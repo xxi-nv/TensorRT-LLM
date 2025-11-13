@@ -1,7 +1,7 @@
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional, Union, final
+from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
@@ -482,6 +482,136 @@ class MoE(nn.Module):
 
     def post_load_weights(self):
         pass
+
+    @abstractmethod
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        **kwargs,
+    ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], Dict]:
+        """
+        Quantize input tensor - unified interface for all MoE backends
+
+        NOTE: This is a temporary interface. In the future, this method should be moved
+        to the MoEBackend interface as part of the backend abstraction layer.
+
+        This method handles quantization of input tensors before MoE computation.
+        All MoE backend implementations must override this method to implement their
+        specific quantization logic.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size] or Fp4QuantizedTensor
+            **kwargs: Backend-specific arguments (e.g., token_selected_experts, workspace, etc.)
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor]] or Dict:
+                (quantized_x, scaling_factors)
+                where scaling_factors should be reshaped to 2D if applicable
+
+        Examples:
+            Simple backends (Cutlass, WideEP, TRTLLMGen):
+                return x_quantized, x_sf  # x_sf is 2D or None
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def run_moe(
+        self,
+        # ========== Common parameters (all backends use) ==========
+        input: torch.Tensor,
+        token_selected_experts: Optional[torch.Tensor],
+        token_selected_slots: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        input_sf: Optional[torch.Tensor] = None,
+        output_dtype: Optional[torch.dtype] = None,
+        # ========== Backend-specific parameters (via kwargs) ==========
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Unified MoE computation interface
+
+        NOTE: This is a TEMPORARY interface. In the future, this method should be moved
+        to the MoEBackend interface as part of the backend abstraction layer.
+
+        This method performs the core MoE computation. Different backends will implement
+        their specific computation logic while following this unified interface.
+
+        Common parameters (all backends use):
+            input: Input activations [num_tokens, hidden_size]
+            token_selected_experts: Expert IDs [num_tokens, top_k] (used by DeepGemm/TRTLLMGen)
+            token_selected_slots: Expert slots [num_tokens, top_k] (used by Cutlass/WideEP)
+            token_final_scales: Routing weights [num_tokens, top_k]
+            input_sf: Input scale factor (for quantization, if applicable)
+            output_dtype: Output data type
+
+        Backend-specific parameters (passed via kwargs, obtained from _get_backend_kwargs()):
+            TODO: This is not finalized, will be updated later.
+            Cutlass-specific:
+                - swizzled_input_sf: bool (whether scale factor is swizzled)
+                - min_latency_mode: bool
+                - use_fused_finalize: bool
+                - tuner_num_tokens: int
+                - tuner_top_k: int
+                - enable_alltoall: bool
+                - output_tensor: Tensor (pre-allocated output)
+                - cluster_size: int
+                - cluster_rank: int
+
+            WideEP-specific:
+                - swizzled_input_sf: bool (fixed to False)
+                - min_latency_mode: bool
+                - use_fused_finalize: bool
+                - tuner_num_tokens: int
+                - tuner_top_k: int
+                - use_all_to_all: bool
+
+            DeepGemm-specific:
+                - min_latency_mode: bool
+                - workspace: Dict[str, Tensor]
+                - expert_first_token_offset_tensor: Tensor
+                - token_to_expert_map: Tensor
+                - unpermuted_row_to_permuted_row_tensor: Tensor
+                - permuted_row_to_unpermuted_row_tensor: Tensor
+                - permuted_data_tensor: Tensor
+                - cluster_size: int
+                - cluster_rank: int
+
+            TRTLLMGen-specific:
+                - router_logits: Tensor (for fused routing)
+                - routing_bias: Tensor
+                - do_finalize: bool
+                - output_tensor: Tensor (pre-allocated output)
+
+        Configuration from backend instance (self):
+            - Weights: self.w3_w1_weight, self.w2_weight, self.w3_w1_bias, self.w2_bias
+            - Quantization: self.quant_scales, self.swiglu_alpha/beta/limit
+            - Model structure: self.num_experts, self.hidden_size, self.intermediate_size,
+                              self.expert_size_per_partition, self.intermediate_size_per_partition
+            - Parallel config: self.tp_size, self.tp_rank, self.ep_size, self.ep_rank
+            - Routing config: self.routing_method.top_k, self.num_slots, etc.
+
+        Returns:
+            torch.Tensor: MoE computation result [num_tokens, hidden_size]
+        """
+        raise NotImplementedError
+
+    def supports_routing_separation(self) -> bool:
+        """
+        Check if this backend supports separated routing
+
+        Returns:
+            True: Backend supports separated routing (ConfigurableMoE calls routing_method)
+                  Examples: CutlassFusedMoE, DeepGemmFusedMoE, WideEPMoE
+            False: Backend has fused routing (routing is integrated in computation kernel)
+                  Examples: TRTLLMGenFusedMoE
+
+        NOTE: This is a temporary method. In the future, this should be part of the
+        MoEBackend interface.
+
+        Backends with fused routing cannot be used with EPLB (Expert Parallel Load Balancing)
+        because EPLB requires routing results to be available before MoE computation.
+        """
+        return True  # Default: assume backends support separated routing
 
     @abstractmethod
     def forward_impl(
