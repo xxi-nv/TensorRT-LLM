@@ -158,7 +158,7 @@ class MoE(nn.Module):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if this MoE backend can implement the given quantization algorithm.
@@ -176,7 +176,7 @@ class MoE(nn.Module):
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type.
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
