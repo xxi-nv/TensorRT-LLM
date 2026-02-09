@@ -531,6 +531,12 @@ class TRTLLMGenFusedMoE(MoE):
 
         routing_bias = routing_bias if router_logits is not None else None
 
+        if (token_selected_experts is not None
+                and token_final_scales is not None
+                and token_selected_experts.dim() == 2):
+            # for cases like deepep low latency where fake top_k=1 might be used
+            top_k = token_selected_experts.shape[1]
+
         # Ensure x_sf is 2D before flattening
         if x_sf is not None:
             assert len(
