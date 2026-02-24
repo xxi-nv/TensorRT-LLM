@@ -40,6 +40,7 @@ from _torch.modules.moe.moe_test_utils import (
     get_backend_class,
     iter_base_test_configs,
     replay_tactics_and_check,
+    skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -49,7 +50,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -103,6 +104,7 @@ def create_test_backend(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -134,6 +136,7 @@ def create_test_backend(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        weight_loading_mode=weight_loading_mode,
     )
 
 
@@ -381,7 +384,7 @@ TEST_PARAMS = generate_test_params()
 # - 128-alignment requirements for quantization
 #
 # =============================================================================
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+# @pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
     "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
@@ -422,6 +425,8 @@ def test_moe_backend(
     top_k = model_config.top_k
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
     # Create mapping
     mapping = Mapping()
@@ -464,6 +469,11 @@ def test_moe_backend(
         # Get swiglu tensors if swiglu_gptoss_style is enabled
         swiglu_tensors = quantize_util.get_swiglu_tensors()
 
+        # Determine weight loading mode based on quantization algorithm
+        weight_loading_mode = MoEWeightLoadingMode.VANILLA
+        if hasattr(quantize_util, "weight_loading_mode"):
+            weight_loading_mode = quantize_util.weight_loading_mode
+
         # Create backend first (needed for MXFP4_MXFP8 to get shapes)
         backend = create_test_backend(
             backend_type=backend_type,
@@ -478,6 +488,7 @@ def test_moe_backend(
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+            weight_loading_mode=weight_loading_mode,
         )
 
         # W4A8_MXFP4_MXFP8 requires different weights for backend and reference

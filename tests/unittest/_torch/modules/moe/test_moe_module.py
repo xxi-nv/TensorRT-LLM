@@ -51,6 +51,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_deepgemm,
     should_skip_multi_gpu,
     should_skip_trtllm,
+    skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -973,7 +974,7 @@ BASE_TEST_PARAMS = generate_base_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+# @pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.parametrize(
     "dtype,moe_backend,quant_algo,seq_len,model_config,routing_method_cls,"
     "swiglu_alpha,swiglu_beta,swiglu_limit",
@@ -999,6 +1000,13 @@ def test_configurable_moe_single_gpu(
     3. Autotune captures and replays all tactics properly
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
@@ -1040,7 +1048,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+# @pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize(
     "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,seq_len,model_config,"
@@ -1060,6 +1068,13 @@ def test_configurable_moe_multi_gpu(
     swiglu_beta,
     swiglu_limit,
 ):
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
@@ -1288,7 +1303,7 @@ EPLB_TEST_PARAMS = generate_eplb_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+# @pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.skipif(
     not _tbr.is_host_accessible_device_memory_supported(),
@@ -1308,6 +1323,13 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     world_size = 4
     _test_moe_multi_gpu(
         comm_method_type,

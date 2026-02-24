@@ -76,10 +76,10 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM == 90 only
+        # FP8_BLOCK_SCALES: SM == 90 only (float16 not supported by kernel)
         QuantAlgo.FP8_BLOCK_SCALES: {
             "sm_constraint": ("exact", 90),
-            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+            "dtypes": {torch.bfloat16},
         },
         # NVFP4: SM in {100, 103}
         QuantAlgo.NVFP4: {

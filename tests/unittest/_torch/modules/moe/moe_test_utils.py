@@ -613,6 +613,45 @@ def get_quick_skip_reason(
 
 
 # ============================================================================
+# GPU Memory Check
+# ============================================================================
+def skip_if_insufficient_gpu_memory(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: torch.dtype = torch.float32,
+    overhead_factor: float = 4.0,
+) -> None:
+    """
+    Skip the current test if estimated GPU memory exceeds device capacity.
+
+    Each expert has gate_up_proj [2*I, H] + down_proj [H, I] = 3*H*I elements.
+    The overhead_factor (default 4x) accounts for ref model + DUT model +
+    quantization scales/activations + CUDA allocator overhead.
+
+    Args:
+        num_experts: Number of MoE experts
+        hidden_size: Hidden dimension size
+        intermediate_size: Intermediate (FFN) dimension size
+        dtype: Weight data type for byte-size calculation
+        overhead_factor: Multiplier over single-model weight bytes
+    """
+    if not torch.cuda.is_available():
+        return
+    bytes_per_elem = torch.tensor([], dtype=dtype).element_size()
+    single_model_bytes = num_experts * 3 * hidden_size * intermediate_size * bytes_per_elem
+    estimated_total_bytes = int(single_model_bytes * overhead_factor)
+    gpu_total_bytes = torch.cuda.get_device_properties(0).total_memory
+    if estimated_total_bytes > gpu_total_bytes:
+        pytest.skip(
+            f"Estimated memory {estimated_total_bytes / (1 << 30):.1f}GB "
+            f"exceeds GPU memory {gpu_total_bytes / (1 << 30):.1f}GB "
+            f"(num_experts={num_experts}, hidden_size={hidden_size}, "
+            f"intermediate_size={intermediate_size}, dtype={dtype})"
+        )
+
+
+# ============================================================================
 # Autotuner Tactic Replay
 # ============================================================================
 def replay_tactics_and_check(
