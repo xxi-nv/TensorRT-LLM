@@ -71,6 +71,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod,
     create_moe,
 )
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -519,6 +520,11 @@ def _test_moe_worker_impl(
         # Get swiglu tensors if swiglu_gptoss_style is enabled
         swiglu_tensors = quantize_util.get_swiglu_tensors()
 
+        # Get weight_loading_mode from quantize_util if available
+        # (e.g., W4A8AWQQuantizeUtil uses W4A8_CUSTOM mode)
+        weight_loading_mode = getattr(quantize_util, 'weight_loading_mode',
+                                      MoEWeightLoadingMode.VANILLA)
+
         with moe_load_balancer:
             # Create and setup fused MoE module
             fused_moe = create_moe(
@@ -529,6 +535,7 @@ def _test_moe_worker_impl(
                 swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
                 swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
                 swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+                weight_loading_mode=weight_loading_mode,
             )
             fused_moe.load_weights([weights])
             fused_moe.post_load_weights()

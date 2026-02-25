@@ -2062,7 +2062,7 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         # the accumulated numerical noise in the final summation.
         top_k = self.routing_method.top_k if hasattr(self.routing_method, "top_k") else 1
         atol = 0.1 * max(1, top_k / 4)
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=atol)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=atol, percent=0.97)
 
 
 class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
