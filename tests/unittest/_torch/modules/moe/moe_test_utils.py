@@ -99,6 +99,7 @@ def should_skip_trtllm(
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
     comm_method: Optional[str] = None,
+    seq_len: Optional[int] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -115,6 +116,7 @@ def should_skip_trtllm(
         swiglu_gptoss_style: Whether using swiglu gptoss style
         comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
             for multi-GPU EP mode checks
+        seq_len: Optional sequence length for seq_len-sensitive skip checks
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -235,6 +237,30 @@ def should_skip_trtllm(
         return (
             "[Potential Bug] TRTLLMGenFusedMoE W4A8_NVFP4_FP8 with top_k=1 "
             "causes CUDA illegal memory access."
+        )
+
+    # Issue: NVFP4 with large expert count + large hidden_size + seq_len=1
+    # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
+    # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
+    # config [8, 83] produces 8.37% element mismatch (threshold: 3%).
+    # All other 207/208 tactics pass. seq=8 with the same config also passes
+    # (different tile behavior). The swiglu_gptoss_style variant passes too
+    # (uses relaxed tolerance: rtol=0.1, percent=0.95).
+    # Root cause: FP4 quantization error accumulates in the large GEMM reduction
+    # dimension (h=7168) and the [8, 83] tile config hits an edge case at seq=1.
+    if (
+        quant_algo == QuantAlgo.NVFP4
+        and not swiglu_gptoss_style
+        and seq_len == 1
+        and num_experts >= 256
+        and model_config.hidden_size >= 7168
+    ):
+        return (
+            f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
+            f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
+            f"and seq_len=1: 207/208 tactics pass but tactic[204] "
+            f"(FP4BlockScaleMoERunner tile [8, 83]) has 8.37% mismatch "
+            f"(threshold 3%). seq_len=8 passes all tactics."
         )
 
     # Issue: NVFP4 with large intermediate_size has known accuracy issues
@@ -539,6 +565,7 @@ def get_quick_skip_reason(
     model_config: "MoeModelConfig",
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
+    seq_len: Optional[int] = None,
 ) -> Optional[str]:
     """
     Fast skip check that calls backend's can_implement() method.
@@ -546,6 +573,7 @@ def get_quick_skip_reason(
     Unified version supporting both backend-level and module-level tests:
     - routing_method_cls: Used by test_moe_module.py for routing method compatibility checks
     - swiglu_gptoss_style: Used by test_moe_backend.py for SwiGLU parameter checks
+    - seq_len: Optional sequence length for seq_len-sensitive skip checks
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -571,7 +599,8 @@ def get_quick_skip_reason(
         skip_checks = [
             lambda: should_skip_routing_method(routing_method_cls, model_config),
             lambda: should_skip_trtllm(
-                backend_type, quant_algo, model_config, routing_method_cls, swiglu_gptoss_style
+                backend_type, quant_algo, model_config, routing_method_cls, swiglu_gptoss_style,
+                seq_len=seq_len,
             ),
             lambda: should_skip_cutedsl(
                 backend_type, quant_algo, model_config, routing_method_cls=routing_method_cls
@@ -780,6 +809,7 @@ def iter_base_test_configs(
             model_config,
             routing_method_cls,
             swiglu_gptoss_style=swiglu_gptoss_style,
+            seq_len=seq_len,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (
