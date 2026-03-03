@@ -420,42 +420,45 @@ def should_skip_cutedsl(
     if backend_type != MoeBackendType.CUTEDSL:
         return None
 
-    # DeepEPLowLatency _modify_output_to_adapt_fused_moe converts dispatch output
-    # to a format where token_selected_slots has shape [num_local_experts, tokens_per_expert]
-    # instead of [num_tokens, top_k]. CuteDSL moe_sort asserts
-    # token_selected_experts.size(1) == top_k, which fails with this format.
-    if comm_method == "DEEPEPLOWLATENCY":
-        return (
-            "[Potential Bug] CuteDslFusedMoE is incompatible with DeepEPLowLatency: "
-            "DeepEPLowLatency _modify_output_to_adapt_fused_moe reshapes "
-            "token_selected_slots to [num_local_experts, tokens_per_expert] "
-            "(effectively top_k=1), but CuteDSL moe_sort requires "
-            "token_selected_experts.size(1) == top_k."
-        )
-
     if model_config is None:
         return None
 
     intermediate_size = model_config.intermediate_size
-    num_experts = model_config.num_experts
 
-    # NVFP4 with large intermediate_size has known accuracy issues
+    # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
+    # at i=14336, threshold 3%). Both CuteDSL and reference have FP4 intermediate
+    # storage, but produce DIFFERENT FP4 values due to:
+    # 1) SwiGLU precision: CuteDSL kernel uses approximate math ops for sigmoid
+    #    (rcp_approx + exp2 fastmath, see utils.py:sigmoid_f32), while reference
+    #    Triton kernel uses standard tl.sigmoid (see swiglu.py:42).
+    # 2) Precision chain: CuteDSL computes SwiGLU in FP32 (GEMM accumulator →
+    #    FP32 SwiGLU → FP4), reference goes FP32 accumulator → BF16 → SwiGLU →
+    #    BF16 → fp4_quantize. Two BF16 truncation points create different values.
+    # 3) FP4 quantization: CuteDSL uses rcp_approx for block scale reciprocal
+    #    (blockscaled_...fusion.py:2588), fp4_quantize uses exact division.
+    # These per-element FP4 value differences accumulate through FC2 GEMM dot
+    # product (K=intermediate_size). CUTLASS avoids this entirely with a single
+    # fused kernel keeping BF16 intermediate precision.
     if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
         return (
-            f"[Potential Bug] CuteDslFusedMoE NVFP4 with large intermediate_size "
-            f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
+            f"[Design Limitation] CuteDslFusedMoE NVFP4 with large "
+            f"intermediate_size has accuracy issues due to FP4 intermediate "
+            f"storage between FC1+SwiGLU and FC2 kernels "
+            f"(intermediate_size={intermediate_size} >= 14336, "
+            f"FC2 accumulates over K={intermediate_size} with 896+ blocks)."
         )
 
-    # NVFP4 with prime num_experts causes CUDA_ERROR_ILLEGAL_ADDRESS
-    prime_experts_with_issues = {7, 13}
-    if quant_algo == QuantAlgo.NVFP4 and num_experts in prime_experts_with_issues:
-        return (
-            f"[Potential Bug] CuteDslFusedMoE NVFP4 with prime num_experts={num_experts} "
-            f"causes CUDA_ERROR_ILLEGAL_ADDRESS due to autotuner cache bucket mapping."
-        )
-
-    # NVFP4 with Llama4Renormalize routing has significant accuracy issues on bfloat16.
-    # Observed mismatch up to 34.6% (threshold 2% at rtol=0.01, percent=0.98).
+    # NVFP4 with Llama4Renormalize routing has significant accuracy issues.
+    # Same root cause as the large intermediate_size skip above: CuteDSL and
+    # reference produce different FP4 intermediate values due to approximate
+    # math ops (rcp_approx, exp2 fastmath) and BF16 truncation differences.
+    # Llama4's sigmoid routing amplifies these differences: standard Renormalize
+    # uses softmax (weights sum to 1, per-expert errors averaged), while Llama4
+    # uses sigmoid (weights independent in (0,1), per-expert errors summed
+    # without normalization). This amplifies FP4 value differences by ~top_k/2.
+    # Mismatch correlates with hidden_size (FC1 K dimension): h=512 passes,
+    # h=2048 fails 8-17%, h=7168 fails 24-35%. Observed: e60(9.4%),
+    # e64(16.5%), e256(34.6%), e384(30.9%) at threshold 3%.
     if routing_method_cls is not None:
         from tensorrt_llm._torch.modules.fused_moe import Llama4RenormalizeMoeRoutingMethod
 
@@ -464,8 +467,9 @@ def should_skip_cutedsl(
             and routing_method_cls == Llama4RenormalizeMoeRoutingMethod
         ):
             return (
-                "[Potential Bug] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
-                "routing has significant accuracy issues (mismatch up to 34.6%%)."
+                "[Design Limitation] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
+                "routing: FP4 intermediate errors amplified by non-normalized "
+                "sigmoid routing weights (mismatch up to 34.6%)."
             )
 
     # TP per-shard alignment: NVFP4 requires 128-aligned per-shard intermediate_size.
@@ -545,18 +549,34 @@ def should_skip_deepgemm(
         return None
 
     # Issue: DEEPGEMM + FP8_BLOCK_SCALES crashes with CUDA illegal memory access
-    # on large expert counts (e.g. e384_k8_h7168_i2048) during post_load_weights().
-    # The crash occurs in get_col_major_tma_aligned_packed_tensor (fp8_utils.py)
-    # when resmoothing FP8 E8M0 scales on SM100f (Blackwell).
-    # Small configs (e.g. e60_k4_h2048_i1408) pass fine.
+    # in _resmooth_kernel (Triton JIT) during post_load_weights() FP8 E8M0 scale
+    # resmoothing on SM100f (Blackwell). Root cause is a Triton compiler/runtime
+    # bug on SM100f: the kernel crashes when total grid blocks exceed ~65K.
+    # The crash depends on grid size, not just num_experts — Grok-1 (e8, h=6144,
+    # i=32768) crashes despite having only 8 experts because its weight tensors
+    # produce grids with 196K+ blocks.
+    # Weight shapes: w3_w1=[E, I*2, H], w2=[E, H, I] (from quantization.py)
+    # Grid for resmooth: (E, cdiv(M,128), cdiv(K,128))
+    # Verified boundary: max_blocks <= 57344 passes, >= 98304 crashes.
+    # Threshold: 65536 blocks (64K). Affected: DeepSeek-V3, Kimi-K2, Grok-1.
+    _RESMOOTH_GRID_BLOCK_LIMIT = 65536
     if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:
-        if model_config.num_experts > 128:
+        num_e = model_config.num_experts
+        hidden = model_config.hidden_size
+        inter = model_config.intermediate_size
+
+        def _cdiv(x, y):
+            return (x + y - 1) // y
+
+        w31_blocks = num_e * _cdiv(inter * 2, 128) * _cdiv(hidden, 128)
+        w2_blocks = num_e * _cdiv(hidden, 128) * _cdiv(inter, 128)
+        max_blocks = max(w31_blocks, w2_blocks)
+        if max_blocks > _RESMOOTH_GRID_BLOCK_LIMIT:
             return (
-                f"[Potential Bug] DeepGemmFusedMoE FP8_BLOCK_SCALES crashes with "
-                f"CUDA illegal memory access on large expert count "
-                f"(num_experts={model_config.num_experts}). The crash occurs in "
-                f"get_col_major_tma_aligned_packed_tensor during "
-                f"post_load_weights() FP8 E8M0 scale resmoothing on SM100f."
+                f"[Triton Bug] DeepGemmFusedMoE FP8_BLOCK_SCALES crashes in "
+                f"_resmooth_kernel on SM100f when grid blocks exceed ~64K "
+                f"(max_blocks={max_blocks:,} > {_RESMOOTH_GRID_BLOCK_LIMIT:,}). "
+                f"Affected: E={num_e}, H={hidden}, I={inter}."
             )
 
     # TP per-shard alignment: FP8_BLOCK_SCALES requires 128-aligned per-shard
@@ -878,7 +898,7 @@ def create_test_param(param_values, test_id, skip_reason=None):
 # CI Mode Detection
 # ============================================================================
 _TRTLLM_TEST_MOE_CI_ENV = "TRTLLM_TEST_MOE_CI"
-IS_CI_MODE = os.environ.get(_TRTLLM_TEST_MOE_CI_ENV, "1") == "1"
+IS_CI_MODE = os.environ.get(_TRTLLM_TEST_MOE_CI_ENV, "0") == "1"
 
 # ============================================================================
 # CI Acceleration Skip Logic
