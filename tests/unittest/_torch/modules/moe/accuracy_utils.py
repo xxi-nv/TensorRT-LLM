@@ -182,14 +182,17 @@ def compute_adaptive_thresholds(
     if routing_type == ROUTING_TYPE_SIGMOID:
         tail_growth += 0.02
 
-    # Heavy quantization (4-bit) has wider tails
+    # Heavy quantization (4-bit) has wider tails.
+    # Block-scaled 4-bit formats (MXFP4, NVFP4) produce extreme outliers when a
+    # block has high dynamic range, causing max_abs_diff >> mean_abs_diff.
+    # Old code used percent=0.85 (15% mismatch) for these formats.
     if quant_algo in (
         QuantAlgo.NVFP4,
         QuantAlgo.W4A8_NVFP4_FP8,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     ):
-        tail_growth += 0.03
+        tail_growth += 0.10
 
     # swiglu_gptoss_style has custom activation that can widen error distribution
     if swiglu_gptoss_style:
