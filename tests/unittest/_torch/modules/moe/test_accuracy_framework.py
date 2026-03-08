@@ -75,33 +75,33 @@ def _get_quant_algo(name: Optional[str]):
 # atol_min/atol_max define the acceptable range for computed atol.
 # Derived from old hardcoded thresholds + error budget analysis.
 THRESHOLD_CASES = [
-    # Unquantized: old=0.001, new should be small (0.01 floor)
+    # Unquantized: 3σ atol, floor dominates → 0.01
     ThresholdTestCase("unquant_small", 512, 512, 1, None, "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.005, 0.05),
     ThresholdTestCase("unquant_large", 7168, 2048, 8, None, "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.005, 0.05),
 
-    # FP8: old=0.15, new should be 0.09-0.27 depending on config
-    ThresholdTestCase("fp8_k4", 2048, 1408, 4, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.30),
-    ThresholdTestCase("fp8_k1", 512, 512, 1, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.10, 0.40),
-    ThresholdTestCase("fp8_k8", 7168, 2048, 8, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.20),
+    # FP8: 2σ atol (was 3σ). atol = q_err(0.06) × activation × routing × 2.0
+    ThresholdTestCase("fp8_k4", 2048, 1408, 4, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.20),
+    ThresholdTestCase("fp8_k1", 512, 512, 1, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.10, 0.30),
+    ThresholdTestCase("fp8_k8", 7168, 2048, 8, "FP8", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.03, 0.15),
 
-    # NVFP4: old=atol1.0+rtol0.85, new should be 0.2-0.7
-    ThresholdTestCase("nvfp4_k4", 2048, 1408, 4, "NVFP4", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.15, 0.80),
-    ThresholdTestCase("nvfp4_k1", 512, 512, 1, "NVFP4", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.30, 1.20),
+    # NVFP4: 1.5σ atol. atol = q_err(0.15) × activation × routing × 1.5
+    ThresholdTestCase("nvfp4_k4", 2048, 1408, 4, "NVFP4", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.10, 0.40),
+    ThresholdTestCase("nvfp4_k1", 512, 512, 1, "NVFP4", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.20, 0.60),
 
-    # FP8_BLOCK_SCALES on different backends
-    ThresholdTestCase("fp8bs_cutlass", 2880, 2880, 4, "FP8_BLOCK_SCALES", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.30),
+    # FP8_BLOCK_SCALES: 2σ atol. Backend floor may dominate.
+    ThresholdTestCase("fp8bs_cutlass", 2880, 2880, 4, "FP8_BLOCK_SCALES", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.20),
     ThresholdTestCase("fp8bs_deepgemm", 2880, 2880, 4, "FP8_BLOCK_SCALES", "DEEPGEMM", ROUTING_TYPE_SOFTMAX, 0.25, 0.60),
     ThresholdTestCase("fp8bs_trtllm", 2880, 2880, 4, "FP8_BLOCK_SCALES", "TRTLLM", ROUTING_TYPE_SOFTMAX, 0.10, 0.30),
 
     # Sigmoid routing (Llama4/DeepSeek): amplified errors
-    ThresholdTestCase("fp8_sigmoid_k4", 2880, 2880, 4, "FP8", "CUTLASS", ROUTING_TYPE_SIGMOID, 0.10, 0.50),
-    ThresholdTestCase("nvfp4_sigmoid_k8", 7168, 2048, 8, "NVFP4", "CUTLASS", ROUTING_TYPE_SIGMOID, 0.50, 2.00),
+    ThresholdTestCase("fp8_sigmoid_k4", 2880, 2880, 4, "FP8", "CUTLASS", ROUTING_TYPE_SIGMOID, 0.10, 0.40),
+    ThresholdTestCase("nvfp4_sigmoid_k8", 7168, 2048, 8, "NVFP4", "CUTLASS", ROUTING_TYPE_SIGMOID, 0.30, 1.00),
 
-    # W8A16: very low quantization error
-    ThresholdTestCase("w8a16_k4", 2048, 1408, 4, "W8A16", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.01, 0.10),
+    # W8A16: 2σ atol, very low quantization error
+    ThresholdTestCase("w8a16_k4", 2048, 1408, 4, "W8A16", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.005, 0.05),
 
-    # W4A8_AWQ: FP8-like
-    ThresholdTestCase("w4a8awq_k4", 2048, 1408, 4, "W4A8_AWQ", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.30),
+    # W4A8_AWQ: 2σ atol, FP8-like
+    ThresholdTestCase("w4a8awq_k4", 2048, 1408, 4, "W4A8_AWQ", "CUTLASS", ROUTING_TYPE_SOFTMAX, 0.05, 0.20),
 ]
 
 
@@ -127,7 +127,7 @@ def test_threshold_calibration(tc: ThresholdTestCase):
         f"[{tc.atol_min:.3f}, {tc.atol_max:.3f}]"
     )
     assert 0 < rtol < 1.0, f"{tc.name}: rtol={rtol} out of reasonable range"
-    assert 0 < mm < 0.25, f"{tc.name}: max_mismatch={mm} out of reasonable range"
+    assert 0 < mm < 0.45, f"{tc.name}: max_mismatch={mm} out of reasonable range"
 
 
 # ──────────────────── GPU accuracy checks (require CUDA) ────────────────────

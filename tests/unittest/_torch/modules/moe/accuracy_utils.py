@@ -128,9 +128,36 @@ def compute_adaptive_thresholds(
         # Noise is averaged, so effective factor ≈ 1/sqrt(top_k).
         routing_factor = max(1.0 / math.sqrt(max(top_k, 1)), 0.3)
 
-    # Combine with 3-sigma safety margin (covers 99.7% of normal distribution)
+    # Sigma multiplier for atol derivation.
+    #
+    # This controls the tradeoff between per-element tolerance and mismatch-rate
+    # detection sensitivity:
+    #   - High sigma (3σ): generous atol, low baseline mismatch, but mismatch
+    #     is INSENSITIVE to precision regressions (few elements near boundary).
+    #   - Low sigma (1.5σ): tight atol, higher baseline mismatch, but mismatch
+    #     is SENSITIVE to precision regressions (many elements near boundary).
+    #
+    # For unquantized: 3σ is fine (Gaussian distribution, few outliers).
+    # For 8-bit quantized: 2σ balances coverage and detection.
+    # For 4-bit quantized: 1.5σ gives detection sensitivity — a 2× error
+    #   increase pushes P(|Z|>0.75) ≈ 45% vs P(|Z|>1.5) ≈ 13%, yielding a
+    #   large mismatch jump that the threshold reliably catches.
+    #   The resulting higher baseline mismatch (~15%) is accommodated by a
+    #   correspondingly higher mismatch threshold.
+    if quant_algo is None:
+        sigma = 3.0
+    elif quant_algo in (
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A8_NVFP4_FP8,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    ):
+        sigma = 1.5
+    else:
+        sigma = 2.0
+
     base_atol = (q_err + accum_err) * activation_factor * routing_factor
-    atol = base_atol * 3.0
+    atol = base_atol * sigma
 
     # Minimum floor: even for unquantized, kernel tiling vs cuBLAS reference
     # produces rounding differences from FP32 accumulation ordering.
@@ -169,36 +196,108 @@ def compute_adaptive_thresholds(
         rtol = max(rtol, 0.02 + 0.005 * log_scale)
 
     # --- max_mismatch_rate: allowed element failure fraction ---
-    # Based on tail probability of error distribution:
-    # Larger K -> wider distribution -> more tail outliers
-    base_mismatch = 0.01  # 1% baseline
-    tail_growth = 0.005 * log_scale  # +0.5% per doubling of K
+    #
+    # Design rationale: the atol above is derived from a 3-sigma Gaussian model,
+    # covering ~99.7% of the WELL-QUANTIZED elements.  But quantization error
+    # distributions are NOT Gaussian — they are bimodal for block-scaled formats:
+    #
+    #   Main peak (~85-90% of elements): quantization error < atol.
+    #     These are elements in blocks with moderate dynamic range, where the
+    #     block scale provides good coverage of all values.
+    #
+    #   Heavy tail (~10-15% for 4-bit, ~2-5% for 8-bit, ~0.3% for unquantized):
+    #     Elements in blocks with HIGH dynamic range, where small values are
+    #     coarsely quantized (error up to block_scale × max_quant_step).
+    #     For MXFP4 (E2M1, block_size=32): ~15% of elements live in blocks
+    #     where max(|w|)/median(|w|) > 3.7, producing per-element errors that
+    #     far exceed the atol derived from the Gaussian model.
+    #
+    # The max_mismatch_rate must accommodate this structural tail WITHOUT being
+    # so loose that it masks real accuracy bugs.
+    #
+    # Threshold = expected_mismatch + detection_gap, where:
+    #   - expected_mismatch: predicted from quantization error distribution theory
+    #   - detection_gap: minimum headroom to detect a 2× error increase
+    #     (e.g., FP32→FP16 accumulator regression, the subtlest detectable bug)
+    #
+    # A 2× per-element error increase roughly doubles the mismatch rate, so
+    # the detection gap must be >= expected_mismatch to catch it.
+    # We use: threshold = expected × (1 + safety_factor), safety_factor >= 1.0.
+    #
+    # What real bugs look like (all detectable):
+    #   - Wrong block index/scale:  mismatch > 50%, cos_sim < 0.95
+    #   - Missing scale dimension:  mismatch > 80%, cos_sim < 0.90
+    #   - Accumulator regression (FP32→FP16): mismatch ~2× normal
+    #   - Off-by-one in expert routing: cos_sim < 0.5
+    #
+    # The cosine_sim gate (0.95 default) is the PRIMARY defense against
+    # catastrophic bugs.  The mismatch check catches subtler precision
+    # regressions that don't distort the overall output shape.
+    #
+    # Expected mismatch per tier (with tier-specific sigma for atol):
+    #
+    # For unquantized (3σ atol): virtually all main-peak elements pass.
+    #   Expected mismatch ~0.3% (kernel tiling diffs, accumulator ordering).
+    #
+    # For 8-bit (2σ atol): P(|Z|>2) = 4.6% of main-peak elements fail,
+    #   plus ~2% from quantization tail.  Expected mismatch ~5%.
+    #
+    # For 4-bit (1.5σ atol): P(|Z|>1.5) = 13.4% of main-peak elements fail,
+    #   plus ~12% from block-quantization tail (block dynamic range outliers).
+    #   Expected mismatch ~18%.  Old code used percent=0.85 (15% allowed) with
+    #   atol≈0.2 (~1σ); our 1.5σ gives slightly higher atol → slightly lower
+    #   mismatch, but the tail contribution is similar.
+    #
+    # Threshold = expected × headroom_factor.  The headroom must be large
+    # enough that a 2× per-element error increase pushes mismatch past the
+    # threshold.  With Nσ atol, a 2× error shifts the CDF boundary to N/2 σ,
+    # causing P(|Z|>N/2) >> P(|Z|>N) for the main peak.
+    #
+    # Detection verification (2× error → new mismatch):
+    #   unquantized: P(|Z|>1.5)=13% from main peak → well above 1% threshold ✓
+    #   8-bit: P(|Z|>1)=32% from main peak → well above 8% threshold ✓
+    #   4-bit: P(|Z|>0.75)=45% + 15% tail → ~50% total → above 25% threshold ✓
+    _EXPECTED_MISMATCH = {
+        "unquantized": 0.005,   # ~0.5% with 3σ atol
+        "8bit":        0.05,    # ~5% with 2σ atol
+        "4bit":        0.20,    # ~20% with 1.5σ atol (main peak ~13% + tail ~7%)
+                                # Worst case at high K + high top_k where routing
+                                # factor compresses atol significantly.
+    }
+    _HEADROOM_FACTOR = {
+        "unquantized": 2.0,     # 0.5% × 2.0 = 1.0% threshold
+        "8bit":        1.6,     # 5% × 1.6 = 8% threshold
+        "4bit":        1.4,     # 20% × 1.4 = 28% threshold
+    }
 
-    # Quantization adds independent noise, widening the tail
-    if quant_algo is not None:
-        tail_growth += 0.01
-
-    # Sigmoid routing amplifies tail (independent expert errors sum)
-    if routing_type == ROUTING_TYPE_SIGMOID:
-        tail_growth += 0.02
-
-    # Heavy quantization (4-bit) has wider tails.
-    # Block-scaled 4-bit formats (MXFP4, NVFP4) produce extreme outliers when a
-    # block has high dynamic range, causing max_abs_diff >> mean_abs_diff.
-    # Old code used percent=0.85 (15% mismatch) for these formats.
-    if quant_algo in (
+    # Classify quantization format into tier
+    if quant_algo is None:
+        tier = "unquantized"
+    elif quant_algo in (
         QuantAlgo.NVFP4,
         QuantAlgo.W4A8_NVFP4_FP8,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     ):
-        tail_growth += 0.10
+        tier = "4bit"
+    else:
+        # FP8, FP8_BLOCK_SCALES, W8A16, W4A8_AWQ (8-bit precision dominates)
+        tier = "8bit"
 
-    # swiglu_gptoss_style has custom activation that can widen error distribution
+    expected = _EXPECTED_MISMATCH[tier]
+    headroom = _HEADROOM_FACTOR[tier]
+    max_mismatch_rate = expected * headroom
+
+    # Sigmoid routing: independent expert weights don't average errors like
+    # softmax does, increasing the effective outlier fraction by ~30%.
+    if routing_type == ROUTING_TYPE_SIGMOID:
+        max_mismatch_rate *= 1.3
+
+    # swiglu_gptoss_style: custom activation widens error distribution (~20%)
     if swiglu_gptoss_style:
-        tail_growth += 0.02
+        max_mismatch_rate *= 1.2
 
-    max_mismatch_rate = min(base_mismatch + tail_growth, 0.20)  # cap at 20%
+    max_mismatch_rate = min(max_mismatch_rate, 0.40)  # cap at 40%
 
     return atol, rtol, max_mismatch_rate
 
