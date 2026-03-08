@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from abc import ABC
 from typing import Dict, List, Optional
 
@@ -23,6 +24,11 @@ from _torch.helpers import (
     per_block_cast_to_fp8,
     per_block_cast_to_fp8_e8m0,
     per_token_cast_to_fp8_e8m0,
+)
+from _torch.modules.moe.accuracy_utils import (
+    ROUTING_TYPE_SIGMOID,
+    ROUTING_TYPE_SOFTMAX,
+    moe_check_accuracy,
 )
 from _torch.modules.moe.moe_test_utils import skip_if_insufficient_gpu_memory
 from utils.util import check_accuracy
@@ -177,6 +183,19 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     return quantize_util_cls, quant_config, quant_kwargs
 
 
+def _detect_routing_type(routing_method) -> str:
+    """Detect routing type from routing method instance for error model.
+
+    Sigmoid-based routing (Llama4, MiniMaxM2) produces independent per-expert
+    weights that sum to > 1, amplifying quantization noise. Softmax-based
+    routing normalizes weights to sum to 1, averaging per-expert errors.
+    """
+    cls_name = type(routing_method).__name__
+    if "Llama4" in cls_name or "MiniMax" in cls_name:
+        return ROUTING_TYPE_SIGMOID
+    return ROUTING_TYPE_SOFTMAX
+
+
 class RefGatedMLPFusedMoE(nn.Module):
     """
     RefGatedMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
@@ -192,6 +211,8 @@ class RefGatedMLPFusedMoE(nn.Module):
     scale_keys: List[str] = []
     # Expected quantization algorithm (subclasses override this)
     expected_quant_algo: Optional[QuantAlgo] = None
+    # Backend name for accuracy thresholds (subclasses can override)
+    _backend_name: str = "CUTLASS"
 
     def __init__(
         self,
@@ -214,6 +235,9 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.bias = bias
         self.dtype = dtype
+        self._swiglu_alpha = swiglu_alpha
+        self._swiglu_beta = swiglu_beta
+        self._swiglu_limit = swiglu_limit
         if model_config is None:
             model_config = ModelConfig()
         self.quant_config = model_config.quant_config
@@ -315,11 +339,35 @@ class RefGatedMLPFusedMoE(nn.Module):
         for expert in range(self.num_experts):
             self._load_expert_weights_with_scales(weights, expert)
 
+    def _is_swiglu_gptoss_style(self) -> bool:
+        """Check if using custom swiglu (gptoss style)."""
+        return (
+            self._swiglu_alpha is not None
+            and (self._swiglu_alpha != 1 or self._swiglu_beta != 0
+                 or self._swiglu_limit != float("inf"))
+        )
+
+    def _get_accuracy_params(self):
+        """Get parameters for adaptive accuracy check.
+
+        Returns dict of keyword arguments for moe_check_accuracy().
+        Subclasses can override to customize (e.g., set backend_name).
+        """
+        quant_algo = self.quant_config.quant_algo if self.quant_config else None
+        top_k = getattr(self.routing_method, "top_k", 2)
+        return dict(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            top_k=top_k,
+            quant_algo=quant_algo,
+            routing_type=_detect_routing_type(self.routing_method),
+            dtype=self.dtype or torch.bfloat16,
+            backend=self._backend_name,
+            swiglu_gptoss_style=self._is_swiglu_gptoss_style(),
+        )
+
     def check_accuracy(self, output, ref_output):
-        # Relaxed percent from 0.984 to 0.96 to handle small tensor statistical variance.
-        # For small outputs (e.g., h=64), a few outliers can cause high mismatch percentage.
-        # Example: 2/64 mismatch = 3.125% > 1.6% (old threshold), but only 2 elements differ.
-        check_accuracy(output, ref_output, rtol=2e-1, atol=2e-1, percent=0.96)
+        moe_check_accuracy(output, ref_output, **self._get_accuracy_params())
 
 
 class BaseQuantizeUtil(ABC):
@@ -450,14 +498,6 @@ class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     scale_keys = ["weight_scale", "input_scale"]
     expected_quant_algo = QuantAlgo.FP8
 
-    def check_accuracy(self, output, ref_output):
-        # Relaxed percent from 0.97 to 0.95 to account for FP8 quantization error accumulation
-        # in large intermediate dimensions and multi-expert routing computations,
-        # especially with Llama4Renormalize sigmoid-based routing.
-        # Theoretical basis: FP8 (E4M3) has ~12.5% unit error, accumulated error grows as sqrt(K)
-        # where K is GEMM reduction dimension. Max observed mismatch is ~4.8% < 5%.
-        check_accuracy(output, ref_output, rtol=4e-2, atol=1e-1, percent=0.95)
-
 
 class FP8QuantizeUtil(BaseQuantizeUtil):
     """
@@ -540,16 +580,6 @@ class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     def __init__(self, *args, swiglu_gptoss_style: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.swiglu_gptoss_style = swiglu_gptoss_style
-
-    def check_accuracy(self, output, ref_output):
-        if self.swiglu_gptoss_style:
-            # swiglu_gptoss_style uses relaxed tolerance
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
-        else:
-            # Relaxed percent from 0.98 to 0.97 to account for NVFP4 quantization
-            # error accumulation with certain routing methods (e.g. Llama4Renormalize).
-            # Max observed mismatch in non-skipped cases is ~2.7% < 3%.
-            check_accuracy(output, ref_output, rtol=1e-2, atol=0.15, percent=0.97)
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
@@ -682,9 +712,6 @@ class FP8BlockScalesRefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     def __init__(self, *args, use_cute_dsl_blockscaling_mm=True, **kwargs):
         # Note: use deepgemm mm will cause accuracy error, so we use cute_dsl_blockscaling_mm here
         super().__init__(*args, use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm, **kwargs)
-
-    def check_accuracy(self, output, ref_output):
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
 class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
@@ -967,19 +994,10 @@ class DeepGemmFP8BlockScalesRefFusedMoE(FP8BlockScalesRefGatedMLPFusedMoE):
 
         return output
 
+    _backend_name = "DEEPGEMM"
+
     def check_accuracy(self, output, ref_output):
-        """
-        Check accuracy with relaxed tolerance for DEEPGEMM FP8 block scale kernel.
-
-        DEEPGEMM with FP8 block scaling has specific numerical behavior due to:
-        - E8M0 scale format quantization
-        - Manual grouped GEMM computation pattern
-        - Different routing methods (especially MiniMaxM2 with sigmoid + manual normalization)
-
-        Relaxed from rtol=0.01 to rtol=0.02 to accommodate these numerical differences
-        while still catching significant errors.
-        """
-        torch.testing.assert_close(output, ref_output, rtol=2e-2, atol=1.5)
+        moe_check_accuracy(output, ref_output, **self._get_accuracy_params())
 
 
 class DeepGemmFP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
@@ -1048,14 +1066,7 @@ class TRTLLMGenFP8BlockScalesRefModule(FP8BlockScalesRefGatedMLPFusedMoE):
     Inherits FP8BlockScalesRefGatedMLPFusedMoE with cute_dsl_blockscaling_mm=True.
     """
 
-    def check_accuracy(self, output, ref_output):
-        """
-        Check accuracy with relaxed tolerance for TRTLLM FP8 block scale kernel.
-
-        The TRTLLM fp8_block_scale_moe_runner has specific numerical behavior that may
-        differ from reference implementation due to kernel-specific optimizations.
-        """
-        check_accuracy(output, ref_output, atol=0.1, rtol=0.85, percent=0.925)
+    _backend_name = "TRTLLM"
 
 
 class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
@@ -1063,9 +1074,7 @@ class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
     expected_quant_algo = QuantAlgo.W4A8_NVFP4_FP8
-
-    def check_accuracy(self, output, ref_output):
-        check_accuracy(output, ref_output, rtol=0.85, atol=0.5, percent=0.925)
+    _backend_name = "TRTLLM"
 
 
 class W4A8NVFP4FP8QuantizeUtil(BaseQuantizeUtil):
@@ -1221,16 +1230,7 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         return output
 
     def check_accuracy(self, output, ref_output):
-        if self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.2, percent=0.8)
-        elif self.hidden_size >= 4096:
-            # Relax tolerance for large hidden_size (e.g., DeepSeek-V3 h=7168).
-            # MXFP4 (4-bit) weights + MXFP8 (8-bit) activations accumulate more
-            # quantization error in large GEMM reduction dimensions: error ~ sqrt(K).
-            # Observed mismatch: ~17-19% for h=7168 vs <15% for h=512.
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
-        else:
-            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
+        moe_check_accuracy(output, ref_output, **self._get_accuracy_params())
 
 
 class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
@@ -1608,7 +1608,7 @@ class WFP4A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def check_accuracy(self, output, ref_output):
-        check_accuracy(output, ref_output, rtol=0.10, atol=0.1, percent=0.85)
+        moe_check_accuracy(output, ref_output, **self._get_accuracy_params())
 
 
 class WFP4A16QuantizeUtil(BaseQuantizeUtil):
@@ -1782,9 +1782,14 @@ class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def check_accuracy(self, output, ref_output, weight_dtype=torch.int8):
-        # Align with woq_assert_near_eq function
+        # Use adaptive framework with calc_woq_tolerence as atol override
+        # (W8A16 dequantization step size is well-characterized by this formula)
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
+        moe_check_accuracy(
+            output, ref_output,
+            **self._get_accuracy_params(),
+            atol_override=atol,
+        )
 
 
 # int8_woq_per_channel
@@ -2057,12 +2062,17 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         return results.reshape(hidden_states.shape)
 
     def check_accuracy(self, output, ref_output):
-        # W4A8_AWQ accumulates FP8 QDQ noise from two layers (fc31 + fc2).
-        # With higher top_k, more experts contribute per token, increasing
-        # the accumulated numerical noise in the final summation.
-        top_k = self.routing_method.top_k if hasattr(self.routing_method, "top_k") else 1
-        atol = 0.1 * max(1, top_k / 4)
-        check_accuracy(output, ref_output, rtol=1e-2, atol=atol, percent=0.97)
+        top_k = self.routing_method.top_k if hasattr(self.routing_method, "top_k") else 2
+        moe_check_accuracy(
+            output, ref_output,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            top_k=top_k,
+            quant_algo=QuantAlgo.W4A8_AWQ,
+            routing_type=_detect_routing_type(self.routing_method),
+            dtype=self.dtype or torch.bfloat16,
+            backend="CUTLASS",
+        )
 
 
 class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
