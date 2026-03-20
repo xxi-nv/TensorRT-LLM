@@ -1492,10 +1492,11 @@ def _test_flashmoe_cutedsl_worker(
     mapping=None,
     routing_method_cls=RenormalizeMoeRoutingMethod,
 ):
-    """Test FlashMoECuteDsl by directly calling forward().
+    """Test FlashMoECuteDsl by directly calling forward() or run_moe().
 
-    Creates FlashMoECuteDsl directly (not via create_moe/ConfigurableMoE),
-    runs forward(), and checks accuracy against RefMLPFusedMoE reference.
+    Single-GPU: Creates FlashMoECuteDsl, runs forward(), checks accuracy.
+    Multi-GPU EP: Creates FlashMoECuteDsl per rank, calls run_moe() directly
+    with local expert partition, verifies partial results match reference.
     """
     try:
         _test_flashmoe_cutedsl_worker_impl(
@@ -1521,6 +1522,8 @@ def _test_flashmoe_cutedsl_worker_impl(
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
     torch.cuda.set_device(mapping.rank)
+
+    is_multi_gpu = mapping.world_size > 1
 
     with torch.device(f"cuda:{mapping.rank}"):
         torch.manual_seed(0)
@@ -1574,20 +1577,78 @@ def _test_flashmoe_cutedsl_worker_impl(
         flashmoe.load_weights([weights])
         flashmoe.cuda(f"cuda:{mapping.rank}")
 
-        # Create reference module for accuracy comparison
-        ref_module = quantize_util.create_ref_module(routing_method)
-        ref_module.load_weights([weights])
-        ref_module.cuda(f"cuda:{mapping.rank}")
+        if is_multi_gpu:
+            # Multi-GPU EP test: call run_moe() directly to test expert
+            # partitioning without NCCL communication.
+            # Each rank processes only its local experts via moe_sort.
+            # Verify partial result matches manually computed reference.
+            token_selected_experts, token_final_scales = routing_method.apply(
+                router_logits)
+            token_selected_experts = token_selected_experts.to(torch.int32)
 
-        # Run forward passes
-        all_rank_num_tokens = [seq_len] * mapping.world_size
-        with torch.inference_mode():
-            output = flashmoe.forward(
-                x, router_logits, all_rank_num_tokens=all_rank_num_tokens
+            with torch.inference_mode():
+                output = flashmoe.run_moe(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                )
+
+            # Compute reference for this rank's local expert partition.
+            # RefMLPFusedMoE always computes all experts, so we manually
+            # compute partial output for only this rank's experts.
+            ep_size = mapping.moe_ep_size
+            ep_rank = mapping.moe_ep_rank
+            experts_per_rank = num_experts // ep_size
+            local_start = ep_rank * experts_per_rank
+            local_end = local_start + experts_per_rank
+
+            ref_output = torch.zeros_like(output)
+            with torch.inference_mode():
+                for i in range(seq_len):
+                    for k_slot in range(top_k):
+                        expert_id = token_selected_experts[i, k_slot].item()
+                        if expert_id < local_start or expert_id >= local_end:
+                            continue
+                        local_idx = expert_id - local_start
+
+                        # FC1: gate_up = x @ w3_w1[expert].T
+                        w3_w1 = flashmoe.w3_w1_weight[local_idx]
+                        gate_up = torch.mm(
+                            x[i:i + 1], w3_w1.t()
+                        )
+
+                        # SwiGLU
+                        up_proj, gate_proj = gate_up.chunk(2, dim=-1)
+                        activated = torch.nn.functional.silu(gate_proj) * up_proj
+
+                        # FC2: down = activated @ w2[expert].T
+                        w2 = flashmoe.w2_weight[local_idx]
+                        down = torch.mm(activated, w2.t())
+
+                        # Scale and accumulate
+                        scale = token_final_scales[i, k_slot].item()
+                        ref_output[i] += (down[0] * scale).to(ref_output.dtype)
+
+            # Check accuracy
+            torch.testing.assert_close(
+                output, ref_output,
+                rtol=1e-2, atol=1e-2,
+                msg=f"EP rank {ep_rank} output mismatch",
             )
-            ref_output = ref_module.forward(x, router_logits)
+        else:
+            # Single-GPU: use forward() with full reference
+            ref_module = quantize_util.create_ref_module(routing_method)
+            ref_module.load_weights([weights])
+            ref_module.cuda(f"cuda:{mapping.rank}")
 
-        ref_module.check_accuracy(output, ref_output)
+            all_rank_num_tokens = [seq_len] * mapping.world_size
+            with torch.inference_mode():
+                output = flashmoe.forward(
+                    x, router_logits, all_rank_num_tokens=all_rank_num_tokens
+                )
+                ref_output = ref_module.forward(x, router_logits)
+
+            ref_module.check_accuracy(output, ref_output)
 
 
 FLASHMOE_CUTEDSL_CONFIGS = [
