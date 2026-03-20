@@ -582,8 +582,8 @@ class FlashMoECuteDsl(FlashMoEFused):
         )
 
         for tile_idx in range(n_valid_tiles):
-            expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-            local_expert_idx = expert_idx - self.slot_start
+            # moe_sort outputs local expert indices (already offset by slot_start)
+            local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * self.tile_size
             row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
@@ -621,8 +621,8 @@ class FlashMoECuteDsl(FlashMoEFused):
         flat_scales = token_final_scales.float().view(-1)  # [num_tokens * top_k]
 
         for tile_idx in range(n_valid_tiles):
-            expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-            local_expert_idx = expert_idx - self.slot_start
+            # moe_sort outputs local expert indices (already offset by slot_start)
+            local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * self.tile_size
             row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
