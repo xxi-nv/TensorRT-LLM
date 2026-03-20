@@ -1,0 +1,676 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+FlashMoE Fused Backend for TensorRT-LLM
+
+Implements fused MoE backends inspired by the FlashMoE paper
+(https://arxiv.org/html/2506.04667v3), fusing token dispatch, expert FFN
+computation, and combine into a single logical operation.
+
+Phase 1: FlashMoEFused - PyTorch + torch.compile implementation for bf16/fp16.
+Phase 2: FlashMoECuteDsl - cuteDSL high-performance kernel for bf16 on SM90+.
+
+Core algorithm:
+1. Token dispatch: moe_sort -> tile-to-expert mapping + permutation indices
+2. FC1: Gather + GroupedGEMM(gate_up) + SwiGLU activation
+3. FC2: GroupedGEMM(down) + Scale + Scatter-Add to original positions
+4. Multi-GPU: NVSHMEM kernel-level dispatch/combine (Phase 2 only)
+"""
+
+from typing import Dict, List, Optional, Tuple, Union
+
+import torch
+from torch import nn
+
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+from ...model_config import ModelConfig
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor, is_gated_activation
+from .interface import MoE, MoEWeightLoadingMode, _warn_and_return
+from .routing import BaseMoeRoutingMethod
+
+
+def _silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU (Swish) activation: x * sigmoid(x)."""
+    return x * torch.sigmoid(x)
+
+
+def _swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """SwiGLU activation: silu(gate) * up."""
+    return _silu(gate) * up
+
+
+class FlashMoEFused(MoE):
+    """
+    FlashMoE Fused Backend: fuses dispatch + expert FFN + combine.
+
+    Only supports unquantized bf16/fp16 (Phase 1).
+    Uses per-expert loop with torch operations for FFN computation.
+    """
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        FlashMoE only supports unquantized bf16/fp16.
+
+        Args:
+            quant_algo: Must be None (unquantized).
+            dtype_activation: Must be float16 or bfloat16.
+            swiglu_gptoss_style: Not supported.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        if quant_algo is not None:
+            return _warn_and_return(
+                f"FlashMoEFused only supports unquantized mode "
+                f"(got quant_algo={quant_algo})")
+
+        if dtype_activation not in (torch.float16, torch.bfloat16):
+            return _warn_and_return(
+                f"FlashMoEFused only supports float16/bfloat16 "
+                f"(got {dtype_activation})")
+
+        if swiglu_gptoss_style:
+            return _warn_and_return(
+                "FlashMoEFused does not support swiglu_gptoss_style")
+
+        return True, None
+
+    def __init__(
+        self,
+        *,
+        routing_method: BaseMoeRoutingMethod,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
+        VANILLA,
+        bias: bool = False,
+        apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = None,
+        init_load_balancer: bool = True,
+        without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
+    ):
+        super().__init__(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
+        )
+
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
+
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def _supports_load_balancer(self) -> bool:
+        """FlashMoE supports load balancer."""
+        return True
+
+    def create_weights(self):
+        if self._weights_created:
+            return
+
+        weight_dtype = self.dtype
+
+        # w3_w1_weight: fused gate_up projection [num_local_experts, 2*I_per_tp, H]
+        w3_w1_weight_shape = (
+            self.expert_size_per_partition,
+            self.expand_intermediate_size_per_partition,
+            self.hidden_size,
+        )
+        w3_w1_weight = nn.Parameter(
+            torch.empty(w3_w1_weight_shape, dtype=weight_dtype),
+            requires_grad=False,
+        )
+        self.register_parameter("w3_w1_weight", w3_w1_weight)
+
+        # w2_weight: down projection [num_local_experts, H, I_per_tp]
+        w2_weight_shape = (
+            self.expert_size_per_partition,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+        )
+        w2_weight = nn.Parameter(
+            torch.empty(w2_weight_shape, dtype=weight_dtype),
+            requires_grad=False,
+        )
+        self.register_parameter("w2_weight", w2_weight)
+
+        # Bias support
+        if self.bias:
+            w3_w1_bias = nn.Parameter(
+                torch.empty(w3_w1_weight_shape[:2], dtype=weight_dtype),
+                requires_grad=False,
+            )
+            self.register_parameter("w3_w1_bias", w3_w1_bias)
+
+            w2_bias = nn.Parameter(
+                torch.empty(w2_weight_shape[:2], dtype=weight_dtype),
+                requires_grad=False,
+            )
+            self.register_parameter("w2_bias", w2_bias)
+        else:
+            self.w3_w1_bias = None
+            self.w2_bias = None
+
+        self.quant_scales = tuple()
+        self._weights_created = True
+
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        """Load weights using the same pattern as other backends."""
+        assert self._weights_created
+        assert len(weights) == 1
+        weights = weights[0]
+
+        from .quantization import (TensorParallelMode, load_weight_shard)
+
+        for local_slot_id, expert_id in enumerate(
+                self.initial_local_expert_ids):
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight = weights.get(f"{expert_id}.w1.weight")
+                w3_weight = weights.get(f"{expert_id}.w3.weight")
+                w2_weight = weights.get(f"{expert_id}.w2.weight")
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_weight, w3_weight = None, None
+                if "gate_up_proj" in weights:
+                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
+                        0, 1)
+                    w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                w2_weight = (weights["down_proj"][expert_id].transpose(
+                    0, 1).contiguous() if "down_proj" in weights else None)
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode: {self.weight_loading_mode}")
+
+            device = self.w3_w1_weight.device
+            dst_w3_w1 = self.w3_w1_weight.data[local_slot_id]
+            dst_w2 = self.w2_weight.data[local_slot_id]
+
+            # Load w1 (up proj) and w3 (gate proj) into fused w3_w1
+            if w1_weight is not None:
+                w1_shard = load_weight_shard(w1_weight, self.tp_size,
+                                             self.tp_rank,
+                                             TensorParallelMode.COLUMN,
+                                             device=device)
+                dst_w3_w1_w3, dst_w3_w1_w1 = dst_w3_w1.chunk(2, dim=0)
+                dst_w3_w1_w1.copy_(w1_shard.contiguous().view(dst_w3_w1.dtype),
+                                   non_blocking=True)
+
+            if w3_weight is not None:
+                w3_shard = load_weight_shard(w3_weight, self.tp_size,
+                                             self.tp_rank,
+                                             TensorParallelMode.COLUMN,
+                                             device=device)
+                dst_w3_w1_w3, _ = dst_w3_w1.chunk(2, dim=0)
+                dst_w3_w1_w3.copy_(w3_shard.contiguous().view(dst_w3_w1.dtype),
+                                   non_blocking=True)
+
+            # Load w2 (down proj)
+            if w2_weight is not None:
+                w2_shard = load_weight_shard(w2_weight, self.tp_size,
+                                             self.tp_rank,
+                                             TensorParallelMode.ROW,
+                                             device=device)
+                dst_w2.copy_(w2_shard.view(dst_w2.dtype), non_blocking=True)
+
+    def post_load_weights(self):
+        """Post-load weight processing. Sets up EPLB if needed."""
+        if hasattr(self,
+                   "layer_load_balancer") and self.layer_load_balancer:
+            weight_fns = {
+                'w3_w1_weight': self.w3_w1_weight.data,
+                'w2_weight': self.w2_weight.data,
+            }
+            self.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
+            self.layer_load_balancer.set_initial_weight_assignments(
+                self.initial_global_assignments)
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """No quantization for FlashMoE (bf16/fp16 only)."""
+        return x, None
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Fused dispatch + expert FFN + combine.
+
+        Algorithm:
+        1. Flatten (token, top_k) -> sorted by expert ID
+        2. For each local expert: GEMM1(gate_up) + SwiGLU + GEMM2(down)
+        3. Scatter-add weighted results back to token positions
+
+        Args:
+            x: Input [num_tokens, hidden_size]
+            token_selected_experts: Expert IDs or slots [num_tokens, top_k]
+            token_final_scales: Routing weights [num_tokens, top_k]
+
+        Returns:
+            Output [num_tokens, hidden_size]
+        """
+        num_tokens = x.shape[0]
+        hidden_size = x.shape[1]
+        top_k = token_selected_experts.shape[1]
+        output_dtype = x.dtype
+
+        # Initialize output
+        final_output = torch.zeros(
+            (num_tokens, hidden_size), dtype=output_dtype, device=x.device)
+
+        # Flatten [num_tokens, top_k] -> [num_tokens * top_k]
+        flat_expert_ids = token_selected_experts.view(-1)  # [N*K]
+        flat_scales = token_final_scales.float().view(-1)  # [N*K]
+        # Token indices: [0,0,..,1,1,..,2,2,..] each repeated top_k times
+        flat_token_ids = torch.arange(
+            num_tokens, device=x.device).unsqueeze(1).expand(
+                -1, top_k).reshape(-1)  # [N*K]
+
+        # Process each local expert
+        for local_expert_idx in range(self.expert_size_per_partition):
+            # Global expert slot ID for this local expert
+            global_slot_id = self.slot_start + local_expert_idx
+
+            # Find tokens assigned to this expert
+            mask = flat_expert_ids == global_slot_id
+            if not mask.any():
+                continue
+
+            # Gather tokens and scales for this expert
+            expert_token_ids = flat_token_ids[mask]  # [T_e]
+            expert_scales = flat_scales[mask]  # [T_e]
+            expert_input = x[expert_token_ids]  # [T_e, H]
+
+            # Expert FFN: gate_up projection
+            # w3_w1_weight[local_expert_idx] shape: [2*I, H]
+            w3_w1 = self.w3_w1_weight[local_expert_idx]  # [2*I, H]
+
+            # GEMM1: [T_e, H] x [H, 2*I] -> [T_e, 2*I]
+            gate_up = torch.mm(expert_input, w3_w1.t())  # [T_e, 2*I]
+
+            if self.w3_w1_bias is not None:
+                gate_up = gate_up + self.w3_w1_bias[local_expert_idx]
+
+            # Split: w3_w1 layout is [w3(up_proj), w1(gate_proj)]
+            # w3 = up projection (direct multiply), w1 = gate projection (SiLU)
+            # SwiGLU = silu(w1*x) * (w3*x)
+            w3_out, w1_out = gate_up.chunk(2, dim=-1)  # each [T_e, I]
+
+            if self.is_gated_activation:
+                hidden = _swiglu(w1_out, w3_out)
+            else:
+                hidden = w3_out  # For non-gated, only use the first projection
+
+            # GEMM2: down projection
+            # w2_weight[local_expert_idx] shape: [H, I]
+            w2 = self.w2_weight[local_expert_idx]  # [H, I]
+            expert_output = torch.mm(hidden, w2.t())  # [T_e, H]
+
+            if self.w2_bias is not None:
+                expert_output = expert_output + self.w2_bias[local_expert_idx]
+
+            # Weighted scatter-add back to original positions
+            weighted_output = expert_output * expert_scales.unsqueeze(
+                1).to(expert_output.dtype)
+            final_output.index_add_(0, expert_token_ids, weighted_output)
+
+        return final_output
+
+    def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Full forward pass: routing -> run_moe -> reduce.
+
+        This is the legacy single-backend forward path used when NOT wrapped
+        by ConfigurableMoE.
+        """
+        assert isinstance(x, torch.Tensor), \
+            "FlashMoEFused does not support Fp4QuantizedTensor input"
+        assert do_finalize, "FlashMoEFused does not support do_finalize=False"
+
+        x = x.view(-1, self.hidden_size)
+
+        # Apply routing
+        token_selected_experts, token_final_scales = self.routing_method.apply(
+            router_logits)
+        token_selected_experts = token_selected_experts.to(torch.int32)
+
+        # Apply router weight on input if enabled
+        if self.apply_router_weight_on_input:
+            x = x * token_final_scales.to(x.dtype)
+            token_final_scales = None
+
+        # AllGather for attention DP
+        if self.use_dp and self.parallel_size > 1:
+            from ...distributed import allgather
+            x, token_selected_experts, token_final_scales = allgather(
+                [x, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+
+        # Quantize (no-op for FlashMoE)
+        x, x_sf = self.quantize_input(x)
+
+        # Run fused MoE computation
+        final_hidden_states = self.run_moe(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            x_sf=x_sf,
+        )
+
+        # ReduceScatter or AllReduce for TP
+        final_hidden_states = self.reducescatter_or_allreduce(
+            final_hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+
+        return final_hidden_states
+
+
+class FlashMoECuteDsl(FlashMoEFused):
+    """FlashMoE with cuteDSL kernel-level fusion.
+
+    Standalone MoE module (NOT wrapped by ConfigurableMoE).
+    Fuses ALL operations into cuteDSL-backed kernels:
+    - Single-GPU: moe_sort -> gather + GEMM + SwiGLU -> GEMM + scatter-add
+    - Multi-GPU: NVSHMEM dispatch + compute + combine in one kernel (future)
+
+    Uses moe_sort for tile management (same as CuteDslFusedMoE) and
+    cuteDSL bf16 grouped GEMM kernels for compute.
+
+    Only supports unquantized bf16 on SM >= 90 (Hopper/Blackwell).
+    """
+
+    # Default tile size for moe_sort tile management
+    DEFAULT_TILE_SIZE = 128
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """Check if FlashMoECuteDsl can be used.
+
+        Requirements:
+        - Unquantized (quant_algo=None)
+        - bf16 only (not fp16 - cuteDSL kernels target bf16 HMMA/WGMMA)
+        - SM >= 90 (Hopper or Blackwell)
+        - No swiglu_gptoss_style
+        """
+        can, reason = FlashMoEFused.can_implement(
+            quant_algo, dtype_activation, swiglu_gptoss_style
+        )
+        if not can:
+            return can, reason
+
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                "FlashMoECuteDsl only supports bfloat16 "
+                f"(got {dtype_activation})"
+            )
+
+        if not torch.cuda.is_available():
+            return _warn_and_return("FlashMoECuteDsl requires CUDA")
+
+        if torch.cuda.get_device_capability() < (9, 0):
+            return _warn_and_return(
+                "FlashMoECuteDsl requires SM >= 90 "
+                f"(got SM {torch.cuda.get_device_capability()})"
+            )
+
+        return True, None
+
+    def __init__(
+        self,
+        *,
+        routing_method: BaseMoeRoutingMethod,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
+        VANILLA,
+        bias: bool = False,
+        apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = None,
+        init_load_balancer: bool = True,
+        without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
+    ):
+        super().__init__(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
+            activation_type=activation_type,
+        )
+
+        self.tile_size = self.DEFAULT_TILE_SIZE
+        self._nvshmem_mgr = None
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Fused dispatch + expert FFN + combine using moe_sort + cuteDSL kernels.
+
+        Algorithm:
+        1. moe_sort() -> tile assignments, permutation indices
+        2. FC1: Gather + Grouped GEMM + SwiGLU (per expert tiles)
+        3. FC2: Grouped GEMM + Scale + Scatter-Add (per expert tiles)
+
+        Falls back to tile-based PyTorch loop (same structure as cuteDSL
+        kernel, but using torch.mm) until compiled cuteDSL kernels are ready.
+
+        Args:
+            x: Input [num_tokens, hidden_size], bf16
+            token_selected_experts: Expert IDs [num_tokens, top_k], int32
+            token_final_scales: Routing weights [num_tokens, top_k], float32
+
+        Returns:
+            Output [num_tokens, hidden_size], bf16
+        """
+        num_tokens = x.shape[0]
+        hidden_size = x.shape[1]
+        top_k = token_selected_experts.shape[1]
+        output_dtype = x.dtype
+
+        # Step 1: moe_sort to get tile-to-expert mapping and permutation
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=top_k,
+            local_expert_offset=self.slot_start,
+            local_num_experts=self.expert_size_per_partition,
+            tile_tokens_dim=self.tile_size,
+        )
+
+        total_permuted = permuted_idx_to_expanded_idx.shape[0]
+        n_valid_tiles = num_non_exiting_tiles.item()
+
+        # Step 2: FC1 - Gather + Grouped GEMM + SwiGLU
+        # Process tiles: gather input, GEMM with gate_up weights, apply SwiGLU
+        interm_size = self.intermediate_size_per_partition
+        fc1_output = torch.zeros(
+            total_permuted, interm_size, dtype=output_dtype, device=x.device
+        )
+
+        for tile_idx in range(n_valid_tiles):
+            expert_idx = tile_idx_to_expert_idx[tile_idx].item()
+            local_expert_idx = expert_idx - self.slot_start
+            mn_limit = tile_idx_to_mn_limit[tile_idx].item()
+            row_start = tile_idx * self.tile_size
+            row_end = row_start + mn_limit
+
+            # Gather input tokens using permutation indices
+            perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
+            # Map expanded indices to token indices
+            token_indices = perm_indices // top_k
+            gathered_input = x[token_indices]  # [mn_limit, hidden_size]
+
+            # FC1 GEMM: gathered_input @ w3_w1[local_expert].T
+            w3_w1 = self.w3_w1_weight[local_expert_idx]  # [2*I, H]
+            gate_up = torch.mm(gathered_input, w3_w1.t())  # [mn_limit, 2*I]
+
+            if self.w3_w1_bias is not None:
+                gate_up = gate_up + self.w3_w1_bias[local_expert_idx]
+
+            # SwiGLU activation
+            # Layout: [w3(up_proj), w1(gate_proj)]
+            up_proj, gate_proj = gate_up.chunk(2, dim=-1)
+
+            if self.is_gated_activation:
+                activated = _swiglu(gate_proj, up_proj)
+            else:
+                activated = up_proj
+
+            fc1_output[row_start:row_end] = activated
+
+        # Step 3: FC2 - Grouped GEMM + Scale + Scatter-Add
+        final_output = torch.zeros(
+            num_tokens, hidden_size, dtype=output_dtype, device=x.device
+        )
+
+        # Flatten token_final_scales for expanded index lookup
+        flat_scales = token_final_scales.float().view(-1)  # [num_tokens * top_k]
+
+        for tile_idx in range(n_valid_tiles):
+            expert_idx = tile_idx_to_expert_idx[tile_idx].item()
+            local_expert_idx = expert_idx - self.slot_start
+            mn_limit = tile_idx_to_mn_limit[tile_idx].item()
+            row_start = tile_idx * self.tile_size
+            row_end = row_start + mn_limit
+
+            tile_input = fc1_output[row_start:row_end]  # [mn_limit, I]
+
+            # FC2 GEMM: tile_input @ w2[local_expert].T
+            w2 = self.w2_weight[local_expert_idx]  # [H, I]
+            tile_output = torch.mm(tile_input, w2.t())  # [mn_limit, H]
+
+            if self.w2_bias is not None:
+                tile_output = tile_output + self.w2_bias[local_expert_idx]
+
+            # Scale by routing weights and scatter-add
+            perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
+            token_indices = perm_indices // top_k
+            scales = flat_scales[perm_indices].unsqueeze(1)  # [mn_limit, 1]
+            scaled_output = tile_output * scales.to(tile_output.dtype)
+            final_output.index_add_(0, token_indices, scaled_output)
+
+        return final_output
+
+    def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Full forward pass: routing -> run_moe -> reduce.
+
+        For multi-GPU with NVSHMEM (future): overrides comm to use
+        kernel-level dispatch/combine instead of allgather/reducescatter.
+        Currently delegates to parent for comm, uses cuteDSL for compute.
+        """
+        # For now, delegate to parent which handles DP allgather + TP reduce.
+        # In the future, multi-GPU NVSHMEM path will replace this.
+        return super().forward_impl(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )

@@ -12,6 +12,7 @@ from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_flashmoe import FlashMoECuteDsl, FlashMoEFused
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -62,6 +63,10 @@ def get_moe_cls(
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
+    elif moe_backend.upper() == "FLASHMOE":
+        return FlashMoEFused
+    elif moe_backend.upper() == "FLASHMOE_CUTEDSL":
+        return FlashMoECuteDsl
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
     else:
@@ -139,8 +144,8 @@ def create_moe_backend(
     if moe_load_balancer is not None:
         assert moe_cls in [
             WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-            DeepGemmFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, and DeepGemmFusedMoE."
+            DeepGemmFusedMoE, FlashMoEFused, FlashMoECuteDsl
+        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, DeepGemmFusedMoE, FlashMoEFused, and FlashMoECuteDsl."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -259,6 +264,24 @@ def create_moe_backend(
             layer_idx=layer_idx,
             without_comm=without_comm,
         )
+    elif moe_cls in (FlashMoEFused, FlashMoECuteDsl):
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
+            activation_type=activation_type,
+        )
     elif moe_cls == TritonFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TritonFusedMoE."
 
@@ -350,7 +373,7 @@ def create_moe(
                                              "1") == "1"
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE):
+                       CutlassFusedMoE, FlashMoEFused):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

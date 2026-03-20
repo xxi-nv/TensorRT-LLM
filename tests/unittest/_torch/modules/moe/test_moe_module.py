@@ -1475,3 +1475,224 @@ def test_configurable_moe_multi_gpu_eplb(
         model_config=model_config,
         routing_method_cls=routing_method_cls,
     )
+
+
+# ============================================================================
+# FlashMoECuteDsl Tests - Direct forward() call (standalone, no ConfigurableMoE)
+# ============================================================================
+
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashmoe import FlashMoECuteDsl  # noqa: E402
+from _torch.modules.moe.quantize_utils import BaseQuantizeUtil  # noqa: E402
+
+
+def _test_flashmoe_cutedsl_worker(
+    dtype,
+    model_config,
+    seq_len,
+    mapping=None,
+    routing_method_cls=RenormalizeMoeRoutingMethod,
+):
+    """Test FlashMoECuteDsl by directly calling forward().
+
+    Creates FlashMoECuteDsl directly (not via create_moe/ConfigurableMoE),
+    runs forward(), and checks accuracy against RefMLPFusedMoE reference.
+    """
+    try:
+        _test_flashmoe_cutedsl_worker_impl(
+            dtype=dtype,
+            model_config=model_config,
+            seq_len=seq_len,
+            mapping=mapping,
+            routing_method_cls=routing_method_cls,
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _test_flashmoe_cutedsl_worker_impl(
+    dtype,
+    model_config,
+    seq_len,
+    mapping=None,
+    routing_method_cls=RenormalizeMoeRoutingMethod,
+):
+    """Implementation of FlashMoECuteDsl test worker."""
+    mapping = mapping or Mapping()
+    mapping.rank = mpi_rank()
+    torch.cuda.set_device(mapping.rank)
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        num_experts = model_config.num_experts
+        top_k = model_config.top_k
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+
+        routing_method = _create_routing_method(
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn(
+            (seq_len, num_experts), dtype=dtype, device="cuda"
+        )
+
+        # Create weights via BaseQuantizeUtil (unquantized bf16)
+        quantize_util = BaseQuantizeUtil(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=None,
+        )
+        weights = quantize_util.create_weights()
+
+        # Build model config for FlashMoECuteDsl
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=mapping,
+        )
+
+        # Create FlashMoECuteDsl directly (standalone, not ConfigurableMoE)
+        flashmoe = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=model_cfg,
+        )
+        flashmoe.load_weights([weights])
+        flashmoe.cuda(f"cuda:{mapping.rank}")
+
+        # Create reference module for accuracy comparison
+        ref_module = quantize_util.create_ref_module(routing_method)
+        ref_module.load_weights([weights])
+        ref_module.cuda(f"cuda:{mapping.rank}")
+
+        # Run forward passes
+        all_rank_num_tokens = [seq_len] * mapping.world_size
+        with torch.inference_mode():
+            output = flashmoe.forward(
+                x, router_logits, all_rank_num_tokens=all_rank_num_tokens
+            )
+            ref_output = ref_module.forward(x, router_logits)
+
+        ref_module.check_accuracy(output, ref_output)
+
+
+FLASHMOE_CUTEDSL_CONFIGS = [
+    MoeModelConfig(8, 2, 512, 512),
+    MoeModelConfig(60, 4, 2048, 1408),
+    MoeModelConfig(256, 8, 7168, 2048),
+]
+
+
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            FLASHMOE_CUTEDSL_CONFIGS,
+            [1, 8],
+            [RenormalizeMoeRoutingMethod, DeepSeekV3MoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_single_gpu(model_config, seq_len, routing_method_cls):
+    """Single-GPU test for FlashMoECuteDsl -- direct forward() call."""
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    from _torch.modules.moe.moe_test_utils import should_skip_routing_method
+
+    skip = should_skip_routing_method(routing_method_cls, model_config)
+    if skip:
+        pytest.skip(skip)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    _test_flashmoe_cutedsl_worker(
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        seq_len=seq_len,
+        routing_method_cls=routing_method_cls,
+    )
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4, reason="needs 4 GPUs"
+)
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            [
+                MoeModelConfig(60, 4, 2048, 1408),
+                MoeModelConfig(256, 8, 7168, 2048),
+            ],
+            [8],
+            [RenormalizeMoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_multi_gpu(model_config, seq_len, routing_method_cls):
+    """Multi-GPU test for FlashMoECuteDsl with EP parallelism."""
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    world_size = 4
+    mapping = _create_mapping_for_parallel_mode(world_size, "DEP")
+
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            _test_flashmoe_cutedsl_worker,
+            *zip(
+                *[
+                    (
+                        torch.bfloat16,
+                        model_config,
+                        seq_len,
+                        mapping,
+                        routing_method_cls,
+                    )
+                ]
+                * world_size
+            ),
+        )
+        for r in results:
+            assert r is None
