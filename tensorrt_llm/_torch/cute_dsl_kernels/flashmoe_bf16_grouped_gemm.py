@@ -176,7 +176,7 @@ class FlashMoEBf16GatherGemmSwigluKernel:
             expert_idx = tile_idx_to_expert_idx[tile_idx].item()
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * tile_m
-            row_end = row_start + mn_limit
+            row_end = mn_limit  # mn_limit is absolute cumulative boundary
 
             # Gather input tokens
             perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
@@ -301,7 +301,7 @@ class FlashMoEBf16GemmFinalizeKernel:
             expert_idx = tile_idx_to_expert_idx[tile_idx].item()
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * tile_m
-            row_end = row_start + mn_limit
+            row_end = mn_limit  # mn_limit is absolute cumulative boundary
 
             tile_input = a[row_start:row_end]  # [mn_limit, interm_size]
 

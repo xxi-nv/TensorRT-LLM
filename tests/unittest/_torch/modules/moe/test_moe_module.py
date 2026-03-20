@@ -1675,10 +1675,17 @@ def test_flashmoe_cutedsl_multi_gpu(model_config, seq_len, routing_method_cls):
         torch.bfloat16,
     )
 
+    def init_worker(custom_paths):
+        for custom_path in custom_paths:
+            if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
+                sys.path.append(custom_path)
+
     world_size = 4
     mapping = _create_mapping_for_parallel_mode(world_size, "DEP")
 
-    with MPIPoolExecutor(max_workers=world_size) as executor:
+    with MPIPoolExecutor(
+        initializer=init_worker, initargs=(sys.path,), max_workers=world_size
+    ) as executor:
         results = executor.map(
             _test_flashmoe_cutedsl_worker,
             *zip(
