@@ -586,7 +586,7 @@ class FlashMoECuteDsl(FlashMoEFused):
             local_expert_idx = expert_idx - self.slot_start
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * self.tile_size
-            row_end = row_start + mn_limit
+            row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
 
             # Gather input tokens using permutation indices
             perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
@@ -625,7 +625,7 @@ class FlashMoECuteDsl(FlashMoEFused):
             local_expert_idx = expert_idx - self.slot_start
             mn_limit = tile_idx_to_mn_limit[tile_idx].item()
             row_start = tile_idx * self.tile_size
-            row_end = row_start + mn_limit
+            row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
 
             tile_input = fc1_output[row_start:row_end]  # [mn_limit, I]
 
