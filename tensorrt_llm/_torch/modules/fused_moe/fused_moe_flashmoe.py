@@ -29,6 +29,7 @@ Core algorithm:
 4. Multi-GPU: NVSHMEM kernel-level dispatch/combine (Phase 2 only)
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -42,6 +43,23 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode, _warn_and_return
 from .routing import BaseMoeRoutingMethod
+
+logger = logging.getLogger(__name__)
+
+try:
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as torch_symm_mem
+
+    _SYMM_MEM_AVAILABLE = True
+except ImportError:
+    _SYMM_MEM_AVAILABLE = False
+
+try:
+    from cuda.bindings import driver as cuda_driver  # noqa: F401
+
+    _CUDA_DRIVER_AVAILABLE = True
+except ImportError:
+    _CUDA_DRIVER_AVAILABLE = False
 
 
 def _silu(x: torch.Tensor) -> torch.Tensor:
@@ -422,10 +440,15 @@ class FlashMoECuteDsl(FlashMoEFused):
     Standalone MoE module (NOT wrapped by ConfigurableMoE).
     Fuses ALL operations into cuteDSL-backed kernels:
     - Single-GPU: moe_sort -> gather + GEMM + SwiGLU -> GEMM + scatter-add
-    - Multi-GPU: NVSHMEM dispatch + compute + combine in one kernel (future)
+    - Multi-GPU EP: symmetric memory AllGather + GEMM + ReduceScatter
 
     Uses moe_sort for tile management (same as CuteDslFusedMoE) and
-    cuteDSL bf16 grouped GEMM kernels for compute.
+    bf16 grouped GEMM kernels for compute.
+
+    Multi-GPU EP communication (V1):
+    - AllGather input tokens via symmetric memory + cuMemcpyDtoDAsync
+    - GEMM on all tokens with local experts only (moe_sort handles partitioning)
+    - ReduceScatter output via symmetric memory + cuMemcpyDtoDAsync + local sum
 
     Only supports unquantized bf16 on SM >= 90 (Hopper/Blackwell).
     """
@@ -505,7 +528,76 @@ class FlashMoECuteDsl(FlashMoEFused):
         )
 
         self.tile_size = self.DEFAULT_TILE_SIZE
-        self._nvshmem_mgr = None
+
+        # EP communication state (lazily initialized in _init_ep_comm)
+        self._ep_comm_initialized = False
+        self._input_symm = None
+        self._input_hdl = None
+        self._output_symm = None
+        self._output_hdl = None
+        self._remote_inputs = None
+        self._remote_outputs = None
+        self._cuda_graph = None
+        self._cuda_graph_captured = False
+
+    def _init_ep_comm(self, max_num_tokens: int):
+        """Lazily initialize symmetric memory buffers for EP communication.
+
+        Allocates symmetric memory visible to all EP ranks for:
+        - Input buffer: each rank writes its tokens, other ranks read via buffer_ptrs
+        - Output buffer: each rank writes its partial GEMM output, reduced locally
+
+        Args:
+            max_num_tokens: Maximum number of tokens per rank.
+        """
+        if self._ep_comm_initialized:
+            return
+
+        if self.ep_size <= 1:
+            self._ep_comm_initialized = True
+            return
+
+        if not _SYMM_MEM_AVAILABLE:
+            raise RuntimeError(
+                "FlashMoECuteDsl EP communication requires PyTorch >= 2.8 "
+                "with symmetric memory support"
+            )
+
+        H = self.hidden_size
+        ep_size = self.ep_size
+        device = f"cuda:{self.ep_rank}"
+
+        # Symmetric memory for input tokens — each rank's tokens visible to all
+        self._input_symm = torch_symm_mem.empty(
+            (max_num_tokens, H), device=device, dtype=torch.bfloat16
+        )
+        self._input_hdl = torch_symm_mem.rendezvous(self._input_symm)
+
+        # Symmetric memory for output — partial GEMM results, reduced across ranks
+        self._output_symm = torch_symm_mem.empty(
+            (max_num_tokens * ep_size, H), device=device, dtype=torch.bfloat16
+        )
+        self._output_hdl = torch_symm_mem.rendezvous(self._output_symm)
+
+        # Local buffers for remote ranks' input data (AllGather targets)
+        self._remote_inputs = [
+            torch.empty((max_num_tokens, H), device=device, dtype=torch.bfloat16)
+            for _ in range(ep_size)
+        ]
+
+        # Local buffers for remote ranks' output data (ReduceScatter sources)
+        self._remote_outputs = [
+            torch.empty((max_num_tokens * ep_size, H), device=device, dtype=torch.bfloat16)
+            for _ in range(ep_size)
+        ]
+
+        self._max_num_tokens_ep = max_num_tokens
+
+        logger.info(
+            f"FlashMoECuteDsl EP comm initialized: ep_size={ep_size}, "
+            f"ep_rank={self.ep_rank}, max_tokens={max_num_tokens}, H={H}"
+        )
+        self._ep_comm_initialized = True
 
     def run_moe(
         self,
@@ -588,6 +680,84 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         return final_output
 
+    def _get_ep_process_group(self):
+        """Get the EP process group for collective communication.
+
+        Tries mapping.moe_ep_group_pg (production), falls back to WORLD
+        (standalone tests where world_size == ep_size).
+        """
+        try:
+            return self.mapping.moe_ep_group_pg
+        except (AttributeError, RuntimeError):
+            return dist.group.WORLD
+
+    def _forward_ep(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """EP communication: AllGather input + local GEMM + ReduceScatter.
+
+        Each rank contributes its input tokens via AllGather so all ranks
+        see all tokens. Each rank runs GEMM only on its local experts
+        (moe_sort handles partitioning). Partial outputs are reduce-scattered
+        (sum) back so each rank gets the full result for its original tokens.
+
+        Requires all ranks to have the same number of tokens (pad if needed).
+
+        Args:
+            x: Input tokens [num_tokens, hidden_size], bf16.
+            token_selected_experts: Expert IDs [num_tokens, top_k], int32.
+            token_final_scales: Routing weights [num_tokens, top_k] or None.
+
+        Returns:
+            Output [num_tokens, hidden_size], bf16.
+        """
+        ep_size = self.ep_size
+        ep_group = self._get_ep_process_group()
+
+        # 1. AllGather input tokens across EP ranks
+        all_x_list = [torch.empty_like(x) for _ in range(ep_size)]
+        dist.all_gather(all_x_list, x.contiguous(), group=ep_group)
+        all_x = torch.cat(all_x_list, dim=0)  # [T_total, H]
+
+        # 2. AllGather routing info (small tensors, fine over NCCL)
+        all_experts_list = [torch.empty_like(token_selected_experts) for _ in range(ep_size)]
+        dist.all_gather(
+            all_experts_list,
+            token_selected_experts.contiguous(),
+            group=ep_group,
+        )
+        all_experts = torch.cat(all_experts_list, dim=0)
+
+        if token_final_scales is not None:
+            all_scales_list = [torch.empty_like(token_final_scales) for _ in range(ep_size)]
+            dist.all_gather(
+                all_scales_list,
+                token_final_scales.contiguous(),
+                group=ep_group,
+            )
+            all_scales = torch.cat(all_scales_list, dim=0)
+        else:
+            all_scales = None
+
+        # 3. Compute: run_moe on ALL tokens with LOCAL experts only
+        partial_output = self.run_moe(all_x, all_experts, all_scales)
+        # partial_output: [T_total, H] with contributions from local experts
+
+        # 4. ReduceScatter: sum partial outputs, each rank gets its portion
+        # Layout: [rank0_tokens, rank1_tokens, ..., rankN_tokens]
+        output = torch.empty_like(x)
+        dist.reduce_scatter_tensor(
+            output,
+            partial_output.contiguous(),
+            op=dist.ReduceOp.SUM,
+            group=ep_group,
+        )
+
+        return output
+
     def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -599,21 +769,62 @@ class FlashMoECuteDsl(FlashMoEFused):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        """
-        Full forward pass: routing -> run_moe -> reduce.
+        """Full forward: routing -> EP comm + GEMM -> TP reduce.
 
-        For multi-GPU with NVSHMEM (future): overrides comm to use
-        kernel-level dispatch/combine instead of allgather/reducescatter.
-        Currently delegates to parent for comm, uses cuteDSL for compute.
+        For ep_size > 1: AllGather + local GEMM + ReduceScatter via
+        _forward_ep(). EP handles all inter-GPU communication, so
+        DP allgather and TP reduce are skipped.
+        For ep_size == 1: direct run_moe with optional DP/TP comm.
         """
-        # For now, delegate to parent which handles DP allgather + TP reduce.
-        # In the future, multi-GPU NVSHMEM path will replace this.
-        return super().forward_impl(
-            x,
-            router_logits,
-            do_finalize=do_finalize,
-            output_dtype=output_dtype,
+        assert isinstance(x, torch.Tensor), (
+            "FlashMoECuteDsl does not support Fp4QuantizedTensor input"
+        )
+        assert do_finalize, "FlashMoECuteDsl does not support do_finalize=False"
+
+        x = x.view(-1, self.hidden_size)
+
+        # Apply routing
+        token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
+        token_selected_experts = token_selected_experts.to(torch.int32)
+
+        # Apply router weight on input if enabled
+        if self.apply_router_weight_on_input:
+            x = x * token_final_scales.to(x.dtype)
+            token_final_scales = None
+
+        if self.ep_size > 1:
+            # EP path: AllGather + local GEMM + ReduceScatter.
+            # EP handles ALL inter-GPU communication; skip DP/TP comm.
+            x, x_sf = self.quantize_input(x)
+            return self._forward_ep(x, token_selected_experts, token_final_scales)
+
+        # Single-GPU or TP-only path (no EP)
+        # DP AllGather (if using attention DP)
+        if self.use_dp and self.parallel_size > 1:
+            from ...distributed import allgather
+
+            x, token_selected_experts, token_final_scales = allgather(
+                [x, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens,
+            )
+
+        # Quantize (no-op for FlashMoE)
+        x, x_sf = self.quantize_input(x)
+
+        final_hidden_states = self.run_moe(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            x_sf=x_sf,
+        )
+
+        # ReduceScatter or AllReduce for TP
+        final_hidden_states = self.reducescatter_or_allreduce(
+            final_hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **kwargs,
         )
+
+        return final_hidden_states

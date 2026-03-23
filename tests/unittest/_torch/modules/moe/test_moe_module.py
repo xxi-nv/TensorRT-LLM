@@ -1481,8 +1481,9 @@ def test_configurable_moe_multi_gpu_eplb(
 # FlashMoECuteDsl Tests - Direct forward() call (standalone, no ConfigurableMoE)
 # ============================================================================
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashmoe import FlashMoECuteDsl  # noqa: E402
 from _torch.modules.moe.quantize_utils import BaseQuantizeUtil  # noqa: E402
+
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashmoe import FlashMoECuteDsl  # noqa: E402
 
 
 def _test_flashmoe_cutedsl_worker(
@@ -1538,9 +1539,7 @@ def _test_flashmoe_cutedsl_worker_impl(
             routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
         )
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
-        router_logits = torch.randn(
-            (seq_len, num_experts), dtype=dtype, device="cuda"
-        )
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
 
         # Create weights via BaseQuantizeUtil (unquantized bf16)
         quantize_util = BaseQuantizeUtil(
@@ -1582,8 +1581,7 @@ def _test_flashmoe_cutedsl_worker_impl(
             # partitioning without NCCL communication.
             # Each rank processes only its local experts via moe_sort.
             # Verify by comparing to a 1GPU FlashMoECuteDsl reference.
-            token_selected_experts, token_final_scales = routing_method.apply(
-                router_logits)
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
             token_selected_experts = token_selected_experts.to(torch.int32)
 
             with torch.inference_mode():
@@ -1641,15 +1639,17 @@ def _test_flashmoe_cutedsl_worker_impl(
                 torch.testing.assert_close(
                     output[all_local_mask],
                     full_output[all_local_mask],
-                    rtol=0, atol=0,
+                    rtol=0,
+                    atol=0,
                     msg=f"EP rank {ep_rank}: all-local tokens must match 1GPU",
                 )
 
             # All tokens: EP partial output norm should not exceed full output
             ep_norms = output.float().norm(dim=1)
             full_norms = full_output.float().norm(dim=1)
-            assert (ep_norms <= full_norms * 1.01 + 1.0).all(), \
+            assert (ep_norms <= full_norms * 1.01 + 1.0).all(), (
                 f"EP rank {ep_rank}: partial output norm exceeds full output"
+            )
         else:
             # Single-GPU: use forward() with full reference
             ref_module = quantize_util.create_ref_module(routing_method)
@@ -1658,9 +1658,7 @@ def _test_flashmoe_cutedsl_worker_impl(
 
             all_rank_num_tokens = [seq_len] * mapping.world_size
             with torch.inference_mode():
-                output = flashmoe.forward(
-                    x, router_logits, all_rank_num_tokens=all_rank_num_tokens
-                )
+                output = flashmoe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
                 ref_output = ref_module.forward(x, router_logits)
 
             ref_module.check_accuracy(output, ref_output)
@@ -1716,9 +1714,7 @@ def test_flashmoe_cutedsl_single_gpu(model_config, seq_len, routing_method_cls):
     )
 
 
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 4, reason="needs 4 GPUs"
-)
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize(
     "model_config,seq_len,routing_method_cls",
     [
@@ -1779,3 +1775,209 @@ def test_flashmoe_cutedsl_multi_gpu(model_config, seq_len, routing_method_cls):
         )
         for r in results:
             assert r is None
+
+
+# ============================================================================
+# FlashMoECuteDsl Fused EP Tests — AllGather + local GEMM + ReduceScatter
+# Uses torch.multiprocessing.spawn + NCCL (not MPI) for distributed comms.
+# ============================================================================
+
+
+def _flashmoe_fused_ep_worker(rank, world_size, port, model_config, seq_len, routing_method_cls):
+    """Worker for fused EP test — runs in each spawned process.
+
+    Each rank:
+    1. Initializes NCCL process group
+    2. Creates FlashMoECuteDsl with EP mapping
+    3. Calls forward() which triggers _forward_ep (AllGather + GEMM + ReduceScatter)
+    4. Compares against single-GPU reference (all experts, all tokens)
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    try:
+        _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, routing_method_cls)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, routing_method_cls):
+    """Implementation of fused EP test worker."""
+    dtype = torch.bfloat16
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    with torch.device(f"cuda:{rank}"):
+        # Use same seed on all ranks so we generate identical global data
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        # Generate ALL tokens and routing logits (same on every rank)
+        total_tokens = seq_len * world_size
+        all_x = torch.randn((total_tokens, hidden_size), dtype=dtype, device="cuda")
+        all_router_logits = torch.randn((total_tokens, num_experts), dtype=dtype, device="cuda")
+
+        # Each rank's portion
+        my_x = all_x[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        my_logits = all_router_logits[rank * seq_len : (rank + 1) * seq_len].contiguous()
+
+        # Create weights (same on all ranks due to same seed)
+        quantize_util = BaseQuantizeUtil(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=None,
+        )
+        weights = quantize_util.create_weights()
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        routing_method = _create_routing_method(
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
+
+        # --- EP model (world_size ranks, each with local experts) ---
+        ep_mapping = Mapping(
+            world_size=world_size,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+            moe_tp_size=1,
+            enable_attention_dp=True,
+        )
+        ep_mapping.rank = rank
+
+        ep_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ep_mapping,
+        )
+
+        flashmoe_ep = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ep_model_cfg,
+        )
+        flashmoe_ep.load_weights([weights])
+        flashmoe_ep.cuda(f"cuda:{rank}")
+
+        all_rank_num_tokens = [seq_len] * world_size
+
+        with torch.inference_mode():
+            ep_output = flashmoe_ep.forward(
+                my_x,
+                my_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+
+        # --- Single-GPU reference (all experts, all tokens) ---
+        ref_mapping = Mapping()
+        ref_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ref_mapping,
+        )
+
+        flashmoe_ref = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ref_model_cfg,
+        )
+        flashmoe_ref.load_weights([weights])
+        flashmoe_ref.cuda(f"cuda:{rank}")
+
+        with torch.inference_mode():
+            ref_output = flashmoe_ref.forward(all_x, all_router_logits)
+
+        # My portion of the reference output
+        my_ref_output = ref_output[rank * seq_len : (rank + 1) * seq_len].contiguous()
+
+        # Compare EP output vs reference
+        torch.testing.assert_close(
+            ep_output,
+            my_ref_output,
+            rtol=1e-2,
+            atol=1e-2,
+            msg=(f"Rank {rank}: fused EP output does not match single-GPU reference"),
+        )
+
+        G_LOGGER.info(
+            "Rank %d: fused EP test PASSED (max_diff=%.6f)",
+            rank,
+            (ep_output - my_ref_output).abs().max().item(),
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            [
+                MoeModelConfig(60, 4, 2048, 1408),
+                MoeModelConfig(256, 8, 7168, 2048),
+            ],
+            [8],
+            [RenormalizeMoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_fused_multi_gpu(model_config, seq_len, routing_method_cls):
+    """Multi-GPU fused EP test: AllGather + local GEMM + ReduceScatter.
+
+    Uses torch.multiprocessing.spawn + NCCL for distributed communication.
+    Each rank runs forward() which internally does EP AllGather/ReduceScatter.
+    Compares against single-GPU reference output.
+    """
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    import torch.multiprocessing as mp
+
+    from tensorrt_llm._utils import get_free_port
+
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(
+        _flashmoe_fused_ep_worker,
+        args=(world_size, port, model_config, seq_len, routing_method_cls),
+        nprocs=world_size,
+        join=True,
+    )
