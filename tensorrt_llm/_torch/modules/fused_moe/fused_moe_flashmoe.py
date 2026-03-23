@@ -34,10 +34,12 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+# Ensure bf16 FlashMoE custom ops are registered
+import tensorrt_llm._torch.custom_ops.flashmoe_bf16_custom_ops  # noqa: F401
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...model_config import ModelConfig
-from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor, is_gated_activation
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode, _warn_and_return
 from .routing import BaseMoeRoutingMethod
 
@@ -80,17 +82,16 @@ class FlashMoEFused(MoE):
         """
         if quant_algo is not None:
             return _warn_and_return(
-                f"FlashMoEFused only supports unquantized mode "
-                f"(got quant_algo={quant_algo})")
+                f"FlashMoEFused only supports unquantized mode (got quant_algo={quant_algo})"
+            )
 
         if dtype_activation not in (torch.float16, torch.bfloat16):
             return _warn_and_return(
-                f"FlashMoEFused only supports float16/bfloat16 "
-                f"(got {dtype_activation})")
+                f"FlashMoEFused only supports float16/bfloat16 (got {dtype_activation})"
+            )
 
         if swiglu_gptoss_style:
-            return _warn_and_return(
-                "FlashMoEFused does not support swiglu_gptoss_style")
+            return _warn_and_return("FlashMoEFused does not support swiglu_gptoss_style")
 
         return True, None
 
@@ -104,10 +105,8 @@ class FlashMoEFused(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream_dict: Optional[Dict[AuxStreamType,
-                                       torch.cuda.Stream]] = None,
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
@@ -191,18 +190,15 @@ class FlashMoEFused(MoE):
         self.quant_scales = tuple()
         self._weights_created = True
 
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """Load weights using the same pattern as other backends."""
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        from .quantization import (TensorParallelMode, load_weight_shard)
+        from .quantization import TensorParallelMode, load_weight_shard
 
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
+        for local_slot_id, expert_id in enumerate(self.initial_local_expert_ids):
             if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_weight = weights.get(f"{expert_id}.w1.weight")
                 w3_weight = weights.get(f"{expert_id}.w3.weight")
@@ -210,14 +206,17 @@ class FlashMoEFused(MoE):
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_weight, w3_weight = None, None
                 if "gate_up_proj" in weights:
-                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
-                        0, 1)
+                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(0, 1)
                     w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = (weights["down_proj"][expert_id].transpose(
-                    0, 1).contiguous() if "down_proj" in weights else None)
+                w2_weight = (
+                    weights["down_proj"][expert_id].transpose(0, 1).contiguous()
+                    if "down_proj" in weights
+                    else None
+                )
             else:
                 raise NotImplementedError(
-                    f"Unknown weight loading mode: {self.weight_loading_mode}")
+                    f"Unknown weight loading mode: {self.weight_loading_mode}"
+                )
 
             device = self.w3_w1_weight.device
             dst_w3_w1 = self.w3_w1_weight.data[local_slot_id]
@@ -225,42 +224,35 @@ class FlashMoEFused(MoE):
 
             # Load w1 (up proj) and w3 (gate proj) into fused w3_w1
             if w1_weight is not None:
-                w1_shard = load_weight_shard(w1_weight, self.tp_size,
-                                             self.tp_rank,
-                                             TensorParallelMode.COLUMN,
-                                             device=device)
+                w1_shard = load_weight_shard(
+                    w1_weight, self.tp_size, self.tp_rank, TensorParallelMode.COLUMN, device=device
+                )
                 dst_w3_w1_w3, dst_w3_w1_w1 = dst_w3_w1.chunk(2, dim=0)
-                dst_w3_w1_w1.copy_(w1_shard.contiguous().view(dst_w3_w1.dtype),
-                                   non_blocking=True)
+                dst_w3_w1_w1.copy_(w1_shard.contiguous().view(dst_w3_w1.dtype), non_blocking=True)
 
             if w3_weight is not None:
-                w3_shard = load_weight_shard(w3_weight, self.tp_size,
-                                             self.tp_rank,
-                                             TensorParallelMode.COLUMN,
-                                             device=device)
+                w3_shard = load_weight_shard(
+                    w3_weight, self.tp_size, self.tp_rank, TensorParallelMode.COLUMN, device=device
+                )
                 dst_w3_w1_w3, _ = dst_w3_w1.chunk(2, dim=0)
-                dst_w3_w1_w3.copy_(w3_shard.contiguous().view(dst_w3_w1.dtype),
-                                   non_blocking=True)
+                dst_w3_w1_w3.copy_(w3_shard.contiguous().view(dst_w3_w1.dtype), non_blocking=True)
 
             # Load w2 (down proj)
             if w2_weight is not None:
-                w2_shard = load_weight_shard(w2_weight, self.tp_size,
-                                             self.tp_rank,
-                                             TensorParallelMode.ROW,
-                                             device=device)
+                w2_shard = load_weight_shard(
+                    w2_weight, self.tp_size, self.tp_rank, TensorParallelMode.ROW, device=device
+                )
                 dst_w2.copy_(w2_shard.view(dst_w2.dtype), non_blocking=True)
 
     def post_load_weights(self):
         """Post-load weight processing. Sets up EPLB if needed."""
-        if hasattr(self,
-                   "layer_load_balancer") and self.layer_load_balancer:
+        if hasattr(self, "layer_load_balancer") and self.layer_load_balancer:
             weight_fns = {
-                'w3_w1_weight': self.w3_w1_weight.data,
-                'w2_weight': self.w2_weight.data,
+                "w3_w1_weight": self.w3_w1_weight.data,
+                "w2_weight": self.w2_weight.data,
             }
             self.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
-            self.layer_load_balancer.set_initial_weight_assignments(
-                self.initial_global_assignments)
+            self.layer_load_balancer.set_initial_weight_assignments(self.initial_global_assignments)
 
     def quantize_input(
         self,
@@ -300,16 +292,15 @@ class FlashMoEFused(MoE):
         output_dtype = x.dtype
 
         # Initialize output
-        final_output = torch.zeros(
-            (num_tokens, hidden_size), dtype=output_dtype, device=x.device)
+        final_output = torch.zeros((num_tokens, hidden_size), dtype=output_dtype, device=x.device)
 
         # Flatten [num_tokens, top_k] -> [num_tokens * top_k]
         flat_expert_ids = token_selected_experts.view(-1)  # [N*K]
         flat_scales = token_final_scales.float().view(-1)  # [N*K]
         # Token indices: [0,0,..,1,1,..,2,2,..] each repeated top_k times
-        flat_token_ids = torch.arange(
-            num_tokens, device=x.device).unsqueeze(1).expand(
-                -1, top_k).reshape(-1)  # [N*K]
+        flat_token_ids = (
+            torch.arange(num_tokens, device=x.device).unsqueeze(1).expand(-1, top_k).reshape(-1)
+        )  # [N*K]
 
         # Process each local expert
         for local_expert_idx in range(self.expert_size_per_partition):
@@ -355,8 +346,7 @@ class FlashMoEFused(MoE):
                 expert_output = expert_output + self.w2_bias[local_expert_idx]
 
             # Weighted scatter-add back to original positions
-            weighted_output = expert_output * expert_scales.unsqueeze(
-                1).to(expert_output.dtype)
+            weighted_output = expert_output * expert_scales.unsqueeze(1).to(expert_output.dtype)
             final_output.index_add_(0, expert_token_ids, weighted_output)
 
         return final_output
@@ -378,15 +368,15 @@ class FlashMoEFused(MoE):
         This is the legacy single-backend forward path used when NOT wrapped
         by ConfigurableMoE.
         """
-        assert isinstance(x, torch.Tensor), \
+        assert isinstance(x, torch.Tensor), (
             "FlashMoEFused does not support Fp4QuantizedTensor input"
+        )
         assert do_finalize, "FlashMoEFused does not support do_finalize=False"
 
         x = x.view(-1, self.hidden_size)
 
         # Apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+        token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
         token_selected_experts = token_selected_experts.to(torch.int32)
 
         # Apply router weight on input if enabled
@@ -397,11 +387,13 @@ class FlashMoEFused(MoE):
         # AllGather for attention DP
         if self.use_dp and self.parallel_size > 1:
             from ...distributed import allgather
+
             x, token_selected_experts, token_final_scales = allgather(
                 [x, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=None if use_dp_padding else all_rank_num_tokens,
+            )
 
         # Quantize (no-op for FlashMoE)
         x, x_sf = self.quantize_input(x)
@@ -456,16 +448,13 @@ class FlashMoECuteDsl(FlashMoEFused):
         - SM >= 90 (Hopper or Blackwell)
         - No swiglu_gptoss_style
         """
-        can, reason = FlashMoEFused.can_implement(
-            quant_algo, dtype_activation, swiglu_gptoss_style
-        )
+        can, reason = FlashMoEFused.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
         if not can:
             return can, reason
 
         if dtype_activation != torch.bfloat16:
             return _warn_and_return(
-                "FlashMoECuteDsl only supports bfloat16 "
-                f"(got {dtype_activation})"
+                f"FlashMoECuteDsl only supports bfloat16 (got {dtype_activation})"
             )
 
         if not torch.cuda.is_available():
@@ -473,8 +462,7 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         if torch.cuda.get_device_capability() < (9, 0):
             return _warn_and_return(
-                "FlashMoECuteDsl requires SM >= 90 "
-                f"(got SM {torch.cuda.get_device_capability()})"
+                f"FlashMoECuteDsl requires SM >= 90 (got SM {torch.cuda.get_device_capability()})"
             )
 
         return True, None
@@ -489,10 +477,8 @@ class FlashMoECuteDsl(FlashMoEFused):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream_dict: Optional[Dict[AuxStreamType,
-                                       torch.cuda.Stream]] = None,
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
@@ -571,77 +557,34 @@ class FlashMoECuteDsl(FlashMoEFused):
             tile_tokens_dim=self.tile_size,
         )
 
-        total_permuted = permuted_idx_to_expanded_idx.shape[0]
-        n_valid_tiles = num_non_exiting_tiles.item()
-
         # Step 2: FC1 - Gather + Grouped GEMM + SwiGLU
-        # Process tiles: gather input, GEMM with gate_up weights, apply SwiGLU
-        interm_size = self.intermediate_size_per_partition
-        fc1_output = torch.zeros(
-            total_permuted, interm_size, dtype=output_dtype, device=x.device
+        fc1_output = torch.ops.trtllm.flashmoe_bf16_gather_gemm_swiglu(
+            input=x,
+            weight=self.w3_w1_weight,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            top_k=top_k,
+            tile_size=self.tile_size,
+            is_gated_activation=self.is_gated_activation,
         )
-
-        for tile_idx in range(n_valid_tiles):
-            # moe_sort outputs local expert indices (already offset by slot_start)
-            local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-            mn_limit = tile_idx_to_mn_limit[tile_idx].item()
-            row_start = tile_idx * self.tile_size
-            row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
-
-            # Gather input tokens using permutation indices
-            perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
-            # Map expanded indices to token indices
-            token_indices = perm_indices // top_k
-            gathered_input = x[token_indices]  # [mn_limit, hidden_size]
-
-            # FC1 GEMM: gathered_input @ w3_w1[local_expert].T
-            w3_w1 = self.w3_w1_weight[local_expert_idx]  # [2*I, H]
-            gate_up = torch.mm(gathered_input, w3_w1.t())  # [mn_limit, 2*I]
-
-            if self.w3_w1_bias is not None:
-                gate_up = gate_up + self.w3_w1_bias[local_expert_idx]
-
-            # SwiGLU activation
-            # Layout: [w3(up_proj), w1(gate_proj)]
-            up_proj, gate_proj = gate_up.chunk(2, dim=-1)
-
-            if self.is_gated_activation:
-                activated = _swiglu(gate_proj, up_proj)
-            else:
-                activated = up_proj
-
-            fc1_output[row_start:row_end] = activated
 
         # Step 3: FC2 - Grouped GEMM + Scale + Scatter-Add
-        final_output = torch.zeros(
-            num_tokens, hidden_size, dtype=output_dtype, device=x.device
+        final_output = torch.ops.trtllm.flashmoe_bf16_gemm_finalize(
+            input=fc1_output,
+            weight=self.w2_weight,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            top_k=top_k,
+            tile_size=self.tile_size,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            output_dtype=output_dtype,
         )
-
-        # Flatten token_final_scales for expanded index lookup
-        flat_scales = token_final_scales.float().view(-1)  # [num_tokens * top_k]
-
-        for tile_idx in range(n_valid_tiles):
-            # moe_sort outputs local expert indices (already offset by slot_start)
-            local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-            mn_limit = tile_idx_to_mn_limit[tile_idx].item()
-            row_start = tile_idx * self.tile_size
-            row_end = mn_limit  # mn_limit is absolute cumulative boundary, not per-tile count
-
-            tile_input = fc1_output[row_start:row_end]  # [mn_limit, I]
-
-            # FC2 GEMM: tile_input @ w2[local_expert].T
-            w2 = self.w2_weight[local_expert_idx]  # [H, I]
-            tile_output = torch.mm(tile_input, w2.t())  # [mn_limit, H]
-
-            if self.w2_bias is not None:
-                tile_output = tile_output + self.w2_bias[local_expert_idx]
-
-            # Scale by routing weights and scatter-add
-            perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
-            token_indices = perm_indices // top_k
-            scales = flat_scales[perm_indices].unsqueeze(1)  # [mn_limit, 1]
-            scaled_output = tile_output * scales.to(tile_output.dtype)
-            final_output.index_add_(0, token_indices, scaled_output)
 
         return final_output
 
