@@ -18,13 +18,54 @@ These ops encapsulate the bf16 grouped GEMM fusion boundary for FlashMoE:
 - FC1: Gather + GroupedGEMM + SwiGLU
 - FC2: GroupedGEMM + Scale + Scatter-Add
 
-Currently uses reference torch.mm() implementation. The compute path can be
-replaced by compiled cuteDSL kernels when bf16 grouped GEMM support is ready.
+Uses expert-merged GEMM: tiles are grouped by expert (from moe_sort) so that
+all tiles for the same expert are processed in a single torch.mm() call.
+This reduces CUDA kernel launch overhead from O(num_tiles) to O(num_active_experts).
+
+The compute path can be replaced by compiled cuteDSL kernels when bf16 grouped
+GEMM support is ready (CUTLASS GroupedGemmKernel supports bf16 on SM100+).
 
 No cutlass-dsl dependency - these ops use pure PyTorch operations.
 """
 
 import torch
+
+
+def _merge_expert_ranges(tile_idx_to_expert_idx, tile_idx_to_mn_limit, n_valid_tiles, tile_size):
+    """Merge consecutive tiles belonging to the same expert into ranges.
+
+    Since moe_sort groups tiles by expert, consecutive tiles for the same
+    expert can be merged into a single contiguous range for one GEMM call.
+
+    Returns list of (expert_idx, row_start, row_end) tuples.
+    """
+    if n_valid_tiles == 0:
+        return []
+
+    ranges = []
+    expert_ids = tile_idx_to_expert_idx[:n_valid_tiles]
+    mn_limits = tile_idx_to_mn_limit[:n_valid_tiles]
+
+    cur_expert = expert_ids[0].item()
+    cur_start = 0
+    cur_end = mn_limits[0].item()
+
+    for tile_idx in range(1, n_valid_tiles):
+        expert_idx = expert_ids[tile_idx].item()
+        mn_limit = mn_limits[tile_idx].item()
+
+        if expert_idx == cur_expert:
+            # Same expert: extend the range
+            cur_end = mn_limit
+        else:
+            # Different expert: emit the current range and start new one
+            ranges.append((cur_expert, cur_start, cur_end))
+            cur_expert = expert_idx
+            cur_start = tile_idx * tile_size
+            cur_end = mn_limit
+
+    ranges.append((cur_expert, cur_start, cur_end))
+    return ranges
 
 
 @torch.library.custom_op(
@@ -43,10 +84,10 @@ def flashmoe_bf16_gather_gemm_swiglu(
 ) -> torch.Tensor:
     """FC1: Gather + GroupedGEMM + SwiGLU for bf16 FlashMoE.
 
-    Processes all expert tiles in a single call:
-    1. For each valid tile, gather input tokens using permuted indices
-    2. GEMM with expert's gate_up weights
-    3. Apply SwiGLU activation (if gated)
+    Merges consecutive tiles by expert for efficient GEMM execution:
+    1. Group tiles by expert (O(num_active_experts) GEMM calls instead of O(num_tiles))
+    2. For each expert group: gather input tokens, GEMM, apply SwiGLU
+    3. Write results to contiguous output buffer
 
     Args:
         input: [num_tokens, hidden_size], bf16
@@ -66,18 +107,20 @@ def flashmoe_bf16_gather_gemm_swiglu(
     output = torch.zeros(total_permuted, interm_size, dtype=input.dtype, device=input.device)
     n_valid_tiles = num_non_exiting_tiles.item()
 
-    for tile_idx in range(n_valid_tiles):
-        local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-        mn_limit = tile_idx_to_mn_limit[tile_idx].item()
-        row_start = tile_idx * tile_size
-        row_end = mn_limit
+    expert_ranges = _merge_expert_ranges(
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, n_valid_tiles, tile_size
+    )
 
+    for local_expert_idx, row_start, row_end in expert_ranges:
+        # Gather input tokens for all tiles of this expert
         perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
         token_indices = perm_indices // top_k
         gathered_input = input[token_indices]
 
+        # Single GEMM for all tokens assigned to this expert
         gate_up = torch.mm(gathered_input, weight[local_expert_idx].t())
 
+        # SwiGLU activation
         up_proj, gate_proj = gate_up.chunk(2, dim=-1)
         if is_gated_activation:
             activated = torch.nn.functional.silu(gate_proj) * up_proj
@@ -123,10 +166,9 @@ def flashmoe_bf16_gemm_finalize_inplace(
 ) -> None:
     """FC2: GroupedGEMM + Scale + Scatter-Add for bf16 FlashMoE (in-place).
 
-    Processes all expert tiles in a single call:
-    1. For each valid tile, GEMM intermediate with expert's down-projection weights
-    2. Scale by routing weights
-    3. Scatter-add to output at original token positions
+    Merges consecutive tiles by expert for efficient GEMM execution:
+    1. Group tiles by expert (O(num_active_experts) GEMM calls instead of O(num_tiles))
+    2. For each expert group: GEMM, scale by routing weights, scatter-add
 
     Args:
         input: [total_permuted_tokens, intermediate_size], bf16
@@ -143,19 +185,20 @@ def flashmoe_bf16_gemm_finalize_inplace(
     n_valid_tiles = num_non_exiting_tiles.item()
     flat_scales = token_final_scales.float().view(-1)
 
-    for tile_idx in range(n_valid_tiles):
-        local_expert_idx = tile_idx_to_expert_idx[tile_idx].item()
-        mn_limit = tile_idx_to_mn_limit[tile_idx].item()
-        row_start = tile_idx * tile_size
-        row_end = mn_limit
+    expert_ranges = _merge_expert_ranges(
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, n_valid_tiles, tile_size
+    )
 
-        tile_input = input[row_start:row_end]
-        tile_output = torch.mm(tile_input, weight[local_expert_idx].t())
+    for local_expert_idx, row_start, row_end in expert_ranges:
+        # Single GEMM for all tokens assigned to this expert
+        expert_input = input[row_start:row_end]
+        expert_output = torch.mm(expert_input, weight[local_expert_idx].t())
 
+        # Scale by routing weights and scatter-add to output
         perm_indices = permuted_idx_to_expanded_idx[row_start:row_end]
         token_indices = perm_indices // top_k
         scales = flat_scales[perm_indices].unsqueeze(1)
-        scaled_output = tile_output * scales.to(tile_output.dtype)
+        scaled_output = expert_output * scales.to(expert_output.dtype)
         output.index_add_(0, token_indices, scaled_output)
 
 
