@@ -1844,6 +1844,16 @@ def _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, rout
         )
         weights = quantize_util.create_weights()
 
+        # Diagnostic: verify all ranks created the same data
+        x_hash = all_x.sum().item()
+        logits_hash = all_router_logits.sum().item()
+        w0_hash = weights["0.w1.weight"].sum().item()
+        print(
+            f"[Rank {rank}] Data hashes: all_x={x_hash:.4f}, "
+            f"logits={logits_hash:.4f}, w0={w0_hash:.4f}",
+            flush=True,
+        )
+
         pretrained_config = PretrainedConfig()
         pretrained_config.num_experts = num_experts
         pretrained_config.hidden_size = hidden_size
@@ -1881,6 +1891,24 @@ def _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, rout
         flashmoe_ep.load_weights([weights])
         flashmoe_ep.cuda(f"cuda:{rank}")
 
+        # Diagnostic: EP model config
+        print(
+            f"[Rank {rank}] EP model: ep_size={flashmoe_ep.ep_size}, "
+            f"ep_rank={flashmoe_ep.ep_rank}, slot_start={flashmoe_ep.slot_start}, "
+            f"expert_size={flashmoe_ep.expert_size_per_partition}, "
+            f"tp_size={flashmoe_ep.tp_size}, tp_rank={flashmoe_ep.tp_rank}, "
+            f"use_dp={flashmoe_ep.use_dp}, parallel_size={flashmoe_ep.parallel_size}",
+            flush=True,
+        )
+        # Diagnostic: weight checksums
+        print(
+            f"[Rank {rank}] EP weights: w3_w1={flashmoe_ep.w3_w1_weight.data.sum().item():.4f}, "
+            f"w2={flashmoe_ep.w2_weight.data.sum().item():.4f}, "
+            f"w3_w1_shape={list(flashmoe_ep.w3_w1_weight.shape)}, "
+            f"w2_shape={list(flashmoe_ep.w2_weight.shape)}",
+            flush=True,
+        )
+
         all_rank_num_tokens = [seq_len] * world_size
 
         with torch.inference_mode():
@@ -1889,6 +1917,14 @@ def _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, rout
                 my_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
+
+        print(
+            f"[Rank {rank}] EP output: norm={ep_output.norm().item():.6f}, "
+            f"max={ep_output.max().item():.6f}, min={ep_output.min().item():.6f}, "
+            f"all_zero={torch.all(ep_output == 0).item()}, "
+            f"shape={list(ep_output.shape)}",
+            flush=True,
+        )
 
         # --- Single-GPU reference (all experts, all tokens) ---
         ref_mapping = Mapping()
@@ -1909,25 +1945,57 @@ def _flashmoe_fused_ep_worker_impl(rank, world_size, model_config, seq_len, rout
         flashmoe_ref.load_weights([weights])
         flashmoe_ref.cuda(f"cuda:{rank}")
 
+        # Diagnostic: ref model config
+        print(
+            f"[Rank {rank}] Ref model: ep_size={flashmoe_ref.ep_size}, "
+            f"slot_start={flashmoe_ref.slot_start}, "
+            f"expert_size={flashmoe_ref.expert_size_per_partition}",
+            flush=True,
+        )
+        print(
+            f"[Rank {rank}] Ref weights: w3_w1={flashmoe_ref.w3_w1_weight.data.sum().item():.4f}, "
+            f"w2={flashmoe_ref.w2_weight.data.sum().item():.4f}",
+            flush=True,
+        )
+
         with torch.inference_mode():
             ref_output = flashmoe_ref.forward(all_x, all_router_logits)
+
+        print(
+            f"[Rank {rank}] Ref output: norm={ref_output.norm().item():.6f}, "
+            f"shape={list(ref_output.shape)}",
+            flush=True,
+        )
 
         # My portion of the reference output
         my_ref_output = ref_output[rank * seq_len : (rank + 1) * seq_len].contiguous()
 
-        # Compare EP output vs reference
+        # Diagnostic: compare EP vs reference
+        diff = (ep_output - my_ref_output).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        print(
+            f"[Rank {rank}] Comparison: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, "
+            f"ep_norm={ep_output.norm().item():.6f}, "
+            f"ref_norm={my_ref_output.norm().item():.6f}",
+            flush=True,
+        )
+        # Print first few values
+        print(f"[Rank {rank}] EP first 5: {ep_output[0, :5].tolist()}", flush=True)
+        print(f"[Rank {rank}] Ref first 5: {my_ref_output[0, :5].tolist()}", flush=True)
+
+        # Compare without custom msg to get default detailed output
         torch.testing.assert_close(
             ep_output,
             my_ref_output,
             rtol=1e-2,
             atol=1e-2,
-            msg=(f"Rank {rank}: fused EP output does not match single-GPU reference"),
         )
 
         G_LOGGER.info(
             "Rank %d: fused EP test PASSED (max_diff=%.6f)",
             rank,
-            (ep_output - my_ref_output).abs().max().item(),
+            max_diff,
         )
 
 
