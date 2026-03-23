@@ -746,13 +746,6 @@ class FlashMoECuteDsl(FlashMoEFused):
         partial_output = self.run_moe(all_x, all_experts, all_scales)
         # partial_output: [T_total, H] with contributions from local experts
 
-        logger.info(
-            f"EP rank {self.ep_rank}: _forward_ep run_moe done. "
-            f"all_x={all_x.shape}, partial_output={partial_output.shape}, "
-            f"partial_norm={partial_output.norm().item():.4f}, "
-            f"partial_nonzero={torch.count_nonzero(partial_output).item()}"
-        )
-
         # 4. ReduceScatter: sum partial outputs, each rank gets its portion
         # Layout: [rank0_tokens, rank1_tokens, ..., rankN_tokens]
         output = torch.empty_like(x)
@@ -761,11 +754,6 @@ class FlashMoECuteDsl(FlashMoEFused):
             partial_output.contiguous(),
             op=dist.ReduceOp.SUM,
             group=ep_group,
-        )
-
-        logger.info(
-            f"EP rank {self.ep_rank}: _forward_ep done. "
-            f"output={output.shape}, output_norm={output.norm().item():.4f}"
         )
 
         return output
