@@ -33,6 +33,7 @@ import torch
 
 # Global cache for compiled cuteDSL kernels
 _compiled_kernel_cache = {}
+_compiled_finalize_kernel_cache = {}
 
 # Environment variable to force-disable cuteDSL path
 _FORCE_DISABLE_CUTEDSL = os.environ.get("FLASHMOE_DISABLE_CUTEDSL", "0") == "1"
@@ -317,6 +318,135 @@ def _fc2_torch_fallback(
         output.index_add_(0, token_indices, scaled_output)
 
 
+def _run_cutedsl_finalize_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+    tile_size: int,
+):
+    """Run the cuteDSL fused finalize GEMM kernel (GEMM + scale + scatter-add).
+
+    Args:
+        a: [M, K] bf16, permuted activations (contiguous, K-major)
+        b: [num_experts, N, K] bf16, expert weights (K-major within each expert)
+        out: [num_tokens, N] bf16, output buffer (pre-zeroed, scatter-add target)
+        tile_idx_to_expert_idx: [num_tiles] int32
+        tile_idx_to_mn_limit: [num_tiles] int32
+        permuted_idx_to_expanded_idx: [M] int32
+        num_non_exiting_tiles: [1] int32
+        token_final_scales: [num_tokens, top_k] float32
+        num_experts: number of experts
+        num_tokens: number of output tokens
+        top_k: number of experts per token
+        tile_size: MMA tile M dimension
+    """
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..cute_dsl_kernels.blackwell.utils import make_ptr
+
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[1]
+
+    # Alpha = 1.0 for all experts
+    alpha = torch.ones(num_experts, dtype=torch.float32, device=a.device)
+
+    # Ensure token_final_scales is [num_tokens, top_k] and float32
+    scales = token_final_scales.float().view(num_tokens, top_k).contiguous()
+
+    # Get current CUDA stream
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+
+    # Create pointer objects
+    a_ptr = make_ptr(cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(cutlass.BFloat16, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    out_ptr = make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    tile_expert_ptr = make_ptr(
+        cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
+    )
+    tile_mn_ptr = make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem)
+    perm_ptr = make_ptr(
+        cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(), cute.AddressSpace.gmem
+    )
+    nnet_ptr = make_ptr(cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem)
+    scales_ptr = make_ptr(cutlass.Float32, scales.data_ptr(), cute.AddressSpace.gmem)
+
+    mma_tiler_mn = (tile_size, 128)
+    cluster_shape_mn = (tile_size // 128, 1)
+
+    cache_key = ("finalize", tile_size)
+    if cache_key not in _compiled_finalize_kernel_cache:
+        from ..cute_dsl_kernels.blackwell.bf16_contiguous_grouped_gemm_finalize_fusion import (
+            Sm100Bf16ContiguousGroupedGemmFinalizeFusionKernel,
+        )
+
+        gemm = Sm100Bf16ContiguousGroupedGemmFinalizeFusionKernel(
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+        )
+
+        hardware_info = cutlass.utils.HardwareInfo()
+        max_active_clusters = hardware_info.get_max_active_clusters(
+            cluster_shape_mn[0] * cluster_shape_mn[1]
+        )
+
+        compiled_gemm = cute.compile(
+            gemm.wrapper,
+            a_ptr,
+            b_ptr,
+            out_ptr,
+            alpha_ptr,
+            tile_expert_ptr,
+            tile_mn_ptr,
+            perm_ptr,
+            nnet_ptr,
+            scales_ptr,
+            m,
+            n,
+            k,
+            num_experts,
+            num_tokens,
+            top_k,
+            tile_size=tile_size,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+        _compiled_finalize_kernel_cache[cache_key] = compiled_gemm
+    else:
+        compiled_gemm = _compiled_finalize_kernel_cache[cache_key]
+
+    compiled_gemm(
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        alpha_ptr,
+        tile_expert_ptr,
+        tile_mn_ptr,
+        perm_ptr,
+        nnet_ptr,
+        scales_ptr,
+        m,
+        n,
+        k,
+        num_experts,
+        num_tokens,
+        top_k,
+        stream=stream,
+    )
+
+
 def _fc2_cutedsl(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -329,53 +459,28 @@ def _fc2_cutedsl(
     top_k: int,
     tile_size: int,
 ) -> None:
-    """FC2 implementation using cuteDSL grouped GEMM kernel."""
-    total_permuted = permuted_idx_to_expanded_idx.shape[0]
-    hidden_size = weight.shape[1]
+    """FC2 implementation using cuteDSL fused finalize kernel.
+
+    Fuses GEMM + scale + scatter-add into a single kernel launch.
+    No intermediate gemm_output buffer needed.
+    """
+    num_tokens = output.shape[0]
     num_experts = weight.shape[0]
 
-    # Step 1: Run cuteDSL grouped GEMM
-    # A: [total_permuted, interm_size]
-    # B: [num_experts, hidden_size, interm_size] - already in correct layout
-    # C: [total_permuted, hidden_size]
-    gemm_output = torch.empty(total_permuted, hidden_size, dtype=input.dtype, device=input.device)
-
-    _run_cutedsl_gemm(
+    _run_cutedsl_finalize_gemm(
         a=input,
         b=weight,
-        c=gemm_output,
+        out=output,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         num_non_exiting_tiles=num_non_exiting_tiles,
+        token_final_scales=token_final_scales,
         num_experts=num_experts,
+        num_tokens=num_tokens,
+        top_k=top_k,
         tile_size=tile_size,
     )
-
-    # Step 2: Scale by routing weights and scatter-add (valid rows only)
-    # moe_sort pads each tile to tile_size; padding rows have sentinel
-    # indices and must NOT participate in scatter-add.
-    # tile_idx_to_mn_limit[t] is the absolute position in the padded
-    # layout where real rows end for tile t. For example, with tile_size=128
-    # and 2 tiles with 1 real token each: mn_limit = [1, 129].
-    # Build a boolean mask over all positions identifying valid rows.
-    n_valid_tiles = num_non_exiting_tiles.item()
-    if n_valid_tiles == 0:
-        return
-
-    # Vectorized valid-row mask: position p is valid iff p < mn_limit[p // tile_size]
-    positions = torch.arange(total_permuted, device=gemm_output.device)
-    tile_indices = positions // tile_size
-    # Only check tiles within n_valid_tiles; padding tiles are invalid
-    valid_mask = (tile_indices < n_valid_tiles) & (
-        positions < tile_idx_to_mn_limit[tile_indices.clamp(max=n_valid_tiles - 1)]
-    )
-
-    valid_positions = valid_mask.nonzero(as_tuple=True)[0]
-    flat_scales = token_final_scales.float().view(-1)
-    perm_indices = permuted_idx_to_expanded_idx[valid_positions]
-    token_indices = perm_indices // top_k
-    scales = flat_scales[perm_indices].unsqueeze(1)
-    scaled_output = gemm_output[valid_positions] * scales.to(gemm_output.dtype)
-    output.index_add_(0, token_indices, scaled_output)
 
 
 @torch.library.custom_op(
