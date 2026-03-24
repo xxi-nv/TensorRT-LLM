@@ -250,7 +250,12 @@ def _fc1_cutedsl(
     num_experts = weight.shape[0]
 
     # Step 1: Pre-gather tokens into contiguous buffer
+    # Clamp indices for safe gather: padding positions in
+    # permuted_idx_to_expanded_idx may contain sentinel values.
+    # The kernel only reads valid tile rows, so padding data in
+    # gathered_a is harmless (never contributes to final output).
     token_indices = permuted_idx_to_expanded_idx // top_k
+    token_indices = token_indices.clamp(0, input.shape[0] - 1)
     gathered_a = input[token_indices]  # [total_permuted, hidden_size]
 
     # Step 2: Run cuteDSL grouped GEMM
@@ -269,7 +274,9 @@ def _fc1_cutedsl(
         tile_size=tile_size,
     )
 
-    # Step 3: SwiGLU activation
+    # Step 3: SwiGLU activation on all rows (including padding)
+    # FC2 needs the full padded tensor. Padding rows produce garbage
+    # but FC2's scatter step only uses valid rows.
     up_proj, gate_proj = gate_up.chunk(2, dim=-1)
     if is_gated_activation:
         output = torch.nn.functional.silu(gate_proj) * up_proj
@@ -343,12 +350,22 @@ def _fc2_cutedsl(
         tile_size=tile_size,
     )
 
-    # Step 2: Scale by routing weights and scatter-add
+    # Step 2: Scale by routing weights and scatter-add (valid rows only)
+    # moe_sort pads total_permuted to tile_size multiples; padding rows
+    # have sentinel indices and must NOT participate in scatter-add.
+    # tile_idx_to_mn_limit[i] is the absolute cumulative boundary;
+    # the last valid tile's limit gives the actual valid token count.
+    n_valid_tiles = num_non_exiting_tiles.item()
+    if n_valid_tiles > 0:
+        actual_valid = tile_idx_to_mn_limit[n_valid_tiles - 1].item()
+    else:
+        actual_valid = 0
+
     flat_scales = token_final_scales.float().view(-1)
-    perm_indices = permuted_idx_to_expanded_idx[:total_permuted]
+    perm_indices = permuted_idx_to_expanded_idx[:actual_valid]
     token_indices = perm_indices // top_k
     scales = flat_scales[perm_indices].unsqueeze(1)
-    scaled_output = gemm_output * scales.to(gemm_output.dtype)
+    scaled_output = gemm_output[:actual_valid] * scales.to(gemm_output.dtype)
     output.index_add_(0, token_indices, scaled_output)
 
 
