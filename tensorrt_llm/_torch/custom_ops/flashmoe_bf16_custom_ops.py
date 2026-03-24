@@ -19,8 +19,11 @@ These ops encapsulate the bf16 grouped GEMM fusion boundary for FlashMoE:
 - FC2: GroupedGEMM + Scale + Scatter-Add
 
 Two compute paths:
-1. cuteDSL (SM100+): Uses Sm100Bf16ContiguousGroupedGemmKernel for the GEMM
-   with pre/post PyTorch operations for gather/SwiGLU/scatter-add.
+1. cuteDSL (SM100+): Fused kernels for both FC1 and FC2:
+   - FC1: Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel
+     (gather + GEMM + SwiGLU in one kernel)
+   - FC2: Sm100Bf16ContiguousGroupedGemmFinalizeFusionKernel
+     (GEMM + scale + scatter-add in one kernel)
 2. Fallback (all GPUs): torch.mm() per expert with expert-merged ranges.
 
 The cuteDSL path is automatically selected on SM100+ when cutlass-dsl is available.
@@ -34,6 +37,7 @@ import torch
 # Global cache for compiled cuteDSL kernels
 _compiled_kernel_cache = {}
 _compiled_finalize_kernel_cache = {}
+_compiled_gather_swiglu_kernel_cache = {}
 
 # Environment variable to force-disable cuteDSL path
 _FORCE_DISABLE_CUTEDSL = os.environ.get("FLASHMOE_DISABLE_CUTEDSL", "0") == "1"
@@ -234,6 +238,123 @@ def _fc1_torch_fallback(
     return output
 
 
+def _run_cutedsl_gather_gemm_swiglu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    token_id_mapping: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    tile_size: int,
+):
+    """Run the cuteDSL fused gather + GEMM + SwiGLU kernel.
+
+    Args:
+        input: [orig_m, K] bf16, un-gathered input tokens
+        weight: [num_experts, 2*I, K] bf16, interleaved gate+up weights
+        output: [M, I] bf16, output buffer (pre-allocated)
+        tile_idx_to_expert_idx: [num_tiles] int32
+        tile_idx_to_mn_limit: [num_tiles] int32
+        token_id_mapping: [M] int32, token indices for gather (clamped)
+        num_non_exiting_tiles: [1] int32
+        num_experts: number of experts
+        top_k: number of experts per token
+        tile_size: MMA tile M dimension
+    """
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..cute_dsl_kernels.blackwell.utils import make_ptr
+
+    orig_m = input.shape[0]
+    k = input.shape[1]
+    m = output.shape[0]  # total_permuted (padded)
+    n = weight.shape[1]  # 2 * interm_size
+
+    # Alpha = 1.0 for all experts
+    alpha = torch.ones(num_experts, dtype=torch.float32, device=input.device)
+
+    # Get current CUDA stream
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+
+    # Create pointer objects
+    a_ptr = make_ptr(cutlass.BFloat16, input.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(cutlass.BFloat16, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    tile_expert_ptr = make_ptr(
+        cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
+    )
+    tile_mn_ptr = make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem)
+    token_map_ptr = make_ptr(cutlass.Int32, token_id_mapping.data_ptr(), cute.AddressSpace.gmem)
+    nnet_ptr = make_ptr(cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem)
+
+    mma_tiler_mn = (tile_size, 128)
+    cluster_shape_mn = (tile_size // 128, 1)
+
+    cache_key = ("gather_swiglu", tile_size, top_k)
+    if cache_key not in _compiled_gather_swiglu_kernel_cache:
+        from ..cute_dsl_kernels.blackwell.bf16_contiguous_gather_grouped_gemm_swiglu_fusion import (
+            Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel,
+        )
+
+        gemm = Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel(
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+        )
+
+        hardware_info = cutlass.utils.HardwareInfo()
+        max_active_clusters = hardware_info.get_max_active_clusters(
+            cluster_shape_mn[0] * cluster_shape_mn[1]
+        )
+
+        compiled_gemm = cute.compile(
+            gemm.wrapper,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            alpha_ptr,
+            tile_expert_ptr,
+            tile_mn_ptr,
+            token_map_ptr,
+            nnet_ptr,
+            orig_m,
+            m,
+            n,
+            k,
+            num_experts,
+            tile_size=tile_size,
+            top_k=top_k,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+        _compiled_gather_swiglu_kernel_cache[cache_key] = compiled_gemm
+    else:
+        compiled_gemm = _compiled_gather_swiglu_kernel_cache[cache_key]
+
+    compiled_gemm(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        alpha_ptr,
+        tile_expert_ptr,
+        tile_mn_ptr,
+        token_map_ptr,
+        nnet_ptr,
+        orig_m,
+        m,
+        n,
+        k,
+        num_experts,
+        stream=stream,
+    )
+
+
 def _fc1_cutedsl(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -245,44 +366,35 @@ def _fc1_cutedsl(
     tile_size: int,
     is_gated_activation: bool,
 ) -> torch.Tensor:
-    """FC1 implementation using cuteDSL grouped GEMM kernel."""
+    """FC1 implementation using cuteDSL fused gather + GEMM + SwiGLU kernel.
+
+    Single kernel launch: gather from input via token_id_mapping,
+    grouped GEMM with interleaved gate+up weights, SwiGLU activation.
+    """
     total_permuted = permuted_idx_to_expanded_idx.shape[0]
     n_2i = weight.shape[1]
+    interm_size = n_2i // 2
     num_experts = weight.shape[0]
 
-    # Step 1: Pre-gather tokens into contiguous buffer
-    # Clamp indices for safe gather: padding positions in
-    # permuted_idx_to_expanded_idx may contain sentinel values.
-    # The kernel only reads valid tile rows, so padding data in
-    # gathered_a is harmless (never contributes to final output).
-    token_indices = permuted_idx_to_expanded_idx // top_k
-    token_indices = token_indices.clamp(0, input.shape[0] - 1)
-    gathered_a = input[token_indices]  # [total_permuted, hidden_size]
+    # Build token_id_mapping: maps each permuted row to source input row.
+    # Clamp for padding safety (sentinel values in padding positions).
+    token_id_mapping = (permuted_idx_to_expanded_idx // top_k).clamp(0, input.shape[0] - 1).int()
 
-    # Step 2: Run cuteDSL grouped GEMM
-    # A: [total_permuted, hidden_size]
-    # B: [num_experts, 2*I, hidden_size] - already in correct layout
-    # C: [total_permuted, 2*I]
-    gate_up = torch.empty(total_permuted, n_2i, dtype=input.dtype, device=input.device)
+    # Output: [total_permuted, interm_size] — SwiGLU halves N
+    output = torch.empty(total_permuted, interm_size, dtype=input.dtype, device=input.device)
 
-    _run_cutedsl_gemm(
-        a=gathered_a,
-        b=weight,
-        c=gate_up,
+    _run_cutedsl_gather_gemm_swiglu(
+        input=input,
+        weight=weight,
+        output=output,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        token_id_mapping=token_id_mapping,
         num_non_exiting_tiles=num_non_exiting_tiles,
         num_experts=num_experts,
+        top_k=top_k,
         tile_size=tile_size,
     )
-
-    # Step 3: SwiGLU activation on all rows (including padding)
-    # FC2 needs the full padded tensor. Padding rows produce garbage
-    # but FC2's scatter step only uses valid rows.
-    up_proj, gate_proj = gate_up.chunk(2, dim=-1)
-    if is_gated_activation:
-        output = torch.nn.functional.silu(gate_proj) * up_proj
-    else:
-        output = up_proj
 
     return output
 
