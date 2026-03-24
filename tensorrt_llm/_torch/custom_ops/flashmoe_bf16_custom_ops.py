@@ -19,9 +19,8 @@ These ops encapsulate the bf16 grouped GEMM fusion boundary for FlashMoE:
 - FC2: GroupedGEMM + Scale + Scatter-Add
 
 Two compute paths:
-1. cuteDSL (SM100+): Fused kernels for both FC1 and FC2:
-   - FC1: Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel
-     (gather + GEMM + SwiGLU in one kernel)
+1. cuteDSL (SM100+): Uses compiled kernels for GEMM operations:
+   - FC1: Pre-gather + Sm100Bf16ContiguousGroupedGemmKernel + Python SwiGLU
    - FC2: Sm100Bf16ContiguousGroupedGemmFinalizeFusionKernel
      (GEMM + scale + scatter-add in one kernel)
 2. Fallback (all GPUs): torch.mm() per expert with expert-merged ranges.
@@ -366,35 +365,50 @@ def _fc1_cutedsl(
     tile_size: int,
     is_gated_activation: bool,
 ) -> torch.Tensor:
-    """FC1 implementation using cuteDSL fused gather + GEMM + SwiGLU kernel.
+    """FC1 implementation using cuteDSL grouped GEMM kernel.
 
-    Single kernel launch: gather from input via token_id_mapping,
-    grouped GEMM with interleaved gate+up weights, SwiGLU activation.
+    Pre-gather in Python + cuteDSL GEMM + Python SwiGLU.
+    The fused gather+SwiGLU kernel (11 warps) exceeds SM100's register
+    budget for bf16; this 7-warp path trades 2 extra Python ops for
+    reliable compilation.
     """
     total_permuted = permuted_idx_to_expanded_idx.shape[0]
     n_2i = weight.shape[1]
-    interm_size = n_2i // 2
     num_experts = weight.shape[0]
 
-    # Build token_id_mapping: maps each permuted row to source input row.
-    # Clamp for padding safety (sentinel values in padding positions).
-    token_id_mapping = (permuted_idx_to_expanded_idx // top_k).clamp(0, input.shape[0] - 1).int()
+    # Step 1: Pre-gather tokens into contiguous buffer
+    # Clamp indices for safe gather: padding positions in
+    # permuted_idx_to_expanded_idx may contain sentinel values.
+    # The kernel only reads valid tile rows, so padding data in
+    # gathered_a is harmless (never contributes to final output).
+    token_indices = permuted_idx_to_expanded_idx // top_k
+    token_indices = token_indices.clamp(0, input.shape[0] - 1)
+    gathered_a = input[token_indices]  # [total_permuted, hidden_size]
 
-    # Output: [total_permuted, interm_size] — SwiGLU halves N
-    output = torch.empty(total_permuted, interm_size, dtype=input.dtype, device=input.device)
+    # Step 2: Run cuteDSL grouped GEMM
+    # A: [total_permuted, hidden_size]
+    # B: [num_experts, 2*I, hidden_size] - already in correct layout
+    # C: [total_permuted, 2*I]
+    gate_up = torch.empty(total_permuted, n_2i, dtype=input.dtype, device=input.device)
 
-    _run_cutedsl_gather_gemm_swiglu(
-        input=input,
-        weight=weight,
-        output=output,
+    _run_cutedsl_gemm(
+        a=gathered_a,
+        b=weight,
+        c=gate_up,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-        token_id_mapping=token_id_mapping,
         num_non_exiting_tiles=num_non_exiting_tiles,
         num_experts=num_experts,
-        top_k=top_k,
         tile_size=tile_size,
     )
+
+    # Step 3: SwiGLU activation on all rows (including padding)
+    # FC2 needs the full padded tensor. Padding rows produce garbage
+    # but FC2's scatter step only uses valid rows.
+    up_proj, gate_proj = gate_up.chunk(2, dim=-1)
+    if is_gated_activation:
+        output = torch.nn.functional.silu(gate_proj) * up_proj
+    else:
+        output = up_proj
 
     return output
 
