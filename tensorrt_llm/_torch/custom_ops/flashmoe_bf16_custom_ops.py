@@ -160,7 +160,7 @@ def _run_cutedsl_gemm(
     # --- DEBUG: Compare cuteDSL output with torch.mm reference ---
     import os
 
-    if os.environ.get("FLASHMOE_DEBUG_GEMM", "0") == "1":
+    if os.environ.get("FLASHMOE_DEBUG_GEMM", "1") == "1":  # TODO: change back to "0"
         n_valid_tiles_val = num_non_exiting_tiles.item()
         tile_experts = tile_idx_to_expert_idx[:n_valid_tiles_val].cpu().tolist()
         c_ref = torch.zeros_like(c)
