@@ -78,7 +78,6 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
-    silu_f32,
 )
 
 
@@ -1157,11 +1156,49 @@ class Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel:
                     acc_vec_gate = tTR_rAcc_gate.load()
 
                     # SwiGLU: output = (alpha * up) * silu(alpha * gate)
+                    # Uses f32x2 packed operations to halve register pressure
+                    # (32 unrolled iterations instead of 64 scalar ones).
                     tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                        acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
-                        acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                        tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+                    LOG2_E = cutlass.Float32(1.4426950408889634)
+                    for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_up), 2):
+                        acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                            (acc_vec_up[i], acc_vec_up[i + 1]),
+                            (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                        )
+                        acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                            (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                            (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                        )
+                        tCompute_log2e = cute.arch.mul_packed_f32x2(
+                            (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                            (-LOG2_E, -LOG2_E),
+                        )
+                        (
+                            tCompute[i],
+                            tCompute[i + 1],
+                        ) = cute.arch.add_packed_f32x2(
+                            (
+                                cute.math.exp2(tCompute_log2e[0], fastmath=True),
+                                cute.math.exp2(tCompute_log2e[1], fastmath=True),
+                            ),
+                            (1.0, 1.0),
+                        )
+                        tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                        tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
+                        (
+                            tCompute[i],
+                            tCompute[i + 1],
+                        ) = cute.arch.mul_packed_f32x2(
+                            (tCompute[i], tCompute[i + 1]),
+                            (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                        )
+                        (
+                            tCompute[i],
+                            tCompute[i + 1],
+                        ) = cute.arch.mul_packed_f32x2(
+                            (tCompute[i], tCompute[i + 1]),
+                            (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                        )
 
                     # Convert to C type and store to SMEM
                     acc_vec = tiled_copy_r2s.retile(tCompute).load()
