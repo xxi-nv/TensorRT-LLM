@@ -785,15 +785,24 @@ class Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel:
                     tAgA_ktile = tAgA[(None, None, a_producer_state.count)]
                     tAsA_ktile = tAsA_tiled[(None, None, None, a_producer_state.index)]
 
-                    # 8 M-iterations × k_sub_iters K sub-iterations
+                    # 8 M-iterations, each with a single LDGSTS.128 covering
+                    # all K elements via thread-level K coverage.
+                    # With bf16 value_layout=(1,8), 8 K-threads × 8 elements = 64 per iter.
+                    # K_tile=256 → k_sub_iters=4. We use cutlass.range with unroll=1
+                    # for the k_sub loop to avoid register spill from full unrolling.
                     for i in range(8):
-                        for k_sub in range(self.k_sub_iters):
-                            # GMEM source: A[token_row, k_tile_offset + thread_k + k_sub*64]
+                        A_gmem_base_offset = cute.assume(
+                            a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
+                            divby=self.ldgsts_elements_per_copy,
+                        )
+                        a_predicate_slice = cute.make_rmem_tensor(
+                            cute.make_layout((1,)), cutlass.Boolean
+                        )
+                        a_predicate_slice[0] = a_predicate_tensor[i]
+
+                        for k_sub in cutlass.range(self.k_sub_iters, unroll=1):
                             k_offset = A_gmem_thread_offset + k_sub * self.ldgsts_k_per_iter
-                            A_gmem_slice_offset = k_offset + cute.assume(
-                                a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
-                                divby=self.ldgsts_elements_per_copy,
-                            )
+                            A_gmem_slice_offset = k_offset + A_gmem_base_offset
                             A_gmem_slice_offset = cute.assume(
                                 A_gmem_slice_offset,
                                 divby=self.ldgsts_elements_per_copy,
@@ -809,11 +818,6 @@ class Sm100Bf16ContiguousGatherGroupedGemmSwigluFusionKernel:
                                 tAsA_ktile[(None, i, k_sub)].iterator,
                                 layout=cute.make_layout((self.ldgsts_elements_per_copy,)),
                             )
-
-                            a_predicate_slice = cute.make_rmem_tensor(
-                                cute.make_layout((1,)), cutlass.Boolean
-                            )
-                            a_predicate_slice[0] = a_predicate_tensor[i]
 
                             cute.copy_atom_call(
                                 a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
