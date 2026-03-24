@@ -155,6 +155,35 @@ def _run_cutedsl_gemm(
         num_experts,
         stream=stream,
     )
+    torch.cuda.synchronize()
+
+    # --- DEBUG: Compare cuteDSL output with torch.mm reference ---
+    import os
+
+    if os.environ.get("FLASHMOE_DEBUG_GEMM", "0") == "1":
+        n_valid_tiles_val = num_non_exiting_tiles.item()
+        tile_experts = tile_idx_to_expert_idx[:n_valid_tiles_val].cpu().tolist()
+        c_ref = torch.zeros_like(c)
+        row = 0
+        for t in range(n_valid_tiles_val):
+            expert = tile_experts[t]
+            row_end = min(row + tile_size, m)
+            a_tile = a[row:row_end]
+            b_expert = b[expert]  # [N, K]
+            c_ref[row:row_end] = torch.mm(a_tile, b_expert.t())
+            row = row_end
+        c_out_valid = c[:row].float()
+        c_ref_valid = c_ref[:row].float()
+        max_abs_err = (c_out_valid - c_ref_valid).abs().max().item()
+        c_out_norm = c_out_valid.abs().mean().item()
+        c_ref_norm = c_ref_valid.abs().mean().item()
+        print(
+            f"[GEMM DEBUG] m={m} n={n} k={k} L={num_experts} "
+            f"n_tiles={n_valid_tiles_val} valid_rows={row} "
+            f"c_out_norm={c_out_norm:.6f} c_ref_norm={c_ref_norm:.6f} "
+            f"max_abs_err={max_abs_err:.6f}"
+        )
+    # --- END DEBUG ---
 
 
 def _merge_expert_ranges(tile_idx_to_expert_idx, tile_idx_to_mn_limit, n_valid_tiles, tile_size):
