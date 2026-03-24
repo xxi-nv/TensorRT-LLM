@@ -160,7 +160,7 @@ def _run_cutedsl_gemm(
     # --- DEBUG: Compare cuteDSL output with torch.mm reference ---
     import os
 
-    if os.environ.get("FLASHMOE_DEBUG_GEMM", "1") == "1":  # TODO: change back to "0"
+    if os.environ.get("FLASHMOE_DEBUG_GEMM", "0") == "1":
         n_valid_tiles_val = num_non_exiting_tiles.item()
         tile_experts = tile_idx_to_expert_idx[:n_valid_tiles_val].cpu().tolist()
         c_ref = torch.zeros_like(c)
@@ -380,21 +380,30 @@ def _fc2_cutedsl(
     )
 
     # Step 2: Scale by routing weights and scatter-add (valid rows only)
-    # moe_sort pads total_permuted to tile_size multiples; padding rows
-    # have sentinel indices and must NOT participate in scatter-add.
-    # tile_idx_to_mn_limit[i] is the absolute cumulative boundary;
-    # the last valid tile's limit gives the actual valid token count.
+    # moe_sort pads each tile to tile_size; padding rows have sentinel
+    # indices and must NOT participate in scatter-add.
+    # tile_idx_to_mn_limit[t] is the absolute position in the padded
+    # layout where real rows end for tile t. For example, with tile_size=128
+    # and 2 tiles with 1 real token each: mn_limit = [1, 129].
+    # Build a boolean mask over all positions identifying valid rows.
     n_valid_tiles = num_non_exiting_tiles.item()
-    if n_valid_tiles > 0:
-        actual_valid = tile_idx_to_mn_limit[n_valid_tiles - 1].item()
-    else:
-        actual_valid = 0
+    if n_valid_tiles == 0:
+        return
 
+    # Vectorized valid-row mask: position p is valid iff p < mn_limit[p // tile_size]
+    positions = torch.arange(total_permuted, device=gemm_output.device)
+    tile_indices = positions // tile_size
+    # Only check tiles within n_valid_tiles; padding tiles are invalid
+    valid_mask = (tile_indices < n_valid_tiles) & (
+        positions < tile_idx_to_mn_limit[tile_indices.clamp(max=n_valid_tiles - 1)]
+    )
+
+    valid_positions = valid_mask.nonzero(as_tuple=True)[0]
     flat_scales = token_final_scales.float().view(-1)
-    perm_indices = permuted_idx_to_expanded_idx[:actual_valid]
+    perm_indices = permuted_idx_to_expanded_idx[valid_positions]
     token_indices = perm_indices // top_k
     scales = flat_scales[perm_indices].unsqueeze(1)
-    scaled_output = gemm_output[:actual_valid] * scales.to(gemm_output.dtype)
+    scaled_output = gemm_output[valid_positions] * scales.to(gemm_output.dtype)
     output.index_add_(0, token_indices, scaled_output)
 
 
