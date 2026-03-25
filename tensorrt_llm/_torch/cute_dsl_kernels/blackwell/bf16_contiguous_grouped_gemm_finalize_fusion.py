@@ -557,17 +557,10 @@ class Sm100Bf16ContiguousGroupedGemmFinalizeFusionKernel:
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
 
-        # Create a fake C tensor for partitioning purposes only
-        # We need tCgC for epilogue T2R partitioning, but we scatter to out instead
-        # Use A's M dim and B's N dim to create the right shape
-        m_size = mA_mkl.shape[0]
-        n_size = mB_nkl.shape[0]
-        fake_c = cute.make_tensor(
-            mA_mkl.iterator,  # dummy pointer, never actually read/written
-            cute.make_ordered_layout((m_size, n_size, 1), order=(1, 0, 2)),
-        )
+        # Use out tensor for partitioning (same pattern as blockscaled finalize).
+        # Only the local tile shape matters for T2R copy layout, not total dims.
         gC_mnl = cute.local_tile(
-            fake_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            out, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
