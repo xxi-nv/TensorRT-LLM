@@ -2171,16 +2171,11 @@ def test_flashmoe_cutedsl_symm_mem_ep(model_config, seq_len, routing_method_cls)
     if not can_impl:
         pytest.skip(reason)
 
-    # Check symmetric memory and cuda-python availability
+    # Check symmetric memory availability
     try:
         from torch.distributed import _symmetric_memory as _sm  # noqa: F401
     except ImportError:
         pytest.skip("PyTorch symmetric memory not available")
-
-    try:
-        from cuda.bindings import driver as _cd  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-python (cuda.bindings.driver) not available")
 
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,

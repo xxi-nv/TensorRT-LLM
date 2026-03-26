@@ -54,13 +54,6 @@ try:
 except ImportError:
     _SYMM_MEM_AVAILABLE = False
 
-try:
-    from cuda.bindings import driver as cuda_driver  # noqa: F401
-
-    _CUDA_DRIVER_AVAILABLE = True
-except ImportError:
-    _CUDA_DRIVER_AVAILABLE = False
-
 
 def _silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU (Swish) activation: x * sigmoid(x)."""
@@ -537,8 +530,6 @@ class FlashMoECuteDsl(FlashMoEFused):
         self._input_hdl = None
         self._output_symm = None
         self._output_hdl = None
-        self._remote_inputs = None
-        self._remote_output_chunk = None
         self._ep_group_cached = None
         self._max_num_tokens_ep = 0
 
@@ -547,12 +538,12 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         Allocates symmetric memory visible to all EP ranks via NVLink for:
         - Input buffer: each rank writes its tokens, other ranks read via
-          cuMemcpyDtoDAsync from buffer_ptrs
+          handle.get_buffer(rank, shape, dtype) + .copy_()
         - Output buffer: each rank writes partial GEMM output, other ranks
           read their chunk and sum locally (ReduceScatter)
 
-        Uses torch.distributed._symmetric_memory for buffer allocation and
-        rendezvous, and cuda.bindings.driver for direct D2D copies.
+        Uses torch.distributed._symmetric_memory for buffer allocation,
+        rendezvous, barrier, and remote buffer access (NVLink P2P).
 
         Args:
             num_tokens: Number of tokens for the current batch. Buffers are
@@ -569,11 +560,6 @@ class FlashMoECuteDsl(FlashMoEFused):
             raise RuntimeError(
                 "FlashMoECuteDsl symmetric memory EP requires PyTorch >= 2.5 "
                 "with torch.distributed._symmetric_memory support"
-            )
-        if not _CUDA_DRIVER_AVAILABLE:
-            raise RuntimeError(
-                "FlashMoECuteDsl symmetric memory EP requires cuda-python "
-                "(pip install cuda-python) for cuMemcpyDtoDAsync"
             )
 
         H = self.hidden_size
@@ -596,17 +582,6 @@ class FlashMoECuteDsl(FlashMoEFused):
         total = num_tokens * ep_size
         self._output_symm = torch_symm_mem.empty((total, H), device=device, dtype=torch.bfloat16)
         self._output_hdl = torch_symm_mem.rendezvous(self._output_symm, group_name)
-
-        # Local buffers for remote ranks' input data (AllGather targets)
-        self._remote_inputs = [
-            torch.empty((num_tokens, H), device=device, dtype=torch.bfloat16)
-            for _ in range(ep_size)
-        ]
-
-        # Single buffer for reading remote output chunks (ReduceScatter)
-        self._remote_output_chunk = torch.empty(
-            (num_tokens, H), device=device, dtype=torch.bfloat16
-        )
 
         self._max_num_tokens_ep = num_tokens
 
@@ -778,44 +753,22 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         return output
 
-    @staticmethod
-    def _get_remote_buffer_ptr(handle, rank: int) -> int:
-        """Get device pointer for remote rank's symmetric memory buffer.
-
-        The symmetric memory handle from rendezvous() exposes each rank's
-        buffer device pointer. The attribute name varies by PyTorch version.
-
-        Args:
-            handle: Symmetric memory handle from rendezvous().
-            rank: Remote rank index.
-
-        Returns:
-            CUdeviceptr as int for the remote rank's buffer.
-        """
-        if hasattr(handle, "buffer_ptrs_dev"):
-            return handle.buffer_ptrs_dev[rank]
-        if hasattr(handle, "buffer_ptrs"):
-            return handle.buffer_ptrs[rank]
-        raise AttributeError(
-            f"Symmetric memory handle has no buffer_ptrs attribute. "
-            f"Available: {[a for a in dir(handle) if not a.startswith('_')]}"
-        )
-
     def _forward_ep_v2(
         self,
         x: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """EP communication via symmetric memory + cuMemcpyDtoDAsync.
+        """EP communication via symmetric memory P2P tensor access.
 
-        Replaces NCCL AllGather/ReduceScatter with direct NVLink D2D copies
-        through symmetric memory buffer pointers. Lower latency than NCCL
-        for small-to-medium token counts.
+        Replaces NCCL AllGather/ReduceScatter with direct NVLink reads
+        through symmetric memory handle.get_buffer() + .copy_(). Each
+        rank can directly read any other rank's symmetric buffer as a
+        regular tensor without explicit D2D copy calls.
 
         Flow:
         1. AllGather: each rank writes tokens to symmetric input buffer,
-           barrier, then reads other ranks' buffers via cuMemcpyDtoDAsync
+           barrier, then reads other ranks' buffers via get_buffer + copy
         2. AllGather routing info via NCCL (small tensors, not latency-critical)
         3. Compute: run_moe on all tokens with local experts
         4. ReduceScatter: each rank writes partial output to symmetric output
@@ -836,31 +789,26 @@ class FlashMoECuteDsl(FlashMoEFused):
         # Lazily initialize symmetric memory buffers
         self._init_ep_symm_mem(num_tokens)
 
-        stream = torch.cuda.current_stream()
-        stream_ptr = stream.cuda_stream
-
         # --- 1. AllGather input tokens via symmetric memory ---
         # Write local tokens to our symmetric buffer
         self._input_symm[:num_tokens].copy_(x)
 
         # Barrier: ensure all ranks have written before reading
-        dist.barrier(group=ep_group)
+        self._input_hdl.barrier()
 
-        # Read remote ranks' tokens via direct D2D NVLink copies
+        # Read remote ranks' tokens via P2P tensor access
+        input_shape = (num_tokens, H)
         all_x_parts = []
         for rank in range(ep_size):
             if rank == self.ep_rank:
-                all_x_parts.append(x)
+                all_x_parts.append(x.clone())
             else:
-                dst = self._remote_inputs[rank][:num_tokens]
-                src_ptr = self._get_remote_buffer_ptr(self._input_hdl, rank)
-                nbytes = num_tokens * H * x.element_size()
-                cuda_driver.cuMemcpyDtoDAsync(dst.data_ptr(), src_ptr, nbytes, stream_ptr)
-                all_x_parts.append(dst)
-
-        # Sync to ensure all D2D copies complete before cat/GEMM
-        stream.synchronize()
+                src = self._input_hdl.get_buffer(rank, input_shape, x.dtype)
+                all_x_parts.append(src.clone())
         all_x = torch.cat(all_x_parts, dim=0)  # [T_total, H]
+
+        # Second barrier: ensure reads are done before writers can modify
+        self._input_hdl.barrier()
 
         # --- 2. AllGather routing info (small tensors, still NCCL) ---
         all_experts_list = [torch.empty_like(token_selected_experts) for _ in range(ep_size)]
@@ -892,28 +840,19 @@ class FlashMoECuteDsl(FlashMoEFused):
         self._output_symm[:total_tokens].copy_(partial_output)
 
         # Barrier: ensure all ranks have written before reading
-        dist.barrier(group=ep_group)
+        self._output_hdl.barrier()
 
         # Each rank reads its chunk from all ranks and sums
         output = torch.zeros_like(x)
         chunk_start = self.ep_rank * num_tokens
-        elem_size = x.element_size()
+        out_total_shape = (total_tokens, H)
 
         for rank in range(ep_size):
-            if rank == self.ep_rank:
-                output += partial_output[chunk_start : chunk_start + num_tokens]
-            else:
-                dst = self._remote_output_chunk[:num_tokens]
-                src_ptr = self._get_remote_buffer_ptr(self._output_hdl, rank)
-                # Offset to our chunk within remote rank's output buffer
-                src_offset = chunk_start * H * elem_size
-                nbytes = num_tokens * H * elem_size
-                cuda_driver.cuMemcpyDtoDAsync(
-                    dst.data_ptr(), src_ptr + src_offset, nbytes, stream_ptr
-                )
-                # Must sync before accumulating — next iteration reuses dst
-                stream.synchronize()
-                output += dst
+            src = self._output_hdl.get_buffer(rank, out_total_shape, x.dtype)
+            output += src[chunk_start : chunk_start + num_tokens]
+
+        # Second barrier: ensure reads are done before writers can modify
+        self._output_hdl.barrier()
 
         return output
 
@@ -932,7 +871,7 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         For ep_size > 1: AllGather + local GEMM + ReduceScatter.
         - V1 (default): NCCL collectives via _forward_ep()
-        - V2 (use_symm_mem_ep=True): symmetric memory D2D copies via
+        - V2 (use_symm_mem_ep=True): symmetric memory P2P via
           _forward_ep_v2()
         EP handles all inter-GPU communication, so DP allgather and TP
         reduce are skipped.
