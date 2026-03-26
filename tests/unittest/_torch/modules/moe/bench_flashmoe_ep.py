@@ -58,13 +58,30 @@ def _bench_worker(rank, world_size, port, args):
             dist.destroy_process_group()
 
 
+def _create_moe_weights(num_experts, hidden_size, intermediate_size, dtype):
+    """Create random MoE expert weights (w1, w2, w3 for SwiGLU)."""
+    weights = {}
+    for eid in range(num_experts):
+        weights[f"{eid}.w1.weight"] = torch.randn(
+            (intermediate_size, hidden_size), dtype=dtype, device="cuda"
+        )
+        weights[f"{eid}.w2.weight"] = torch.randn(
+            (hidden_size, intermediate_size), dtype=dtype, device="cuda"
+        )
+        weights[f"{eid}.w3.weight"] = torch.randn(
+            (intermediate_size, hidden_size), dtype=dtype, device="cuda"
+        )
+    return weights
+
+
 def _bench_worker_impl(rank, world_size, args):
     """Benchmark V1 (NCCL) vs V2 (symm mem) EP communication."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
     from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashmoe import FlashMoECuteDsl
-    from tensorrt_llm._torch.modules.fused_moe.routing_method import RenormalizeMoeRoutingMethod
     from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.models.modeling_utils import ModelConfig, PretrainedConfig
-    from tests.unittest._torch.modules.moe.moe_test_utils import BaseQuantizeUtil
 
     dtype = torch.bfloat16
     num_experts = args.num_experts
@@ -88,15 +105,8 @@ def _bench_worker_impl(rank, world_size, args):
         my_x = all_x[rank * seq_len : (rank + 1) * seq_len].contiguous()
         my_logits = all_router_logits[rank * seq_len : (rank + 1) * seq_len].contiguous()
 
-        # Shared weights
-        quantize_util = BaseQuantizeUtil(
-            num_experts=num_experts,
-            dtype=dtype,
-            intermediate_size=intermediate_size,
-            hidden_size=hidden_size,
-            quant_config=None,
-        )
-        weights = quantize_util.create_weights()
+        # Shared weights (inline, no test-util dependency)
+        weights = _create_moe_weights(num_experts, hidden_size, intermediate_size, dtype)
 
         pretrained_config = PretrainedConfig()
         pretrained_config.num_experts = num_experts
@@ -104,7 +114,7 @@ def _bench_worker_impl(rank, world_size, args):
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, num_experts=num_experts)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, force_enable_pytorch_op=True)
 
         ep_mapping = Mapping(
             world_size=world_size,
