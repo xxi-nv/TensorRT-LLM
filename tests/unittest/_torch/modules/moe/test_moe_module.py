@@ -1983,3 +1983,221 @@ def test_flashmoe_cutedsl_fused_multi_gpu(model_config, seq_len, routing_method_
         nprocs=world_size,
         join=True,
     )
+
+
+# ============================================================================
+# FlashMoECuteDsl Symmetric Memory EP Tests (V2)
+# Uses symmetric memory + cuMemcpyDtoDAsync for AllGather/ReduceScatter.
+# ============================================================================
+
+
+def _flashmoe_symm_mem_ep_worker(rank, world_size, port, model_config, seq_len, routing_method_cls):
+    """Worker for symmetric memory EP test — runs in each spawned process.
+
+    Each rank:
+    1. Initializes NCCL process group (needed for routing info + barriers)
+    2. Creates FlashMoECuteDsl with use_symm_mem_ep=True
+    3. Calls forward() which triggers _forward_ep_v2
+    4. Compares against single-GPU reference
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    try:
+        _flashmoe_symm_mem_ep_worker_impl(
+            rank, world_size, model_config, seq_len, routing_method_cls
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _flashmoe_symm_mem_ep_worker_impl(rank, world_size, model_config, seq_len, routing_method_cls):
+    """Implementation of symmetric memory EP test worker."""
+    dtype = torch.bfloat16
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    with torch.device(f"cuda:{rank}"):
+        # Same seed on all ranks for identical global data
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        total_tokens = seq_len * world_size
+        all_x = torch.randn((total_tokens, hidden_size), dtype=dtype, device="cuda")
+        all_router_logits = torch.randn((total_tokens, num_experts), dtype=dtype, device="cuda")
+
+        # Each rank's portion
+        my_x = all_x[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        my_logits = all_router_logits[rank * seq_len : (rank + 1) * seq_len].contiguous()
+
+        # Shared weights
+        quantize_util = BaseQuantizeUtil(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=None,
+        )
+        weights = quantize_util.create_weights()
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        routing_method = _create_routing_method(
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
+
+        # --- EP model with symmetric memory V2 ---
+        ep_mapping = Mapping(
+            world_size=world_size,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+            moe_tp_size=1,
+            enable_attention_dp=True,
+        )
+        ep_mapping.rank = rank
+
+        ep_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ep_mapping,
+        )
+
+        flashmoe_ep = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ep_model_cfg,
+            use_symm_mem_ep=True,
+        )
+        flashmoe_ep.load_weights([weights])
+        flashmoe_ep.cuda(f"cuda:{rank}")
+
+        all_rank_num_tokens = [seq_len] * world_size
+
+        with torch.inference_mode():
+            ep_output = flashmoe_ep.forward(
+                my_x,
+                my_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+
+        # --- Single-GPU reference ---
+        ref_mapping = Mapping()
+        ref_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ref_mapping,
+        )
+
+        flashmoe_ref = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ref_model_cfg,
+        )
+        flashmoe_ref.load_weights([weights])
+        flashmoe_ref.cuda(f"cuda:{rank}")
+
+        with torch.inference_mode():
+            ref_output = flashmoe_ref.forward(all_x, all_router_logits)
+
+        my_ref_output = ref_output[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        max_diff = (ep_output - my_ref_output).abs().max().item()
+
+        # Same tolerance as V1 EP test — AllGather + GEMMs + ReduceScatter
+        # accumulates rounding errors
+        torch.testing.assert_close(
+            ep_output,
+            my_ref_output,
+            rtol=2e-2,
+            atol=5000,
+        )
+
+        G_LOGGER.info(
+            "Rank %d: symm mem EP V2 test PASSED (max_diff=%.6f)",
+            rank,
+            max_diff,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            [
+                MoeModelConfig(60, 4, 2048, 1408),
+                MoeModelConfig(256, 8, 7168, 2048),
+            ],
+            [8],
+            [RenormalizeMoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_symm_mem_ep(model_config, seq_len, routing_method_cls):
+    """Symmetric memory EP test (V2): cuMemcpyDtoDAsync AllGather + ReduceScatter.
+
+    Uses torch.multiprocessing.spawn + NCCL for process group setup.
+    Communication uses symmetric memory D2D copies instead of NCCL collectives.
+    """
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    # Check symmetric memory and cuda-python availability
+    try:
+        from torch.distributed import _symmetric_memory as _sm  # noqa: F401
+    except ImportError:
+        pytest.skip("PyTorch symmetric memory not available")
+
+    try:
+        from cuda.bindings import driver as _cd  # noqa: F401
+    except ImportError:
+        pytest.skip("cuda-python (cuda.bindings.driver) not available")
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    import torch.multiprocessing as mp
+
+    from tensorrt_llm._utils import get_free_port
+
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(
+        _flashmoe_symm_mem_ep_worker,
+        args=(world_size, port, model_config, seq_len, routing_method_cls),
+        nprocs=world_size,
+        join=True,
+    )
