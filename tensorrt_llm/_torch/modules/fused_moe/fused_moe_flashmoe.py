@@ -429,10 +429,12 @@ class FlashMoEFused(MoE):
 
 def _build_chunk_mappings(
     permuted_idx_to_expanded_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
     top_k: int,
     seq_len: int,
     ep_size: int,
-    num_valid_rows: int,
 ) -> list:
     """Build per-chunk (per-rank) index mappings for pipelined scatter-add.
 
@@ -440,27 +442,52 @@ def _build_chunk_mappings(
     (rank c's tokens), returns the permuted row indices, local token
     indices within the chunk, and expanded indices for scale lookup.
 
-    Only considers rows within [0, num_valid_rows) to skip padding.
+    Valid rows are determined per-tile from tile_idx_to_mn_limit. In the
+    padded moe_sort layout, tile t has valid rows at positions
+    [t * tile_size, tile_idx_to_mn_limit[t]). Rows between mn_limit[t]
+    and (t+1) * tile_size are padding and must be skipped.
 
     Args:
         permuted_idx_to_expanded_idx: [T_permuted] int32, from moe_sort
+        tile_idx_to_mn_limit: [num_tiles] int32, absolute row boundary
+            per tile (NOT a contiguous count)
+        num_non_exiting_tiles: scalar tensor, number of valid tiles
+        tile_size: rows per tile (e.g. 128)
         top_k: experts per token
         seq_len: tokens per rank
         ep_size: number of EP ranks
-        num_valid_rows: number of valid (non-padding) permuted rows
 
     Returns:
         List of (perm_row_indices, local_token_indices, expanded_indices)
         tuples, one per chunk. All tensors are int64 on the same device.
     """
     device = permuted_idx_to_expanded_idx.device
+    n_valid_tiles = num_non_exiting_tiles.item()
 
-    # Only look at valid rows (exclude padding from moe_sort)
-    valid_expanded = permuted_idx_to_expanded_idx[:num_valid_rows].long()
-    valid_row_ids = torch.arange(num_valid_rows, device=device)
+    if n_valid_tiles == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=device)
+        return [(empty.clone(), empty.clone(), empty.clone()) for _ in range(ep_size)]
+
+    # Build valid row indices from per-tile bounds
+    # Each tile t has valid rows at [t * tile_size, mn_limit[t])
+    valid_row_parts = []
+    for t in range(n_valid_tiles):
+        tile_start = t * tile_size
+        mn_limit = tile_idx_to_mn_limit[t].item()
+        if mn_limit > tile_start:
+            valid_row_parts.append(
+                torch.arange(tile_start, mn_limit, device=device, dtype=torch.long)
+            )
+
+    if not valid_row_parts:
+        empty = torch.zeros(0, dtype=torch.long, device=device)
+        return [(empty.clone(), empty.clone(), empty.clone()) for _ in range(ep_size)]
+
+    valid_row_ids = torch.cat(valid_row_parts)
+    valid_expanded = permuted_idx_to_expanded_idx[valid_row_ids].long()
 
     # Compute token index and chunk assignment for each valid row
-    token_idx = valid_expanded // top_k  # [num_valid_rows]
+    token_idx = valid_expanded // top_k
     chunk_idx = token_idx // seq_len  # which rank's chunk (0..ep_size-1)
 
     # Build per-chunk mappings
@@ -645,9 +672,14 @@ class FlashMoECuteDsl(FlashMoEFused):
         The graph uses fixed-shape buffers allocated by _init_graph_buffers().
         Data is copied into graph buffers before replay and copied out after.
 
-        NOTE: The cuteDSL kernel path does lazy compilation (Python side
-        effects) which is not graph-safe. This method forces the torch.mm
-        fallback path during capture by temporarily disabling cuteDSL.
+        The cuteDSL kernel path does lazy compilation on the first call
+        (Python-level MLIR compilation, not graph-safe). The warmup run
+        triggers this compilation. Subsequent calls (during graph capture)
+        use the cached compiled kernel, which is a single kernel launch
+        and IS graph-safe.
+
+        The torch.mm fallback path uses .item() host-device sync and is
+        NOT graph-safe. On SM100+ (GB200), cuteDSL is used instead.
 
         Args:
             num_tokens: Tokens per rank (must match _init_graph_buffers).
@@ -658,23 +690,15 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         self._init_graph_buffers(num_tokens)
 
-        # Force fallback path during graph capture to avoid cuteDSL
-        # lazy compilation side effects
-        import tensorrt_llm._torch.custom_ops.flashmoe_bf16_custom_ops as _ops
-
-        old_disable = _ops._FORCE_DISABLE_CUTEDSL
-        _ops._FORCE_DISABLE_CUTEDSL = True
-
-        # Warmup run (CUDA graph requires at least one eager run)
+        # Warmup run: triggers cuteDSL kernel compilation (lazy, cached).
+        # After warmup, compiled kernels are cached and graph-safe.
         self._forward_ep_graph_body(num_tokens, ep_group)
+        torch.cuda.synchronize()
 
-        # Capture
+        # Capture: all kernels are pre-compiled, no Python side effects.
         self._ep_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._ep_graph):
             self._forward_ep_graph_body(num_tokens, ep_group)
-
-        # Restore cuteDSL setting
-        _ops._FORCE_DISABLE_CUTEDSL = old_disable
 
         logger.info(
             "FlashMoECuteDsl CUDA Graph captured: tokens=%d, ep_size=%d",
@@ -1180,15 +1204,14 @@ class FlashMoECuteDsl(FlashMoEFused):
         # fc2_gemm_out: [T_permuted, H] in permuted order
 
         # --- 4. Build per-chunk index mappings ---
-        # Compute total valid rows from tile info
-        n_valid_tiles = num_non_exiting_tiles.item()
-        if n_valid_tiles > 0:
-            num_valid_rows = tile_idx_to_mn_limit[n_valid_tiles - 1].item()
-        else:
-            num_valid_rows = 0
-
         chunk_mappings = _build_chunk_mappings(
-            permuted_idx_to_expanded_idx, top_k, num_tokens, ep_size, num_valid_rows
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_size=self.tile_size,
+            top_k=top_k,
+            seq_len=num_tokens,
+            ep_size=ep_size,
         )
 
         # --- 5. Pipelined scatter-add + ReduceScatter ---

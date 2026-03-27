@@ -43,10 +43,8 @@ _FORCE_DISABLE_CUTEDSL = os.environ.get("FLASHMOE_DISABLE_CUTEDSL", "0") == "1"
 
 
 @lru_cache(maxsize=1)
-def _cutedsl_available() -> bool:
-    """Check if cuteDSL bf16 grouped GEMM is available (SM100+ and cutlass-dsl)."""
-    if _FORCE_DISABLE_CUTEDSL:
-        return False
+def _cutedsl_hw_available() -> bool:
+    """Check if cuteDSL bf16 grouped GEMM hardware/imports are available."""
     try:
         from ..._utils import get_sm_version
 
@@ -60,6 +58,17 @@ def _cutedsl_available() -> bool:
         return True
     except (ImportError, RuntimeError):
         return False
+
+
+def _cutedsl_available() -> bool:
+    """Check if cuteDSL bf16 grouped GEMM is available and not force-disabled.
+
+    This is NOT cached because _FORCE_DISABLE_CUTEDSL can be toggled at
+    runtime (e.g., during CUDA Graph capture).
+    """
+    if _FORCE_DISABLE_CUTEDSL:
+        return False
+    return _cutedsl_hw_available()
 
 
 def _run_cutedsl_gemm(
