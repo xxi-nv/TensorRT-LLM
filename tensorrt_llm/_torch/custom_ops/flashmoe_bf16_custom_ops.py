@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -809,3 +809,172 @@ def _(
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     return torch.empty(num_tokens, hidden_size, dtype=output_dtype, device=input.device)
+
+
+# ---------------------------------------------------------------------------
+# FC2 GEMM-only (no scatter-add) — for pipelined ReduceScatter (V3.4d)
+# ---------------------------------------------------------------------------
+
+
+def _fc2_gemm_only_torch_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+) -> torch.Tensor:
+    """FC2 GEMM-only using torch.mm() per expert (fallback path).
+
+    Returns GEMM results in permuted order without scatter-add.
+    """
+    hidden_size = weight.shape[1]
+    total_permuted = input.shape[0]
+    output = torch.zeros(total_permuted, hidden_size, dtype=input.dtype, device=input.device)
+    n_valid_tiles = num_non_exiting_tiles.item()
+
+    expert_ranges = _merge_expert_ranges(
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, n_valid_tiles, tile_size
+    )
+
+    for local_expert_idx, row_start, row_end in expert_ranges:
+        expert_input = input[row_start:row_end]
+        output[row_start:row_end] = torch.mm(expert_input, weight[local_expert_idx].t())
+
+    return output
+
+
+def _fc2_gemm_only_cutedsl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+) -> torch.Tensor:
+    """FC2 GEMM-only using cuteDSL kernel (SM100+ path).
+
+    Uses the base grouped GEMM kernel (no finalize fusion).
+    """
+    total_permuted = input.shape[0]
+    hidden_size = weight.shape[1]
+    num_experts = weight.shape[0]
+
+    output = torch.empty(total_permuted, hidden_size, dtype=input.dtype, device=input.device)
+
+    _run_cutedsl_gemm(
+        a=input,
+        b=weight,
+        c=output,
+        tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        num_experts=num_experts,
+        tile_size=tile_size,
+    )
+
+    return output
+
+
+@torch.library.custom_op("trtllm::flashmoe_bf16_gemm_only", mutates_args=(), device_types="cuda")
+def flashmoe_bf16_gemm_only(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+) -> torch.Tensor:
+    """FC2 GEMM-only: GroupedGEMM without scatter-add for bf16 FlashMoE.
+
+    Used by V3.4d pipelined ReduceScatter to split FC2 into GEMM + per-chunk
+    scatter-add stages.
+
+    Args:
+        input: [total_permuted_tokens, intermediate_size], bf16
+        weight: [num_local_experts, hidden_size, intermediate_size], bf16
+        tile_idx_to_expert_idx: [num_tiles], int32 (local expert indices)
+        tile_idx_to_mn_limit: [num_tiles], int32 (absolute cumulative boundary)
+        num_non_exiting_tiles: scalar int32
+        tile_size: MMA tile M dimension (128 or 256)
+
+    Returns:
+        fc2_gemm_output: [total_permuted_tokens, hidden_size], bf16
+    """
+    if _cutedsl_available():
+        return _fc2_gemm_only_cutedsl(
+            input, weight, tile_idx_to_expert_idx, num_non_exiting_tiles, tile_size
+        )
+    return _fc2_gemm_only_torch_fallback(
+        input,
+        weight,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        num_non_exiting_tiles,
+        tile_size,
+    )
+
+
+@torch.library.register_fake("trtllm::flashmoe_bf16_gemm_only")
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+) -> torch.Tensor:
+    hidden_size = weight.size(1)
+    total_permuted = input.size(0)
+    return torch.empty(total_permuted, hidden_size, dtype=input.dtype, device=input.device)
+
+
+# ---------------------------------------------------------------------------
+# Per-chunk scatter-add with scaling — for pipelined ReduceScatter (V3.4d)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "trtllm::flashmoe_scatter_add_chunk", mutates_args=("chunk_output",), device_types="cuda"
+)
+def flashmoe_scatter_add_chunk(
+    fc2_output: torch.Tensor,
+    chunk_output: torch.Tensor,
+    perm_row_indices: torch.Tensor,
+    local_token_indices: torch.Tensor,
+    expanded_indices: torch.Tensor,
+    token_final_scales: torch.Tensor,
+) -> None:
+    """Scatter-add FC2 GEMM results for one chunk of tokens (in-place).
+
+    For pipelined ReduceScatter: scatter-adds only the rows belonging to a
+    specific rank's token chunk, enabling per-chunk RS overlap.
+
+    Args:
+        fc2_output: [T_permuted, H], bf16 — full FC2 GEMM output
+        chunk_output: [seq_len, H], bf16 — pre-zeroed output buffer (mutated)
+        perm_row_indices: [N_chunk], int64 — rows of fc2_output for this chunk
+        local_token_indices: [N_chunk], int64 — output row within chunk
+        expanded_indices: [N_chunk], int64 — expanded index for scale lookup
+        token_final_scales: [total_tokens * top_k] or [total_tokens, top_k], float32
+    """
+    if perm_row_indices.numel() == 0:
+        return
+
+    flat_scales = token_final_scales.float().view(-1)
+
+    # Vectorized scatter-add: gather rows, scale, then index_add
+    fc2_rows = fc2_output[perm_row_indices]  # [N_chunk, H]
+    scale_vals = flat_scales[expanded_indices].unsqueeze(1)  # [N_chunk, 1]
+    scaled = fc2_rows * scale_vals.to(fc2_rows.dtype)  # [N_chunk, H]
+    chunk_output.index_add_(0, local_token_indices, scaled)
+
+
+@torch.library.register_fake("trtllm::flashmoe_scatter_add_chunk")
+def _(
+    fc2_output: torch.Tensor,
+    chunk_output: torch.Tensor,
+    perm_row_indices: torch.Tensor,
+    local_token_indices: torch.Tensor,
+    expanded_indices: torch.Tensor,
+    token_final_scales: torch.Tensor,
+) -> None:
+    pass

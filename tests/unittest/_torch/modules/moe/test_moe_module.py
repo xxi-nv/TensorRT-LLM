@@ -2196,3 +2196,404 @@ def test_flashmoe_cutedsl_symm_mem_ep(model_config, seq_len, routing_method_cls)
         nprocs=world_size,
         join=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# V3 Pipelined ReduceScatter EP test
+# ---------------------------------------------------------------------------
+
+
+def _flashmoe_pipelined_rs_ep_worker(
+    rank, world_size, port, model_config, seq_len, routing_method_cls
+):
+    """Worker for pipelined RS EP test (V3) — runs in each spawned process."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    try:
+        _flashmoe_pipelined_rs_ep_worker_impl(
+            rank, world_size, model_config, seq_len, routing_method_cls
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _flashmoe_pipelined_rs_ep_worker_impl(
+    rank, world_size, model_config, seq_len, routing_method_cls
+):
+    """Implementation of pipelined RS EP test worker (V3)."""
+    dtype = torch.bfloat16
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    with torch.device(f"cuda:{rank}"):
+        # Same seed on all ranks for identical global data
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        total_tokens = seq_len * world_size
+        all_x = torch.randn((total_tokens, hidden_size), dtype=dtype, device="cuda")
+        all_router_logits = torch.randn((total_tokens, num_experts), dtype=dtype, device="cuda")
+
+        # Each rank's portion
+        my_x = all_x[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        my_logits = all_router_logits[rank * seq_len : (rank + 1) * seq_len].contiguous()
+
+        # Shared weights
+        quantize_util = BaseQuantizeUtil(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=None,
+        )
+        weights = quantize_util.create_weights()
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        routing_method = _create_routing_method(
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
+
+        # --- EP model with pipelined RS V3 ---
+        ep_mapping = Mapping(
+            world_size=world_size,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+            moe_tp_size=1,
+            enable_attention_dp=True,
+        )
+        ep_mapping.rank = rank
+
+        ep_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ep_mapping,
+        )
+
+        flashmoe_ep = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ep_model_cfg,
+            ep_comm_version="v3",
+        )
+        flashmoe_ep.load_weights([weights])
+        flashmoe_ep.cuda(f"cuda:{rank}")
+
+        all_rank_num_tokens = [seq_len] * world_size
+
+        with torch.inference_mode():
+            ep_output = flashmoe_ep.forward(
+                my_x,
+                my_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+
+        # --- Single-GPU reference ---
+        ref_mapping = Mapping()
+        ref_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ref_mapping,
+        )
+
+        flashmoe_ref = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ref_model_cfg,
+        )
+        flashmoe_ref.load_weights([weights])
+        flashmoe_ref.cuda(f"cuda:{rank}")
+
+        with torch.inference_mode():
+            ref_output = flashmoe_ref.forward(all_x, all_router_logits)
+
+        my_ref_output = ref_output[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        max_diff = (ep_output - my_ref_output).abs().max().item()
+
+        # Same tolerance as V1/V2 EP tests
+        torch.testing.assert_close(
+            ep_output,
+            my_ref_output,
+            rtol=2e-2,
+            atol=5000,
+        )
+
+        G_LOGGER.info(
+            "Rank %d: pipelined RS V3 EP test PASSED (max_diff=%.6f)",
+            rank,
+            max_diff,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            [
+                MoeModelConfig(60, 4, 2048, 1408),
+                MoeModelConfig(256, 8, 7168, 2048),
+            ],
+            [8],
+            [RenormalizeMoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_pipelined_rs_ep(model_config, seq_len, routing_method_cls):
+    """Pipelined ReduceScatter EP test (V3): split FC2 + per-chunk RS overlap.
+
+    Uses NCCL reduce per chunk on a separate CUDA stream, overlapping
+    scatter-add computation with communication.
+    """
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    import torch.multiprocessing as mp
+
+    from tensorrt_llm._utils import get_free_port
+
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(
+        _flashmoe_pipelined_rs_ep_worker,
+        args=(world_size, port, model_config, seq_len, routing_method_cls),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph EP test (V3.4c)
+# ---------------------------------------------------------------------------
+
+
+def _flashmoe_graph_ep_worker(rank, world_size, port, model_config, seq_len, routing_method_cls):
+    """Worker for CUDA Graph EP test — runs in each spawned process."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    try:
+        _flashmoe_graph_ep_worker_impl(rank, world_size, model_config, seq_len, routing_method_cls)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _flashmoe_graph_ep_worker_impl(rank, world_size, model_config, seq_len, routing_method_cls):
+    """Implementation of CUDA Graph EP test worker."""
+    dtype = torch.bfloat16
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    with torch.device(f"cuda:{rank}"):
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        total_tokens = seq_len * world_size
+        all_x = torch.randn((total_tokens, hidden_size), dtype=dtype, device="cuda")
+        all_router_logits = torch.randn((total_tokens, num_experts), dtype=dtype, device="cuda")
+
+        my_x = all_x[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        my_logits = all_router_logits[rank * seq_len : (rank + 1) * seq_len].contiguous()
+
+        quantize_util = BaseQuantizeUtil(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=None,
+        )
+        weights = quantize_util.create_weights()
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        routing_method = _create_routing_method(
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
+
+        ep_mapping = Mapping(
+            world_size=world_size,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+            moe_tp_size=1,
+            enable_attention_dp=True,
+        )
+        ep_mapping.rank = rank
+
+        ep_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ep_mapping,
+        )
+
+        # --- EP model with CUDA Graph ---
+        flashmoe_ep = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ep_model_cfg,
+            ep_comm_version="graph",
+        )
+        flashmoe_ep.load_weights([weights])
+        flashmoe_ep.cuda(f"cuda:{rank}")
+
+        all_rank_num_tokens = [seq_len] * world_size
+
+        with torch.inference_mode():
+            # First call captures the graph
+            ep_output = flashmoe_ep.forward(
+                my_x,
+                my_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+            # Second call replays
+            ep_output = flashmoe_ep.forward(
+                my_x,
+                my_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+
+        # --- Single-GPU reference ---
+        ref_mapping = Mapping()
+        ref_model_cfg = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=ref_mapping,
+        )
+
+        flashmoe_ref = FlashMoECuteDsl(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ref_model_cfg,
+        )
+        flashmoe_ref.load_weights([weights])
+        flashmoe_ref.cuda(f"cuda:{rank}")
+
+        with torch.inference_mode():
+            ref_output = flashmoe_ref.forward(all_x, all_router_logits)
+
+        my_ref_output = ref_output[rank * seq_len : (rank + 1) * seq_len].contiguous()
+        max_diff = (ep_output - my_ref_output).abs().max().item()
+
+        torch.testing.assert_close(
+            ep_output,
+            my_ref_output,
+            rtol=2e-2,
+            atol=5000,
+        )
+
+        G_LOGGER.info(
+            "Rank %d: CUDA Graph EP test PASSED (max_diff=%.6f)",
+            rank,
+            max_diff,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(
+    "model_config,seq_len,routing_method_cls",
+    [
+        pytest.param(
+            mc,
+            sl,
+            rm,
+            id=f"{mc}-seq={sl}-routing={rm.__name__.replace('MoeRoutingMethod', '')}",
+        )
+        for mc, sl, rm in product(
+            [
+                MoeModelConfig(60, 4, 2048, 1408),
+                MoeModelConfig(256, 8, 7168, 2048),
+            ],
+            [8],
+            [RenormalizeMoeRoutingMethod],
+        )
+    ],
+)
+def test_flashmoe_cutedsl_graph_ep(model_config, seq_len, routing_method_cls):
+    """CUDA Graph EP test: captures V1 EP pipeline as a graph.
+
+    First forward captures the graph, second replays it.
+    Both outputs should match single-GPU reference.
+    """
+    can_impl, reason = FlashMoECuteDsl.can_implement(None, torch.bfloat16)
+    if not can_impl:
+        pytest.skip(reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    import torch.multiprocessing as mp
+
+    from tensorrt_llm._utils import get_free_port
+
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(
+        _flashmoe_graph_ep_worker,
+        args=(world_size, port, model_config, seq_len, routing_method_cls),
+        nprocs=world_size,
+        join=True,
+    )

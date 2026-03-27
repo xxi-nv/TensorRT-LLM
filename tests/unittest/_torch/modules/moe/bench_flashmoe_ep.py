@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashMoE EP Communication Benchmark: NCCL (V1) vs Symmetric Memory (V2).
+"""FlashMoE EP Communication Benchmark: NCCL (V1) vs Symmetric Memory (V2) vs Pipelined RS (V3).
 
 Usage:
     # Basic benchmark (4 GPUs, mp.spawn):
@@ -27,6 +27,9 @@ Usage:
     trtllm-llmapi-launch python tests/unittest/_torch/modules/moe/bench_flashmoe_ep.py \
         --num-experts 256 --top-k 8 --hidden-size 7168 --intermediate-size 2048 \
         --seq-len 32 --warmup 10 --iters 50
+
+    # Benchmark specific versions only:
+    trtllm-llmapi-launch python tests/unittest/_torch/modules/moe/bench_flashmoe_ep.py --versions v1 v3
 """
 
 import argparse
@@ -75,7 +78,7 @@ def _create_moe_weights(num_experts, hidden_size, intermediate_size, dtype):
 
 
 def _bench_worker_impl(rank, world_size, args):
-    """Benchmark V1 (NCCL) vs V2 (symm mem) EP communication."""
+    """Benchmark V1 (NCCL) vs V2 (symm mem) vs V3 (pipelined RS) EP communication."""
     from transformers.configuration_utils import PretrainedConfig
 
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -92,6 +95,7 @@ def _bench_worker_impl(rank, world_size, args):
     warmup_iters = args.warmup
     bench_iters = args.iters
     use_nsys = args.nsys
+    versions = args.versions
 
     with torch.device(f"cuda:{rank}"):
         # Deterministic data across ranks
@@ -132,33 +136,76 @@ def _bench_worker_impl(rank, world_size, args):
 
         all_rank_num_tokens = [seq_len] * world_size
 
-        # --- Create V1 (NCCL) model ---
-        model_v1 = FlashMoECuteDsl(
-            routing_method=routing_method,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            dtype=dtype,
-            reduce_results=True,
-            model_config=ep_model_cfg,
-            use_symm_mem_ep=False,
-        )
-        model_v1.load_weights([weights])
-        model_v1.cuda(f"cuda:{rank}")
+        # --- Create models for requested versions ---
+        models = {}
+        model_labels = {
+            "v1": "V1 NCCL",
+            "v2": "V2 SymmMem",
+            "v3": "V3 PipeRS",
+            "graph": "Graph",
+        }
 
-        # --- Create V2 (symm mem) model ---
-        model_v2 = FlashMoECuteDsl(
-            routing_method=routing_method,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            dtype=dtype,
-            reduce_results=True,
-            model_config=ep_model_cfg,
-            use_symm_mem_ep=True,
-        )
-        model_v2.load_weights([weights])
-        model_v2.cuda(f"cuda:{rank}")
+        if "v1" in versions:
+            m = FlashMoECuteDsl(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ep_model_cfg,
+                use_symm_mem_ep=False,
+                ep_comm_version="v1",
+            )
+            m.load_weights([weights])
+            m.cuda(f"cuda:{rank}")
+            models["v1"] = m
+
+        if "v2" in versions:
+            m = FlashMoECuteDsl(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ep_model_cfg,
+                use_symm_mem_ep=True,
+                ep_comm_version="v2",
+            )
+            m.load_weights([weights])
+            m.cuda(f"cuda:{rank}")
+            models["v2"] = m
+
+        if "v3" in versions:
+            m = FlashMoECuteDsl(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ep_model_cfg,
+                ep_comm_version="v3",
+            )
+            m.load_weights([weights])
+            m.cuda(f"cuda:{rank}")
+            models["v3"] = m
+
+        if "graph" in versions:
+            m = FlashMoECuteDsl(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ep_model_cfg,
+                ep_comm_version="graph",
+            )
+            m.load_weights([weights])
+            m.cuda(f"cuda:{rank}")
+            models["graph"] = m
 
         def _run_forward(model, label):
             """Run forward pass with optional NVTX annotation."""
@@ -181,102 +228,101 @@ def _bench_worker_impl(rank, world_size, args):
             print(f"  hidden={hidden_size}, intermediate={intermediate_size}")
             print(f"  seq_len={seq_len} per rank, total={total_tokens}")
             print(f"  world_size={world_size}")
+            print(f"  versions={versions}")
             print(f"  warmup={warmup_iters}, bench_iters={bench_iters}")
             print(f"{'=' * 60}")
             print(f"\nWarming up ({warmup_iters} iters)...")
 
         with torch.inference_mode():
             for _ in range(warmup_iters):
-                _run_forward(model_v1, "warmup_v1")
-                _run_forward(model_v2, "warmup_v2")
+                for v, model in models.items():
+                    _run_forward(model, f"warmup_{v}")
             torch.cuda.synchronize()
 
         dist.barrier()
 
-        # --- Benchmark V1 (NCCL) ---
-        if rank == 0:
-            print(f"\nBenchmarking V1 (NCCL) EP: {bench_iters} iters...")
+        # --- Benchmark each version ---
+        all_times = {}
+        for v, model in models.items():
+            label = model_labels[v]
+            if rank == 0:
+                print(f"\nBenchmarking {label}: {bench_iters} iters...")
 
-        start_events_v1 = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
-        end_events_v1 = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
+            starts = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
+            ends = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
 
-        with torch.inference_mode():
-            for i in range(bench_iters):
-                if use_nsys and i == 0:
-                    torch.cuda.nvtx.range_push("bench_v1_nccl")
-                start_events_v1[i].record()
-                _run_forward(model_v1, f"v1_iter_{i}")
-                end_events_v1[i].record()
-                if use_nsys and i == bench_iters - 1:
-                    torch.cuda.nvtx.range_pop()
+            with torch.inference_mode():
+                for i in range(bench_iters):
+                    if use_nsys and i == 0:
+                        torch.cuda.nvtx.range_push(f"bench_{v}")
+                    starts[i].record()
+                    _run_forward(model, f"{v}_iter_{i}")
+                    ends[i].record()
+                    if use_nsys and i == bench_iters - 1:
+                        torch.cuda.nvtx.range_pop()
 
-        torch.cuda.synchronize()
-        dist.barrier()
+            torch.cuda.synchronize()
+            dist.barrier()
 
-        # --- Benchmark V2 (symm mem) ---
-        if rank == 0:
-            print(f"Benchmarking V2 (Symmetric Memory) EP: {bench_iters} iters...")
-
-        start_events_v2 = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
-        end_events_v2 = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
-
-        with torch.inference_mode():
-            for i in range(bench_iters):
-                if use_nsys and i == 0:
-                    torch.cuda.nvtx.range_push("bench_v2_symm_mem")
-                start_events_v2[i].record()
-                _run_forward(model_v2, f"v2_iter_{i}")
-                end_events_v2[i].record()
-                if use_nsys and i == bench_iters - 1:
-                    torch.cuda.nvtx.range_pop()
-
-        torch.cuda.synchronize()
-        dist.barrier()
+            if rank == 0:
+                all_times[v] = [starts[i].elapsed_time(ends[i]) for i in range(bench_iters)]
 
         # --- Results (rank 0 only) ---
         if rank == 0:
-            times_v1 = [
-                start_events_v1[i].elapsed_time(end_events_v1[i]) for i in range(bench_iters)
-            ]
-            times_v2 = [
-                start_events_v2[i].elapsed_time(end_events_v2[i]) for i in range(bench_iters)
-            ]
-
-            avg_v1 = sum(times_v1) / len(times_v1)
-            avg_v2 = sum(times_v2) / len(times_v2)
-            min_v1 = min(times_v1)
-            min_v2 = min(times_v2)
-            max_v1 = max(times_v1)
-            max_v2 = max(times_v2)
-
-            # Median
-            s_v1 = sorted(times_v1)
-            s_v2 = sorted(times_v2)
-            med_v1 = s_v1[len(s_v1) // 2]
-            med_v2 = s_v2[len(s_v2) // 2]
-
-            # P95
-            p95_v1 = s_v1[int(len(s_v1) * 0.95)]
-            p95_v2 = s_v2[int(len(s_v2) * 0.95)]
-
-            print(f"\n{'=' * 60}")
+            print(f"\n{'=' * 70}")
             print(f"RESULTS (rank 0, {bench_iters} iterations)")
-            print(f"{'=' * 60}")
-            print(f"{'Metric':<12} {'V1 NCCL (ms)':>14} {'V2 SymmMem (ms)':>16} {'Speedup':>10}")
-            print(f"{'-' * 12} {'-' * 14} {'-' * 16} {'-' * 10}")
-            print(f"{'Mean':<12} {avg_v1:>14.3f} {avg_v2:>16.3f} {avg_v1 / avg_v2:>9.2f}x")
-            print(f"{'Median':<12} {med_v1:>14.3f} {med_v2:>16.3f} {med_v1 / med_v2:>9.2f}x")
-            print(f"{'Min':<12} {min_v1:>14.3f} {min_v2:>16.3f} {min_v1 / min_v2:>9.2f}x")
-            print(f"{'Max':<12} {max_v1:>14.3f} {max_v2:>16.3f} {max_v1 / max_v2:>9.2f}x")
-            print(f"{'P95':<12} {p95_v1:>14.3f} {p95_v2:>16.3f} {p95_v1 / p95_v2:>9.2f}x")
-            print(f"{'=' * 60}")
+            print(f"{'=' * 70}")
 
-            # Print individual iteration times for detailed analysis
+            # Build header
+            header = f"{'Metric':<12}"
+            for v in versions:
+                if v in all_times:
+                    header += f" {model_labels[v] + ' (ms)':>16}"
+            print(header)
+            print("-" * len(header))
+
+            def _stats(times):
+                s = sorted(times)
+                return {
+                    "mean": sum(s) / len(s),
+                    "median": s[len(s) // 2],
+                    "min": s[0],
+                    "max": s[-1],
+                    "p95": s[int(len(s) * 0.95)],
+                }
+
+            stats = {v: _stats(t) for v, t in all_times.items()}
+
+            for metric in ["mean", "median", "min", "max", "p95"]:
+                row = f"{metric.capitalize():<12}"
+                for v in versions:
+                    if v in stats:
+                        row += f" {stats[v][metric]:>16.3f}"
+                print(row)
+
+            # Speedup vs V1 (if V1 is included)
+            if "v1" in stats:
+                print()
+                for v in versions:
+                    if v != "v1" and v in stats:
+                        speedup = stats["v1"]["median"] / stats[v]["median"]
+                        print(f"  {model_labels[v]} vs V1: {speedup:.2f}x (median)")
+
+            print(f"{'=' * 70}")
+
             if args.verbose:
                 print("\nPer-iteration times (ms):")
-                print(f"{'Iter':<6} {'V1 NCCL':>10} {'V2 SymmMem':>12}")
+                header = f"{'Iter':<6}"
+                for v in versions:
+                    if v in all_times:
+                        header += f" {model_labels[v]:>12}"
+                print(header)
                 for i in range(bench_iters):
-                    print(f"{i:<6} {times_v1[i]:>10.3f} {times_v2[i]:>12.3f}")
+                    row = f"{i:<6}"
+                    for v in versions:
+                        if v in all_times:
+                            row += f" {all_times[v][i]:>12.3f}"
+                    print(row)
 
 
 def main():
@@ -293,6 +339,13 @@ def main():
         "--nsys", action="store_true", help="Add NVTX annotations for NSYS profiling"
     )
     parser.add_argument("--verbose", action="store_true", help="Print per-iteration times")
+    parser.add_argument(
+        "--versions",
+        nargs="+",
+        default=["v1", "v2", "v3", "graph"],
+        choices=["v1", "v2", "v3", "graph"],
+        help="EP versions to benchmark (default: v1 v2 v3 graph)",
+    )
     args = parser.parse_args()
 
     from tensorrt_llm._utils import get_free_port

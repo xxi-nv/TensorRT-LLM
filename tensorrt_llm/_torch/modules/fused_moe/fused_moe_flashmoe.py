@@ -427,6 +427,54 @@ class FlashMoEFused(MoE):
         return final_hidden_states
 
 
+def _build_chunk_mappings(
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    top_k: int,
+    seq_len: int,
+    ep_size: int,
+    num_valid_rows: int,
+) -> list:
+    """Build per-chunk (per-rank) index mappings for pipelined scatter-add.
+
+    Groups permuted rows by destination rank chunk. For each chunk c
+    (rank c's tokens), returns the permuted row indices, local token
+    indices within the chunk, and expanded indices for scale lookup.
+
+    Only considers rows within [0, num_valid_rows) to skip padding.
+
+    Args:
+        permuted_idx_to_expanded_idx: [T_permuted] int32, from moe_sort
+        top_k: experts per token
+        seq_len: tokens per rank
+        ep_size: number of EP ranks
+        num_valid_rows: number of valid (non-padding) permuted rows
+
+    Returns:
+        List of (perm_row_indices, local_token_indices, expanded_indices)
+        tuples, one per chunk. All tensors are int64 on the same device.
+    """
+    device = permuted_idx_to_expanded_idx.device
+
+    # Only look at valid rows (exclude padding from moe_sort)
+    valid_expanded = permuted_idx_to_expanded_idx[:num_valid_rows].long()
+    valid_row_ids = torch.arange(num_valid_rows, device=device)
+
+    # Compute token index and chunk assignment for each valid row
+    token_idx = valid_expanded // top_k  # [num_valid_rows]
+    chunk_idx = token_idx // seq_len  # which rank's chunk (0..ep_size-1)
+
+    # Build per-chunk mappings
+    chunk_mappings = []
+    for c in range(ep_size):
+        mask = chunk_idx == c
+        perm_rows = valid_row_ids[mask]
+        local_tokens = (token_idx[mask] - c * seq_len).long()
+        expanded_idx = valid_expanded[mask]
+        chunk_mappings.append((perm_rows, local_tokens, expanded_idx))
+
+    return chunk_mappings
+
+
 class FlashMoECuteDsl(FlashMoEFused):
     """FlashMoE with cuteDSL kernel-level fusion.
 
@@ -438,10 +486,11 @@ class FlashMoECuteDsl(FlashMoEFused):
     Uses moe_sort for tile management (same as CuteDslFusedMoE) and
     bf16 grouped GEMM kernels for compute.
 
-    Multi-GPU EP communication (V1):
-    - AllGather input tokens via symmetric memory + cuMemcpyDtoDAsync
-    - GEMM on all tokens with local experts only (moe_sort handles partitioning)
-    - ReduceScatter output via symmetric memory + cuMemcpyDtoDAsync + local sum
+    Multi-GPU EP communication versions:
+    - V1 (default): NCCL AllGather + local GEMM + NCCL ReduceScatter
+    - V2 (use_symm_mem_ep=True): symmetric memory P2P for AG/RS
+    - V3 (ep_comm_version='v3'): split FC2 + pipelined per-chunk RS
+    - Graph (ep_comm_version='graph'): CUDA Graph capture of V1 pipeline
 
     Only supports unquantized bf16 on SM >= 90 (Hopper/Blackwell).
     """
@@ -502,6 +551,7 @@ class FlashMoECuteDsl(FlashMoEFused):
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         use_symm_mem_ep: bool = False,
+        ep_comm_version: str = "v1",
     ):
         super().__init__(
             routing_method=routing_method,
@@ -523,6 +573,7 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         self.tile_size = self.DEFAULT_TILE_SIZE
         self.use_symm_mem_ep = use_symm_mem_ep
+        self.ep_comm_version = ep_comm_version
 
         # EP symmetric memory state (lazily initialized in _init_ep_symm_mem)
         self._ep_symm_mem_initialized = False
@@ -532,6 +583,178 @@ class FlashMoECuteDsl(FlashMoEFused):
         self._output_hdl = None
         self._ep_group_cached = None
         self._max_num_tokens_ep = 0
+
+        # V3 pipelined RS: comm stream for overlapping scatter-add with RS
+        self._comm_stream = None
+
+        # V3.4c CUDA Graph: state for graph capture/replay
+        self._ep_graph = None
+        self._ep_graph_num_tokens = 0
+        # Fixed-shape graph buffers (lazily allocated in _init_graph_buffers)
+        self._graph_input = None
+        self._graph_experts = None
+        self._graph_scales = None
+        self._graph_output = None
+
+    def _init_graph_buffers(self, num_tokens: int):
+        """Pre-allocate fixed-shape buffers for CUDA Graph EP capture.
+
+        All buffers are sized for num_tokens per rank. The graph is
+        captured once and replayed for subsequent forwards with the
+        same token count.
+
+        Args:
+            num_tokens: Number of tokens per rank (must be constant
+                across graph replays).
+        """
+        if self._graph_input is not None and self._ep_graph_num_tokens == num_tokens:
+            return
+
+        ep_size = self.ep_size
+        H = self.hidden_size
+        top_k = self.routing_method.top_k
+        device = torch.cuda.current_device()
+        dtype = self.dtype or torch.bfloat16
+        total = num_tokens * ep_size
+
+        self._graph_input = torch.zeros(num_tokens, H, dtype=dtype, device=device)
+        self._graph_experts = torch.zeros(num_tokens, top_k, dtype=torch.int32, device=device)
+        self._graph_scales = torch.zeros(num_tokens, top_k, dtype=torch.float32, device=device)
+        self._graph_output = torch.zeros(num_tokens, H, dtype=dtype, device=device)
+
+        # Pre-allocate AllGather destination buffers
+        self._graph_all_x = torch.zeros(total, H, dtype=dtype, device=device)
+        self._graph_all_experts = torch.zeros(total, top_k, dtype=torch.int32, device=device)
+        self._graph_all_scales = torch.zeros(total, top_k, dtype=torch.float32, device=device)
+
+        self._ep_graph_num_tokens = num_tokens
+        self._ep_graph = None  # Invalidate any existing graph
+
+        logger.info(
+            "FlashMoECuteDsl graph buffers initialized: ep_size=%d, tokens=%d, H=%d",
+            ep_size,
+            num_tokens,
+            H,
+        )
+
+    def _capture_ep_graph(self, num_tokens: int):
+        """Capture the V1 NCCL EP pipeline as a CUDA Graph.
+
+        Captures: AllGather → moe_sort → FC1 → FC2 → ReduceScatter.
+
+        The graph uses fixed-shape buffers allocated by _init_graph_buffers().
+        Data is copied into graph buffers before replay and copied out after.
+
+        NOTE: The cuteDSL kernel path does lazy compilation (Python side
+        effects) which is not graph-safe. This method forces the torch.mm
+        fallback path during capture by temporarily disabling cuteDSL.
+
+        Args:
+            num_tokens: Tokens per rank (must match _init_graph_buffers).
+        """
+
+        ep_size = self.ep_size
+        ep_group = self._get_ep_process_group()
+
+        self._init_graph_buffers(num_tokens)
+
+        # Force fallback path during graph capture to avoid cuteDSL
+        # lazy compilation side effects
+        import tensorrt_llm._torch.custom_ops.flashmoe_bf16_custom_ops as _ops
+
+        old_disable = _ops._FORCE_DISABLE_CUTEDSL
+        _ops._FORCE_DISABLE_CUTEDSL = True
+
+        # Warmup run (CUDA graph requires at least one eager run)
+        self._forward_ep_graph_body(num_tokens, ep_group)
+
+        # Capture
+        self._ep_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._ep_graph):
+            self._forward_ep_graph_body(num_tokens, ep_group)
+
+        # Restore cuteDSL setting
+        _ops._FORCE_DISABLE_CUTEDSL = old_disable
+
+        logger.info(
+            "FlashMoECuteDsl CUDA Graph captured: tokens=%d, ep_size=%d",
+            num_tokens,
+            ep_size,
+        )
+
+    def _forward_ep_graph_body(self, num_tokens: int, ep_group):
+        """The EP forward body used for both graph capture and eager warmup.
+
+        Reads from self._graph_input/experts/scales and writes to
+        self._graph_output. Uses pre-allocated AllGather buffers.
+        """
+        ep_size = self.ep_size
+
+        x = self._graph_input
+        experts = self._graph_experts
+        scales = self._graph_scales
+
+        # AllGather input tokens
+        all_x_list = list(self._graph_all_x.chunk(ep_size, dim=0))
+        dist.all_gather(all_x_list, x.contiguous(), group=ep_group)
+
+        # AllGather routing info
+        all_experts_list = list(self._graph_all_experts.chunk(ep_size, dim=0))
+        dist.all_gather(all_experts_list, experts.contiguous(), group=ep_group)
+
+        all_scales_list = list(self._graph_all_scales.chunk(ep_size, dim=0))
+        dist.all_gather(all_scales_list, scales.contiguous(), group=ep_group)
+
+        # Compute: moe_sort + FC1 + FC2 on all gathered tokens
+        partial_output = self.run_moe(
+            self._graph_all_x, self._graph_all_experts, self._graph_all_scales
+        )
+
+        # ReduceScatter
+        dist.reduce_scatter_tensor(
+            self._graph_output,
+            partial_output.contiguous(),
+            op=dist.ReduceOp.SUM,
+            group=ep_group,
+        )
+
+    def _forward_ep_graph(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """EP forward via CUDA Graph replay.
+
+        Copies inputs to graph buffers, replays the captured graph, and
+        returns a clone of the graph output buffer.
+
+        On first call (or when token count changes), captures the graph.
+
+        Args:
+            x: Input tokens [num_tokens, hidden_size], bf16.
+            token_selected_experts: Expert IDs [num_tokens, top_k], int32.
+            token_final_scales: Routing weights [num_tokens, top_k] or None.
+
+        Returns:
+            Output [num_tokens, hidden_size], bf16.
+        """
+        num_tokens = x.shape[0]
+
+        # Capture graph if needed
+        if self._ep_graph is None or self._ep_graph_num_tokens != num_tokens:
+            self._capture_ep_graph(num_tokens)
+
+        # Copy inputs into graph buffers
+        self._graph_input.copy_(x)
+        self._graph_experts.copy_(token_selected_experts)
+        if token_final_scales is not None:
+            self._graph_scales.copy_(token_final_scales)
+
+        # Replay
+        self._ep_graph.replay()
+
+        return self._graph_output.clone()
 
     def _init_ep_symm_mem(self, num_tokens: int):
         """Lazily initialize symmetric memory buffers for EP V2 communication.
@@ -856,6 +1079,171 @@ class FlashMoECuteDsl(FlashMoEFused):
 
         return output
 
+    def _forward_ep_v3(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """EP communication with pipelined ReduceScatter (V3.4d).
+
+        Splits FC2 into GEMM-only + per-chunk scatter-add, then overlaps
+        the per-chunk scatter-add with ReduceScatter using CUDA streams.
+
+        Flow:
+        1. AllGather input tokens + routing (same as V1/V2)
+        2. moe_sort + FC1 (same as before)
+        3. FC2 GEMM only (no scatter-add) -> [T_permuted, H]
+        4. Build per-chunk index mappings
+        5. Pipelined loop:
+           - Compute stream: scatter-add chunk c
+           - Comm stream: reduce(chunk c-1) to destination rank
+        6. Final reduce for last chunk
+
+        Args:
+            x: Input tokens [num_tokens, hidden_size], bf16.
+            token_selected_experts: Expert IDs [num_tokens, top_k], int32.
+            token_final_scales: Routing weights [num_tokens, top_k] or None.
+
+        Returns:
+            Output [num_tokens, hidden_size], bf16.
+        """
+        ep_size = self.ep_size
+        ep_group = self._get_ep_process_group()
+        num_tokens, H = x.shape
+        top_k = token_selected_experts.shape[1]
+
+        # --- 1. AllGather input tokens (NCCL) ---
+        all_x_list = [torch.empty_like(x) for _ in range(ep_size)]
+        dist.all_gather(all_x_list, x.contiguous(), group=ep_group)
+        all_x = torch.cat(all_x_list, dim=0)  # [T_total, H]
+
+        # AllGather routing info
+        all_experts_list = [torch.empty_like(token_selected_experts) for _ in range(ep_size)]
+        dist.all_gather(
+            all_experts_list,
+            token_selected_experts.contiguous(),
+            group=ep_group,
+        )
+        all_experts = torch.cat(all_experts_list, dim=0)
+
+        if token_final_scales is not None:
+            all_scales_list = [torch.empty_like(token_final_scales) for _ in range(ep_size)]
+            dist.all_gather(
+                all_scales_list,
+                token_final_scales.contiguous(),
+                group=ep_group,
+            )
+            all_scales = torch.cat(all_scales_list, dim=0)
+        else:
+            all_scales = None
+
+        # --- 2. moe_sort + FC1 ---
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=all_experts,
+            token_final_scales=all_scales,
+            num_experts=self.num_slots,
+            top_k=top_k,
+            local_expert_offset=self.slot_start,
+            local_num_experts=self.expert_size_per_partition,
+            tile_tokens_dim=self.tile_size,
+        )
+
+        fc1_output = torch.ops.trtllm.flashmoe_bf16_gather_gemm_swiglu(
+            input=all_x,
+            weight=self.w3_w1_weight,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            top_k=top_k,
+            tile_size=self.tile_size,
+            is_gated_activation=self.is_gated_activation,
+        )
+
+        # --- 3. FC2 GEMM only (no scatter-add) ---
+        fc2_gemm_out = torch.ops.trtllm.flashmoe_bf16_gemm_only(
+            input=fc1_output,
+            weight=self.w2_weight,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_size=self.tile_size,
+        )
+        # fc2_gemm_out: [T_permuted, H] in permuted order
+
+        # --- 4. Build per-chunk index mappings ---
+        # Compute total valid rows from tile info
+        n_valid_tiles = num_non_exiting_tiles.item()
+        if n_valid_tiles > 0:
+            num_valid_rows = tile_idx_to_mn_limit[n_valid_tiles - 1].item()
+        else:
+            num_valid_rows = 0
+
+        chunk_mappings = _build_chunk_mappings(
+            permuted_idx_to_expanded_idx, top_k, num_tokens, ep_size, num_valid_rows
+        )
+
+        # --- 5. Pipelined scatter-add + ReduceScatter ---
+        if self._comm_stream is None:
+            self._comm_stream = torch.cuda.Stream()
+        comm_stream = self._comm_stream
+        compute_stream = torch.cuda.current_stream()
+
+        # Allocate per-chunk output buffers
+        chunk_bufs = [
+            torch.zeros(num_tokens, H, dtype=x.dtype, device=x.device) for _ in range(ep_size)
+        ]
+        scatter_events = [torch.cuda.Event() for _ in range(ep_size)]
+
+        for c in range(ep_size):
+            perm_rows, local_tokens, expanded_idx = chunk_mappings[c]
+
+            # Scatter-add on compute stream
+            torch.ops.trtllm.flashmoe_scatter_add_chunk(
+                fc2_output=fc2_gemm_out,
+                chunk_output=chunk_bufs[c],
+                perm_row_indices=perm_rows,
+                local_token_indices=local_tokens,
+                expanded_indices=expanded_idx,
+                token_final_scales=all_scales if all_scales is not None else token_final_scales,
+            )
+            scatter_events[c].record(compute_stream)
+
+            # Launch reduce for previous chunk on comm stream (pipelined)
+            if c > 0:
+                with torch.cuda.stream(comm_stream):
+                    comm_stream.wait_event(scatter_events[c - 1])
+                    dist.reduce(
+                        chunk_bufs[c - 1],
+                        dst=c - 1,
+                        op=dist.ReduceOp.SUM,
+                        group=ep_group,
+                    )
+
+        # Handle last chunk reduce
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(scatter_events[ep_size - 1])
+            dist.reduce(
+                chunk_bufs[ep_size - 1],
+                dst=ep_size - 1,
+                op=dist.ReduceOp.SUM,
+                group=ep_group,
+            )
+
+        # Wait for all comm to finish
+        compute_stream.wait_stream(comm_stream)
+
+        # My output is the chunk corresponding to my rank
+        return chunk_bufs[self.ep_rank]
+
     def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -873,6 +1261,8 @@ class FlashMoECuteDsl(FlashMoEFused):
         - V1 (default): NCCL collectives via _forward_ep()
         - V2 (use_symm_mem_ep=True): symmetric memory P2P via
           _forward_ep_v2()
+        - V3 (ep_comm_version='v3'): pipelined RS via _forward_ep_v3()
+        - Graph (ep_comm_version='graph'): CUDA Graph via _forward_ep_graph()
         EP handles all inter-GPU communication, so DP allgather and TP
         reduce are skipped.
         For ep_size == 1: direct run_moe with optional DP/TP comm.
@@ -897,6 +1287,10 @@ class FlashMoECuteDsl(FlashMoEFused):
             # EP path: AllGather + local GEMM + ReduceScatter.
             # EP handles ALL inter-GPU communication; skip DP/TP comm.
             x, x_sf = self.quantize_input(x)
+            if self.ep_comm_version == "v3":
+                return self._forward_ep_v3(x, token_selected_experts, token_final_scales)
+            if self.ep_comm_version == "graph":
+                return self._forward_ep_graph(x, token_selected_experts, token_final_scales)
             if self.use_symm_mem_ep:
                 return self._forward_ep_v2(x, token_selected_experts, token_final_scales)
             return self._forward_ep(x, token_selected_experts, token_final_scales)
