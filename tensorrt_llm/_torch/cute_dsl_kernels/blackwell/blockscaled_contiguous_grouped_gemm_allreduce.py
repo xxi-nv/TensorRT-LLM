@@ -154,8 +154,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         out_mc_ptr: cutlass.Int64,
         tile_barrier_mc_ptr: cutlass.Int64,
         completion_barrier_mc_ptr: cutlass.Int64,
-        rank: cutlass.Int32,
-        world_size: cutlass.Int32,
+        rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
         out: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -459,8 +459,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         out_mc_ptr: cutlass.Int64,
         tile_barrier_mc_ptr: cutlass.Int64,
         completion_barrier_mc_ptr: cutlass.Int64,
-        rank: cutlass.Int32,
-        world_size: cutlass.Int32,
+        rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
         out: cute.Tensor,
         epilogue_op: cutlass.Constexpr,
     ):
@@ -1149,7 +1149,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                     # Write to staging buffer (contiguous, not scatter-add)
                     # This is the key difference from the base finalize-fusion kernel.
                     # For single-GPU (world_size==1), we still scatter-add directly.
-                    if world_size > 1:
+                    if cutlass.const_expr(world_size > 1):
                         # Write to contiguous staging buffer
                         if cutlass.const_expr(self.use_blkred):
                             tRS_rC.store(acc_vec_final.to(self.out_dtype))
@@ -1247,7 +1247,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                         space=cute.arch.SharedSpace.shared_cta,
                     )
                     if is_valid_row:
-                        if world_size > 1:
+                        if cutlass.const_expr(world_size > 1):
                             coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
                             staging_out_offset = cute.domain_offset(
                                 (permuted_row, coord_n, 0), staging
@@ -1294,7 +1294,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 # Signal AR warps that this tile is ready
-                if world_size > 1:
+                if cutlass.const_expr(world_size > 1):
                     # After all epilogue subtiles are done for this tile,
                     # signal the AR warps via multicast barrier
                     threadfence_system()
@@ -1316,7 +1316,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 tile_info_consumer_state.advance()
 
             # Store total tile count for AR warps
-            if world_size > 1:
+            if cutlass.const_expr(world_size > 1):
                 with cute.arch.elect_one():
                     storage.ar_total_tiles = epi_tile_count
                 cute.arch.fence_proxy(
@@ -1332,7 +1332,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         if warp_idx >= 7:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_ar_warps)
 
-            if world_size > 1:
+            if cutlass.const_expr(world_size > 1):
                 # AR thread index across 4 warps: 0-127
                 ar_thread_idx = (warp_idx - 7) * 32 + (tidx % 32)
 
@@ -1413,8 +1413,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         l: cutlass.Int64,  # noqa: E741
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
-        rank: cutlass.Int32,
-        world_size: cutlass.Int32,
+        rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
