@@ -439,6 +439,65 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
 
+    def _init_ep_nvls(self, max_num_tokens: int):
+        """Initialize NVLS IPC memory for fused FC2 GEMM + AllReduce (V4 EP).
+
+        Allocates MnnvlMemory buffers for:
+        - Staging buffer: FC2 output before cross-rank reduce [permuted_m, hidden_size]
+        - Tile barriers: int32 flags for epilogue→AR warp synchronization
+        - Completion barriers: int32 flags for AR warp completion signaling
+
+        Args:
+            max_num_tokens: Maximum number of tokens per rank (for buffer sizing).
+        """
+        from ..._mnnvl_utils import MoEEpAllReduceMnnvlMemory
+
+        top_k = self.routing_method.top_k
+        ep_size = self.mapping.moe_ep_size
+        tile_size = 128  # default CTA tile M
+
+        # Staging buffer: [max_permuted_m, hidden_size] in bf16
+        max_permuted_m = max_num_tokens * ep_size * top_k
+        # Align to tile_size for clean tile boundaries
+        max_permuted_m = (
+            (max_permuted_m + tile_size - 1) // tile_size) * tile_size
+        staging_bytes = max_permuted_m * self.hidden_size * 2  # bf16 = 2 bytes
+
+        self._ep_nvls_staging = MoEEpAllReduceMnnvlMemory(
+            self.mapping, staging_bytes)
+        self._ep_nvls_staging_ipc_ptrs = self._ep_nvls_staging.get_ipc_ptrs()
+
+        # Output buffer for reduced results [max_permuted_m, hidden_size] in bf16
+        output_bytes = max_permuted_m * self.hidden_size * 2
+        self._ep_nvls_output = MoEEpAllReduceMnnvlMemory(
+            self.mapping, output_bytes)
+        self._ep_nvls_output_ipc_ptrs = self._ep_nvls_output.get_ipc_ptrs()
+
+        # Tile barriers: one int32 flag per tile
+        max_tiles = max_permuted_m // tile_size
+        barrier_bytes = max_tiles * 4  # 4 bytes per int32 flag
+        # Align to page size
+        barrier_bytes = max(barrier_bytes, 4096)
+
+        self._ep_nvls_tile_barriers = MoEEpAllReduceMnnvlMemory(
+            self.mapping, barrier_bytes)
+        self._ep_nvls_completion_barriers = MoEEpAllReduceMnnvlMemory(
+            self.mapping, barrier_bytes)
+
+        # Create torch tensor views for zeroing
+        self._ep_nvls_staging_tensor = self._ep_nvls_staging.as_torch_strided_tensor(
+            torch.bfloat16)
+        self._ep_nvls_output_tensor = self._ep_nvls_output.as_torch_strided_tensor(
+            torch.bfloat16)
+        self._ep_nvls_tile_barrier_tensor = self._ep_nvls_tile_barriers.as_torch_strided_tensor(
+            torch.int32)
+        self._ep_nvls_completion_barrier_tensor = (
+            self._ep_nvls_completion_barriers.as_torch_strided_tensor(
+                torch.int32))
+
+        self._ep_nvls_max_permuted_m = max_permuted_m
+        self._ep_nvls_initialized = True
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -650,6 +709,133 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
+        return moe_output
+
+    def run_moe_nvfp4_v4_ep(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: torch.Tensor,
+        moe_output: torch.Tensor,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """V4 EP: Fused FC2 GEMM + AllReduce via 11-warp kernel.
+
+        Uses NVLS IPC memory for cross-rank reduce. The 11-warp kernel
+        writes FC2 output to a staging buffer and overlaps NVLink reduce
+        with GEMM epilogue.
+
+        Args:
+            x: FC1 quantized output [permuted_m, K/2] (fp4)
+            token_selected_experts: Expert IDs [num_tokens, top_k]
+            token_final_scales: Router scales [num_tokens, top_k]
+            x_sf: Input scale factors
+            moe_output: Pre-allocated output buffer [num_tokens, hidden_size]
+            tile_size: CTA tile M dimension (128 or 256)
+        """
+        output_dtype = torch.bfloat16
+        effective_top_k = token_selected_experts.size(1)
+        ep_size = self.mapping.moe_ep_size
+        ep_rank = self.mapping.moe_ep_rank
+
+        # Initialize NVLS memory on first call
+        if not hasattr(self,
+                       '_ep_nvls_initialized') or not self._ep_nvls_initialized:
+            max_num_tokens = token_final_scales.size(0) // ep_size
+            self._init_ep_nvls(max_num_tokens)
+
+        # moe_sort
+        (tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+         expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+         total_num_padded_tokens,
+         num_non_exiting_tiles) = torch.ops.trtllm.moe_sort(
+             token_selected_experts=token_selected_experts,
+             token_final_scales=token_final_scales,
+             num_experts=self.num_slots,
+             top_k=effective_top_k,
+             local_expert_offset=self.slot_start,
+             local_num_experts=self.expert_size_per_partition,
+             tile_tokens_dim=tile_size,
+         )
+
+        # FC1: gather + grouped GEMM + swiglu (same as non-EP)
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+            input=x.view(torch.float4_e2m1fn_x2),
+            weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf.view(torch.uint8),
+            weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
+            alpha=self.quant_scales.fc1_global,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            global_sf=self.fc2_input_scale,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            tile_size=tile_size,
+        )
+
+        # Zero staging and barrier buffers
+        self._ep_nvls_staging_tensor.zero_()
+        self._ep_nvls_tile_barrier_tensor.zero_()
+        self._ep_nvls_completion_barrier_tensor.zero_()
+
+        # Create pointer tensors (1-element int64) for passing raw ptrs to custom op
+        staging_mc_ptr = torch.tensor([self._ep_nvls_staging.ptr],
+                                      dtype=torch.int64,
+                                      device=x.device)
+        out_mc_ptr = torch.tensor([self._ep_nvls_output.ptr],
+                                  dtype=torch.int64,
+                                  device=x.device)
+        tile_barrier_mc_ptr = torch.tensor([self._ep_nvls_tile_barriers.ptr],
+                                           dtype=torch.int64,
+                                           device=x.device)
+        completion_barrier_mc_ptr = torch.tensor(
+            [self._ep_nvls_completion_barriers.ptr],
+            dtype=torch.int64,
+            device=x.device)
+
+        # Get staging/output as torch tensors for the custom op
+        permuted_m = total_num_padded_tokens.item() if isinstance(
+            total_num_padded_tokens, torch.Tensor) else total_num_padded_tokens
+        n = self.hidden_size
+        staging = self._ep_nvls_staging_tensor[0, :permuted_m * n].view(
+            permuted_m, n)
+
+        # Zero the moe_output for scatter-add
+        moe_output.zero_()
+
+        # FC2 + AllReduce: fused 11-warp kernel
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
+            input=x.view(torch.float4_e2m1fn_x2),
+            weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf.view(torch.uint8),
+            weight_scale=self.quant_scales.fc2_weight_block.view(torch.uint8),
+            alpha=self.quant_scales.fc2_global,
+            staging=staging,
+            out=moe_output,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            staging_mc_ptr=staging_mc_ptr,
+            out_mc_ptr=out_mc_ptr,
+            tile_barrier_mc_ptr=tile_barrier_mc_ptr,
+            completion_barrier_mc_ptr=completion_barrier_mc_ptr,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            tile_size=tile_size,
+            rank=ep_rank,
+            world_size=ep_size,
+            output_dtype=output_dtype,
+        )
+
         return moe_output
 
     def run_moe_fp8_block_scales(

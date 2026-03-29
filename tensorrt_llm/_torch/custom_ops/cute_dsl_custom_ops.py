@@ -1512,6 +1512,350 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            dtype=output_dtype,
                            device=input.device)
 
+    class Sm100BlockScaledContiguousGroupedGemmAllReduceRunner(TunableRunner):
+        """Runner for the 11-warp fused GEMM + AllReduce kernel.
+
+        Extends the finalize-fusion runner with AllReduce parameters for
+        cross-rank reduce in EP (expert parallelism) mode.
+        """
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        def __init__(self,
+                     num_experts: int,
+                     top_k: int,
+                     num_local_experts: int,
+                     local_expert_offset: int,
+                     tile_size: int,
+                     output_dtype: torch.dtype,
+                     rank: int,
+                     world_size: int,
+                     scaling_vector_size: int = 16):
+            super().__init__()
+            self.num_experts = num_experts
+            self.top_k = top_k
+            self.num_local_experts = num_local_experts
+            self.local_expert_offset = local_expert_offset
+            self.tile_size = tile_size
+            self.rank = rank
+            self.world_size = world_size
+
+            assert output_dtype == torch.bfloat16
+            self.output_dtype = output_dtype
+            self.scaling_vector_size = scaling_vector_size
+
+            if (sm_version := get_sm_version()) not in (100, 103):
+                raise ValueError(
+                    f"Sm100BlockScaledContiguousGroupedGemmAllReduceKernel supports SM 100/103 only, got SM {sm_version}"
+                )
+
+            if self.tile_size not in (128, 256):
+                raise ValueError(
+                    f"Sm100BlockScaledContiguousGroupedGemmAllReduceKernel supports tile_size 128/256 only, got {self.tile_size}"
+                )
+
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.rank,
+                self.world_size,
+                self.scaling_vector_size,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[int, int]]:
+            from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import \
+                Sm100BlockScaledContiguousGroupedGemmAllReduceKernel
+            a, b, *_ = inputs
+            m, k = a.size(0), a.size(1) * 2
+            l, n = b.size(0), b.size(1)
+
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
+            raster_along_m_candidates = [False]
+
+            valid_tactics = []
+            for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    raster_along_m_candidates):
+                if (ceil_div(m, mma_tiler_mn[0]) < cluster_shape_mn[0]
+                        or ceil_div(n, mma_tiler_mn[1]) < cluster_shape_mn[1]):
+                    continue
+                if Sm100BlockScaledContiguousGroupedGemmAllReduceKernel.can_implement(
+                        ab_dtype=cutlass.Float4E2M1FN,
+                        sf_dtype=cutlass.Float8E4M3FN,
+                        sf_vec_size=self.scaling_vector_size,
+                        out_dtype=cutlass.BFloat16,
+                        mma_tiler_mn=mma_tiler_mn,
+                        cluster_shape_mn=cluster_shape_mn,
+                        m=m,
+                        n=n,
+                        k=k,
+                        l=l,
+                        a_major="k",
+                        b_major="k",
+                        out_major="n",
+                ):
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, raster_along_m))
+
+            return valid_tactics
+
+        def get_tuning_config(self) -> TuningConfig:
+            key = self.unique_id()
+            if key not in self.__class__.tuning_config_cache:
+                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
+                                                 self.num_local_experts,
+                                                 self.local_expert_offset,
+                                                 self.tile_size)
+                self.__class__.tuning_config_cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, helper.gen_tuning_buckets,
+                        helper.map_to_tuning_buckets), ),
+                    constraint_specs=(
+                        ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                        ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
+                        ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(
+                            8, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
+                    inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    use_cold_l2_cache=True,
+                )
+            return self.__class__.tuning_config_cache[key]
+
+        def forward(self, inputs: List[torch.Tensor],
+                    tactic: Optional[tuple]) -> torch.Tensor:
+            from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import \
+                Sm100BlockScaledContiguousGroupedGemmAllReduceKernel
+
+            (a, b, a_sf, b_sf, alpha, staging, tile_idx_to_group_idx,
+             tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+             num_non_exiting_tiles, token_final_scales, staging_mc_ptr_tensor,
+             out_mc_ptr_tensor, tile_barrier_mc_ptr_tensor,
+             completion_barrier_mc_ptr_tensor, out) = inputs
+
+            assert a.dtype == torch.float4_e2m1fn_x2
+            assert a.dim() == 2
+            assert b.dtype == torch.float4_e2m1fn_x2
+            assert b.dim() == 3
+
+            m, k = a.size(0), a.size(1) * 2
+            l, n = b.size(0), b.size(1)
+            k // self.scaling_vector_size
+            num_tokens = out.size(0)
+
+            # Extract raw pointers from 1-element int64 tensors
+            staging_mc_ptr = staging_mc_ptr_tensor.item()
+            out_mc_ptr = out_mc_ptr_tensor.item()
+            tile_barrier_mc_ptr = tile_barrier_mc_ptr_tensor.item()
+            completion_barrier_mc_ptr = completion_barrier_mc_ptr_tensor.item()
+
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
+            staging_ptr = make_ptr(cutlass.BFloat16,
+                                   staging.data_ptr(),
+                                   cute.AddressSpace.gmem,
+                                   assumed_align=16)
+            out_ptr = make_ptr(cutlass.BFloat16,
+                               out.data_ptr(),
+                               cute.AddressSpace.gmem,
+                               assumed_align=16)
+            tile_idx_to_group_idx_ptr = make_ptr(
+                cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                cute.AddressSpace.gmem)
+            tile_idx_to_mn_limit_ptr = make_ptr(cutlass.Int32,
+                                                tile_idx_to_mn_limit.data_ptr(),
+                                                cute.AddressSpace.gmem)
+            permuted_idx_to_expanded_idx_ptr = make_ptr(
+                cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
+                cute.AddressSpace.gmem)
+            num_non_exiting_tiles_ptr = make_ptr(
+                cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                cute.AddressSpace.gmem)
+            token_final_scales_ptr = make_ptr(cutlass.Float32,
+                                              token_final_scales.data_ptr(),
+                                              cute.AddressSpace.gmem)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
+            else:
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+
+            cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
+                         cluster_shape_mn, raster_along_m, self.world_size)
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    use_blkred=True,
+                    raster_along_m=raster_along_m,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    staging_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    token_final_scales_ptr,
+                    staging_mc_ptr,
+                    out_mc_ptr,
+                    tile_barrier_mc_ptr,
+                    completion_barrier_mc_ptr,
+                    out_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    num_tokens,
+                    self.top_k,
+                    self.rank,
+                    self.world_size,
+                    tile_size=self.tile_size,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                staging_ptr,
+                alpha_ptr,
+                tile_idx_to_group_idx_ptr,
+                tile_idx_to_mn_limit_ptr,
+                permuted_idx_to_expanded_idx_ptr,
+                num_non_exiting_tiles_ptr,
+                token_final_scales_ptr,
+                staging_mc_ptr,
+                out_mc_ptr,
+                tile_barrier_mc_ptr,
+                completion_barrier_mc_ptr,
+                out_ptr,
+                m,
+                n,
+                k,
+                l,
+                num_tokens,
+                self.top_k,
+                self.rank,
+                self.world_size,
+                stream=stream,
+            )
+            return out
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell",
+        mutates_args=("staging", "out"),
+        device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        staging: torch.Tensor,
+        out: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        staging_mc_ptr: torch.Tensor,
+        out_mc_ptr: torch.Tensor,
+        tile_barrier_mc_ptr: torch.Tensor,
+        completion_barrier_mc_ptr: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        rank: int,
+        world_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        tuner = AutoTuner.get()
+        runner = Sm100BlockScaledContiguousGroupedGemmAllReduceRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, output_dtype, rank, world_size, scaling_vector_size)
+
+        inputs = [
+            input,
+            weight,
+            input_scale,
+            weight_scale,
+            alpha,
+            staging,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            staging_mc_ptr,
+            out_mc_ptr,
+            tile_barrier_mc_ptr,
+            completion_barrier_mc_ptr,
+            out,
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
     class Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner(
             TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel

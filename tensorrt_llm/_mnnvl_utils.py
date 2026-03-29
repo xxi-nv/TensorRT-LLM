@@ -425,6 +425,40 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
         HelixCpMnnvlMemory.get_comm(mapping)
 
 
+class MoEEpAllReduceMnnvlMemory(MnnvlMemory):
+    """MNNVL memory management for MoE EP fused AllReduce operations.
+
+    Provides IPC unicast buffers for cross-rank reduce in fused GEMM+AllReduce
+    kernels. Each rank can access all other ranks' staging buffers via IPC
+    pointers derived from the MnnvlMemory VA space.
+
+    Per-class state is automatically isolated via __init_subclass__.
+    """
+
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
+        """Get EP-based communicator (ranks in same EP group)."""
+        if cls.comm is not None:
+            return cls.comm
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
+            mapping.moe_ep_rank,
+        )
+        cls.comm = comm
+        return comm
+
+    def get_ipc_ptrs(self) -> List[int]:
+        """Get IPC pointer for each rank's buffer in the VA space.
+
+        Returns:
+            List of raw pointers, one per rank. ptr[i] points to rank i's
+            buffer as mapped into this rank's address space.
+        """
+        comm = type(self).get_comm(self.mapping)
+        num_ranks = comm.Get_size()
+        return [self.ptr + i * self.rank_stride for i in range(num_ranks)]
+
+
 @dataclass
 class MoEAlltoallInfo:
     local_gather_indices: torch.Tensor

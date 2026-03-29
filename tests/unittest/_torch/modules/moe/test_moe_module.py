@@ -65,6 +65,7 @@ from transformers.configuration_utils import PretrainedConfig
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -1476,3 +1477,243 @@ def test_configurable_moe_multi_gpu_eplb(
         model_config=model_config,
         routing_method_cls=routing_method_cls,
     )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuteDSL not available")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
+    reason="Requires SM100/SM103 (Blackwell)",
+)
+@pytest.mark.parametrize(
+    "m,n,k,l,top_k",
+    [
+        (128, 2048, 2048, 8, 2),
+        (256, 7168, 2048, 8, 2),
+    ],
+)
+def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
+    """Test 11-warp AllReduce kernel matches base finalize-fusion on single GPU.
+
+    When world_size=1, the AR warps are no-op and the kernel should produce
+    identical results to the base 7-warp finalize-fusion kernel.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    sf_vec_size = 16
+    tile_size = 128
+    mma_tiler_mn = (128, 128)
+    cluster_shape_mn = (1, 1)
+    scale_k = k // sf_vec_size
+    num_tokens = m // top_k
+    num_tiles = m // tile_size
+
+    if not Sm100BlockScaledContiguousGroupedGemmAllReduceKernel.can_implement(
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=sf_vec_size,
+        out_dtype=cutlass.BFloat16,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        out_major="n",
+    ):
+        pytest.skip("Cannot implement this config")
+
+    # Generate random inputs
+    a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
+    b = torch.randint(0, 256, (l, n, k // 2), dtype=torch.uint8, device=device)
+    a_sf = torch.randint(0, 256, (m * scale_k,), dtype=torch.uint8, device=device)
+    b_sf = torch.randint(0, 256, (l, n, scale_k), dtype=torch.uint8, device=device)
+    alpha = torch.ones(l, dtype=torch.float32, device=device)
+
+    tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32, device=device) % l
+    tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32, device=device)
+    permuted_idx_to_expanded_idx = torch.arange(m, dtype=torch.int32, device=device)
+    num_non_exiting_tiles = torch.tensor([num_tiles], dtype=torch.int32, device=device)
+    token_final_scales = torch.ones(num_tokens, top_k, dtype=torch.float32, device=device)
+
+    staging = torch.zeros(m, n, dtype=torch.bfloat16, device=device)
+    out_ar = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+    out_ref = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+
+    make_ptr = cutlass.cute.runtime.make_ptr
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    hardware_info = cutlass.utils.HardwareInfo()
+    max_active_clusters = hardware_info.get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
+    # Helper to make pointers
+    def ptrs():
+        return (
+            make_ptr(cutlass.Float4E2M1FN, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32),
+            make_ptr(cutlass.Float4E2M1FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32),
+            make_ptr(
+                cutlass.Float8E4M3FN, a_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Float8E4M3FN, b_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem),
+            make_ptr(cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem),
+            make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem),
+            make_ptr(
+                cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(), cute.AddressSpace.gmem
+            ),
+            make_ptr(cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem),
+            make_ptr(cutlass.Float32, token_final_scales.data_ptr(), cute.AddressSpace.gmem),
+        )
+
+    # Run base finalize-fusion kernel
+    base_kernel = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+    p = ptrs()
+    out_ref_ptr = make_ptr(
+        cutlass.BFloat16, out_ref.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    compiled_base = cute.compile(
+        base_kernel.wrapper,
+        p[0],
+        p[1],
+        p[2],
+        p[3],
+        out_ref_ptr,
+        p[4],
+        p[5],
+        p[6],
+        p[7],
+        p[8],
+        p[9],
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+    )
+    compiled_base(
+        p[0],
+        p[1],
+        p[2],
+        p[3],
+        out_ref_ptr,
+        p[4],
+        p[5],
+        p[6],
+        p[7],
+        p[8],
+        p[9],
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+
+    # Run AllReduce kernel (world_size=1)
+    ar_kernel = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+    staging_ptr = make_ptr(
+        cutlass.BFloat16, staging.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    out_ar_ptr = make_ptr(
+        cutlass.BFloat16, out_ar.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    compiled_ar = cute.compile(
+        ar_kernel.wrapper,
+        p[0],
+        p[1],
+        p[2],
+        p[3],
+        staging_ptr,
+        p[4],
+        p[5],
+        p[6],
+        p[7],
+        p[8],
+        p[9],
+        0,
+        0,
+        0,
+        0,  # mc pointers (unused for world_size=1)
+        out_ar_ptr,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        0,
+        1,  # rank=0, world_size=1
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+    )
+    compiled_ar(
+        p[0],
+        p[1],
+        p[2],
+        p[3],
+        staging_ptr,
+        p[4],
+        p[5],
+        p[6],
+        p[7],
+        p[8],
+        p[9],
+        0,
+        0,
+        0,
+        0,
+        out_ar_ptr,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        0,
+        1,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+
+    # Compare results
+    max_diff = (out_ar.float() - out_ref.float()).abs().max().item()
+    assert max_diff < 1e-2, f"AllReduce kernel (world_size=1) differs from base by {max_diff}"
