@@ -344,10 +344,6 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
-            # AR tile counter: tracks which tile the AR warps should process next
-            ar_tile_counter: cutlass.Int32
-            # AR total tiles: total number of tiles to process
-            ar_total_tiles: cutlass.Int32
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
                 self.buffer_align_bytes,
@@ -547,12 +543,6 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
         )
-
-        # Initialize AR tile counter in SMEM
-        if warp_idx == self.ar_warp_ids[0]:
-            with cute.arch.elect_one():
-                storage.ar_tile_counter = cutlass.Int32(0)
-                storage.ar_total_tiles = cutlass.Int32(0)
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -1314,15 +1304,6 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-
-            # Store total tile count for AR warps
-            if cutlass.const_expr(world_size > 1):
-                with cute.arch.elect_one():
-                    storage.ar_total_tiles = epi_tile_count
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
 
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
