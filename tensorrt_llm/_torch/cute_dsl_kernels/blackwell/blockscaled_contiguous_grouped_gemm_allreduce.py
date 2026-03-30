@@ -1396,7 +1396,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                         acc6, acc7 = bf16x2_to_f32x2(w3)
 
                         # Remaining ranks: load and accumulate
-                        for rank_i in cutlass.static_range(1, world_size):
+                        for rank_i in cutlass.range_constexpr(1, world_size):
                             rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
                             rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
                             f0, f1 = bf16x2_to_f32x2(rw0)
