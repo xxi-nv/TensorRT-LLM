@@ -835,10 +835,34 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
                     # Load A, B, SFA, SFB via TMA
-                    cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar, a_full_mcast_mask)
-                    cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar, b_full_mcast_mask)
-                    cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar, sfa_full_mcast_mask)
-                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar, sfb_full_mcast_mask)
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_k,
+                        tAsA_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=a_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_k,
+                        tBsB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=b_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfa,
+                        tAgSFA_k,
+                        tAsSFA_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=sfa_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        tBgSFB_k,
+                        tBsSFB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=sfb_full_mcast_mask,
+                    )
 
                     ab_pipeline.producer_commit(ab_producer_state)
                     ab_producer_state.advance()
