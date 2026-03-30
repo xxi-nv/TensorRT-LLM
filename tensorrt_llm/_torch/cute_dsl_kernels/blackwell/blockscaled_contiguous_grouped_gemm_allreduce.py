@@ -158,8 +158,11 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         staging_rank_stride: cutlass.Int64,
         out_rank_stride: cutlass.Int64,
         total_2d_tiles: cutlass.Int32,
+        n_tiles: cutlass.Int32,
+        staging_n: cutlass.Int32,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
+        ar_strategy: cutlass.Constexpr,
         out: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -185,8 +188,12 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             completion_barrier_mc_ptr: Base IPC VA for completion barrier flags
             staging_rank_stride: Byte stride between ranks in staging IPC buffer
             out_rank_stride: Byte stride between ranks in output IPC buffer
+            total_2d_tiles: Total number of 2D tiles (M-tiles * N-tiles)
+            n_tiles: Number of N-tiles (for 2D tile addressing)
+            staging_n: N dimension of staging buffer (for 2D addressing)
             rank: Current EP rank
             world_size: Number of EP ranks
+            ar_strategy: AllReduce strategy (0=batch, 1=overlapped)
             out: Final output tensor (for scatter-add after reduce)
             epilogue_op: Optional epilogue function
         """
@@ -413,8 +420,11 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             staging_rank_stride,
             out_rank_stride,
             total_2d_tiles,
+            n_tiles,
+            staging_n,
             rank,
             world_size,
+            ar_strategy,
             out,
             epilogue_op,
         ).launch(
@@ -467,8 +477,11 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         staging_rank_stride: cutlass.Int64,
         out_rank_stride: cutlass.Int64,
         total_2d_tiles: cutlass.Int32,
+        n_tiles: cutlass.Int32,
+        staging_n: cutlass.Int32,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
+        ar_strategy: cutlass.Constexpr,
         out: cute.Tensor,
         epilogue_op: cutlass.Constexpr,
     ):
@@ -1321,11 +1334,13 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
 
                 # Signal AR warps that this tile is ready
                 if cutlass.const_expr(world_size > 1):
-                    # After all epilogue subtiles are done for this tile,
-                    # signal the AR warps via multicast barrier
+                    # Use global 2D tile index for barrier addressing.
+                    # Each tile maps to a unique barrier slot regardless
+                    # of which CTA processes it.
+                    global_tile_idx = mma_tile_coord_mnl[0] * n_tiles + mma_tile_coord_mnl[1]
                     threadfence_system()
                     if epi_tidx == 0:
-                        barrier_arrive_mc(tile_barrier_mc_ptr + epi_tile_count * 4)
+                        barrier_arrive_mc(tile_barrier_mc_ptr + global_tile_idx * 4)
 
                 epi_tile_count = epi_tile_count + 1
 
@@ -1362,70 +1377,139 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 vec_width = cutlass.Int32(8)  # 8 bf16 = 128 bits
                 num_ar_threads = cutlass.Int32(128)  # 4 warps * 32 threads
 
-                # Phase 1: Wait for ALL tile barriers to indicate data is
-                # ready across all ranks. Each AR thread independently polls
-                # (redundant across threads/CTAs but avoids intra-CTA sync).
-                # No barrier_reset — avoids deadlock with multi-CTA grids
-                # where another CTA's AR warps may not have read the barrier
-                # before it is reset.
-                wait_idx = cutlass.Int32(0)
-                while wait_idx < total_2d_tiles:
-                    tile_barrier_addr = tile_barrier_mc_ptr + wait_idx * 4
-                    flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
-                    while flag_val < world_size:
+                if cutlass.const_expr(ar_strategy == 0):
+                    # --------------------------------------------------
+                    # Strategy 0 (batch): Wait ALL tiles, then linear
+                    # reduce the entire staging buffer at once.
+                    # Simple but no overlap with epilogue.
+                    # --------------------------------------------------
+                    wait_idx = cutlass.Int32(0)
+                    while wait_idx < total_2d_tiles:
+                        tile_barrier_addr = tile_barrier_mc_ptr + wait_idx * 4
                         flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
-                    wait_idx = wait_idx + 1
+                        while flag_val < world_size:
+                            flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
+                        wait_idx = wait_idx + 1
 
-                # Phase 2: Reduce staging buffer linearly across all m*n
-                # elements. The staging buffer is [m, n] row-major, so
-                # linear processing covers all tiles correctly regardless
-                # of 2D tile layout. Each AR thread processes a contiguous
-                # chunk of elements.
-                total_elements = total_2d_tiles * elements_per_tile
-                elems_per_thread = total_elements // num_ar_threads
+                    total_elements = total_2d_tiles * elements_per_tile
+                    elems_per_thread = total_elements // num_ar_threads
 
-                for i in cutlass.range(0, elems_per_thread, vec_width):
-                    elem_offset = ar_thread_idx * elems_per_thread + i
-                    byte_offset = elem_offset * 2  # bf16 = 2 bytes
+                    for i in cutlass.range(0, elems_per_thread, vec_width):
+                        elem_offset = ar_thread_idx * elems_per_thread + i
+                        byte_offset = elem_offset * 2  # bf16
 
-                    # Load rank 0 data and init f32 accumulators
-                    rank0_addr = staging_mc_ptr + byte_offset
-                    w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
-                    acc0, acc1 = bf16x2_to_f32x2(w0)
-                    acc2, acc3 = bf16x2_to_f32x2(w1)
-                    acc4, acc5 = bf16x2_to_f32x2(w2)
-                    acc6, acc7 = bf16x2_to_f32x2(w3)
+                        rank0_addr = staging_mc_ptr + byte_offset
+                        w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
+                        acc0, acc1 = bf16x2_to_f32x2(w0)
+                        acc2, acc3 = bf16x2_to_f32x2(w1)
+                        acc4, acc5 = bf16x2_to_f32x2(w2)
+                        acc6, acc7 = bf16x2_to_f32x2(w3)
 
-                    # Accumulate from remaining ranks via IPC loads
-                    for rank_i in cutlass.range_constexpr(1, world_size):
-                        rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
-                        rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
-                        f0, f1 = bf16x2_to_f32x2(rw0)
-                        f2, f3 = bf16x2_to_f32x2(rw1)
-                        f4, f5 = bf16x2_to_f32x2(rw2)
-                        f6, f7 = bf16x2_to_f32x2(rw3)
-                        acc0 = acc0 + f0
-                        acc1 = acc1 + f1
-                        acc2 = acc2 + f2
-                        acc3 = acc3 + f3
-                        acc4 = acc4 + f4
-                        acc5 = acc5 + f5
-                        acc6 = acc6 + f6
-                        acc7 = acc7 + f7
+                        for rank_i in cutlass.range_constexpr(1, world_size):
+                            rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
+                            rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
+                            f0, f1 = bf16x2_to_f32x2(rw0)
+                            f2, f3 = bf16x2_to_f32x2(rw1)
+                            f4, f5 = bf16x2_to_f32x2(rw2)
+                            f6, f7 = bf16x2_to_f32x2(rw3)
+                            acc0 = acc0 + f0
+                            acc1 = acc1 + f1
+                            acc2 = acc2 + f2
+                            acc3 = acc3 + f3
+                            acc4 = acc4 + f4
+                            acc5 = acc5 + f5
+                            acc6 = acc6 + f6
+                            acc7 = acc7 + f7
 
-                    # Pack f32 accumulators back to bf16 and store
-                    out_w0 = f32x2_to_bf16x2(acc0, acc1)
-                    out_w1 = f32x2_to_bf16x2(acc2, acc3)
-                    out_w2 = f32x2_to_bf16x2(acc4, acc5)
-                    out_w3 = f32x2_to_bf16x2(acc6, acc7)
+                        out_w0 = f32x2_to_bf16x2(acc0, acc1)
+                        out_w1 = f32x2_to_bf16x2(acc2, acc3)
+                        out_w2 = f32x2_to_bf16x2(acc4, acc5)
+                        out_w3 = f32x2_to_bf16x2(acc6, acc7)
 
-                    out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
-                    st_global_v4_b32(out_addr, out_w0, out_w1, out_w2, out_w3)
+                        out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
+                        st_global_v4_b32(out_addr, out_w0, out_w1, out_w2, out_w3)
 
-                # Signal completion (single barrier, not per-tile)
-                threadfence_system()
-                if ar_thread_idx == 0:
-                    barrier_arrive_mc(completion_barrier_mc_ptr)
+                    threadfence_system()
+                    if ar_thread_idx == 0:
+                        barrier_arrive_mc(completion_barrier_mc_ptr)
+
+                elif cutlass.const_expr(ar_strategy == 1):
+                    # --------------------------------------------------
+                    # Strategy 1 (overlapped): Wait per-tile barrier,
+                    # then reduce that tile using 2D addressing.
+                    # Overlaps reduce of tile N with epilogue of tile N+1.
+                    # All CTAs' AR warps process all tiles (redundant but
+                    # correct — all produce identical results).
+                    # --------------------------------------------------
+                    elems_per_thread_tile = elements_per_tile // num_ar_threads
+
+                    tile_idx = cutlass.Int32(0)
+                    while tile_idx < total_2d_tiles:
+                        # Wait for this specific tile
+                        tile_barrier_addr = tile_barrier_mc_ptr + tile_idx * 4
+                        flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
+                        while flag_val < world_size:
+                            flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
+
+                        # 2D tile coordinates from linear tile index
+                        m_tile_idx = tile_idx // n_tiles
+                        n_tile_idx = tile_idx - m_tile_idx * n_tiles
+                        tile_row_start = m_tile_idx * cta_tile_m
+                        tile_col_start = n_tile_idx * cta_tile_n
+
+                        for i in cutlass.range(0, elems_per_thread_tile, vec_width):
+                            flat_idx = ar_thread_idx * elems_per_thread_tile + i
+                            row_in_tile = flat_idx // cta_tile_n
+                            col_in_tile = flat_idx - row_in_tile * cta_tile_n
+                            row = tile_row_start + row_in_tile
+                            col = tile_col_start + col_in_tile
+                            # Byte offset in row-major [m, n] bf16 buffer
+                            byte_offset = (row * staging_n + col) * 2
+
+                            rank0_addr = staging_mc_ptr + byte_offset
+                            w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
+                            acc0, acc1 = bf16x2_to_f32x2(w0)
+                            acc2, acc3 = bf16x2_to_f32x2(w1)
+                            acc4, acc5 = bf16x2_to_f32x2(w2)
+                            acc6, acc7 = bf16x2_to_f32x2(w3)
+
+                            for rank_i in cutlass.range_constexpr(1, world_size):
+                                rank_addr = (
+                                    staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
+                                )
+                                rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
+                                f0, f1 = bf16x2_to_f32x2(rw0)
+                                f2, f3 = bf16x2_to_f32x2(rw1)
+                                f4, f5 = bf16x2_to_f32x2(rw2)
+                                f6, f7 = bf16x2_to_f32x2(rw3)
+                                acc0 = acc0 + f0
+                                acc1 = acc1 + f1
+                                acc2 = acc2 + f2
+                                acc3 = acc3 + f3
+                                acc4 = acc4 + f4
+                                acc5 = acc5 + f5
+                                acc6 = acc6 + f6
+                                acc7 = acc7 + f7
+
+                            out_w0 = f32x2_to_bf16x2(acc0, acc1)
+                            out_w1 = f32x2_to_bf16x2(acc2, acc3)
+                            out_w2 = f32x2_to_bf16x2(acc4, acc5)
+                            out_w3 = f32x2_to_bf16x2(acc6, acc7)
+
+                            out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
+                            st_global_v4_b32(
+                                out_addr,
+                                out_w0,
+                                out_w1,
+                                out_w2,
+                                out_w3,
+                            )
+
+                        tile_idx = tile_idx + 1
+
+                    threadfence_system()
+                    if ar_thread_idx == 0:
+                        barrier_arrive_mc(completion_barrier_mc_ptr)
             # else: world_size == 1, AR warps do nothing
 
         griddepcontrol_launch_dependents()
@@ -1460,6 +1544,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         top_k: cutlass.Int64,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
+        ar_strategy: cutlass.Constexpr,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -1472,7 +1557,10 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         # Use self.mma_tiler[1] (set in __init__) because cta_tile_shape_mnk
         # is only available after _setup_attributes() runs inside __call__().
         cta_n = cutlass.Int64(self.mma_tiler[1])
-        total_2d_tiles = cutlass.Int32(num_tiles * ((n + cta_n - 1) // cta_n))
+        n_tiles_i64 = (n + cta_n - 1) // cta_n
+        total_2d_tiles = cutlass.Int32(num_tiles * n_tiles_i64)
+        n_tiles = cutlass.Int32(n_tiles_i64)
+        staging_n = cutlass.Int32(n)
 
         a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
@@ -1535,8 +1623,11 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             staging_rank_stride=staging_rank_stride,
             out_rank_stride=out_rank_stride,
             total_2d_tiles=total_2d_tiles,
+            n_tiles=n_tiles,
+            staging_n=staging_n,
             rank=rank,
             world_size=world_size,
+            ar_strategy=ar_strategy,
             out=out,
             epilogue_op=epilogue_op,
         )

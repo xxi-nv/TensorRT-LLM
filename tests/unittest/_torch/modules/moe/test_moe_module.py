@@ -1683,6 +1683,7 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
         top_k,
         0,
         1,  # rank=0, world_size=1
+        0,  # ar_strategy=0 (unused for world_size=1)
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         max_active_clusters=max_active_clusters,
@@ -1737,13 +1738,15 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
     reason="Requires SM100/SM103 (Blackwell)",
 )
 @pytest.mark.parametrize(
-    "m,n,k,l,top_k,world_size",
+    "m,n,k,l,top_k,world_size,ar_strategy",
     [
-        (256, 2048, 2048, 8, 2, 2),
-        (512, 2048, 2048, 8, 2, 4),
+        (256, 2048, 2048, 8, 2, 2, 0),
+        (256, 2048, 2048, 8, 2, 2, 1),
+        (512, 2048, 2048, 8, 2, 4, 0),
+        (512, 2048, 2048, 8, 2, 4, 1),
     ],
 )
-def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E741
+def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):  # noqa: E741
     """Test 11-warp kernel IPC AllReduce correctness (simulated multi-GPU).
 
     Simulates multi-GPU IPC reduce by allocating separate staging buffers for
@@ -2127,6 +2130,7 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E74
         top_k,
         rank_val,
         world_size,
+        ar_strategy,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         max_active_clusters=max_active_clusters,

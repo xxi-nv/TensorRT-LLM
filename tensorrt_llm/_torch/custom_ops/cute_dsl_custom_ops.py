@@ -1530,6 +1530,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      output_dtype: torch.dtype,
                      rank: int,
                      world_size: int,
+                     ar_strategy: int = 0,
                      scaling_vector_size: int = 16):
             super().__init__()
             self.num_experts = num_experts
@@ -1539,6 +1540,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.rank = rank
             self.world_size = world_size
+            self.ar_strategy = ar_strategy
 
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
@@ -1564,6 +1566,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.rank,
                 self.world_size,
+                self.ar_strategy,
                 self.scaling_vector_size,
             )
 
@@ -1719,7 +1722,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raster_along_m = False
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m, self.world_size)
+                         cluster_shape_mn, raster_along_m, self.world_size,
+                         self.ar_strategy)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                     sf_vec_size=self.scaling_vector_size,
@@ -1760,6 +1764,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.top_k,
                     self.rank,
                     self.world_size,
+                    self.ar_strategy,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
@@ -1796,6 +1801,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.top_k,
                 self.rank,
                 self.world_size,
+                self.ar_strategy,
                 stream=stream,
             )
             return out
@@ -1831,12 +1837,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         rank: int,
         world_size: int,
         output_dtype: torch.dtype,
+        ar_strategy: int = 0,
         scaling_vector_size: int = 16,
     ) -> None:
         tuner = AutoTuner.get()
         runner = Sm100BlockScaledContiguousGroupedGemmAllReduceRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, rank, world_size, scaling_vector_size)
+            tile_size, output_dtype, rank, world_size, ar_strategy,
+            scaling_vector_size)
 
         inputs = [
             input,
