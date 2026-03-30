@@ -53,7 +53,6 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 )
 from .multimem_helpers import (
     barrier_arrive_mc,
-    barrier_reset,
     barrier_try_wait_eq,
     bf16x2_to_f32x2,
     f32x2_to_bf16x2,
@@ -158,6 +157,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         completion_barrier_mc_ptr: cutlass.Int64,
         staging_rank_stride: cutlass.Int64,
         out_rank_stride: cutlass.Int64,
+        total_2d_tiles: cutlass.Int32,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         out: cute.Tensor,
@@ -412,6 +412,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             completion_barrier_mc_ptr,
             staging_rank_stride,
             out_rank_stride,
+            total_2d_tiles,
             rank,
             world_size,
             out,
@@ -465,6 +466,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         completion_barrier_mc_ptr: cutlass.Int64,
         staging_rank_stride: cutlass.Int64,
         out_rank_stride: cutlass.Int64,
+        total_2d_tiles: cutlass.Int32,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         out: cute.Tensor,
@@ -1357,82 +1359,73 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 elements_per_tile = cta_tile_m * cta_tile_n
 
                 # Each 128-bit load covers 4 b32 words = 8 bf16 elements.
-                # vec_width is in units of bf16 elements per vector load.
                 vec_width = cutlass.Int32(8)  # 8 bf16 = 128 bits
+                num_ar_threads = cutlass.Int32(128)  # 4 warps * 32 threads
 
-                # Total 2D tiles = M-tiles * N-tiles-per-M-tile.
-                # num_non_exiting_tiles[0] counts M-tiles only.
-                n_dim = cutlass.Int32(cute.size(staging.shape[1]))
-                n_tiles_per_m = (n_dim + cta_tile_n - cutlass.Int32(1)) // cta_tile_n
-                total_tiles = num_non_exiting_tiles[0] * n_tiles_per_m
-
-                # Spin-wait for tiles and process
-                ar_tile_idx = cutlass.Int32(0)
-
-                while ar_tile_idx < total_tiles:
-                    # Wait for this tile's barrier to reach world_size
-                    # (all ranks have written their epilogue for this tile)
-                    tile_barrier_addr = tile_barrier_mc_ptr + ar_tile_idx * 4
+                # Phase 1: Wait for ALL tile barriers to indicate data is
+                # ready across all ranks. Each AR thread independently polls
+                # (redundant across threads/CTAs but avoids intra-CTA sync).
+                # No barrier_reset — avoids deadlock with multi-CTA grids
+                # where another CTA's AR warps may not have read the barrier
+                # before it is reset.
+                wait_idx = cutlass.Int32(0)
+                while wait_idx < total_2d_tiles:
+                    tile_barrier_addr = tile_barrier_mc_ptr + wait_idx * 4
                     flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
                     while flag_val < world_size:
                         flag_val = barrier_try_wait_eq(tile_barrier_addr, world_size)
+                    wait_idx = wait_idx + 1
 
-                    # Reset barrier for next use
-                    if ar_thread_idx == 0:
-                        barrier_reset(tile_barrier_addr)
+                # Phase 2: Reduce staging buffer linearly across all m*n
+                # elements. The staging buffer is [m, n] row-major, so
+                # linear processing covers all tiles correctly regardless
+                # of 2D tile layout. Each AR thread processes a contiguous
+                # chunk of elements.
+                total_elements = total_2d_tiles * elements_per_tile
+                elems_per_thread = total_elements // num_ar_threads
 
-                    # IPC reduce: load bf16 from each rank's staging via IPC,
-                    # accumulate in f32, convert back to bf16 and store to output.
-                    tile_start_elem = ar_tile_idx * elements_per_tile
-                    elems_per_thread = elements_per_tile // 128  # 128 AR threads
+                for i in cutlass.range(0, elems_per_thread, vec_width):
+                    elem_offset = ar_thread_idx * elems_per_thread + i
+                    byte_offset = elem_offset * 2  # bf16 = 2 bytes
 
-                    for i in cutlass.range(0, elems_per_thread, vec_width):
-                        elem_offset = tile_start_elem + ar_thread_idx * elems_per_thread + i
-                        byte_offset = elem_offset * 2  # bf16 = 2 bytes
+                    # Load rank 0 data and init f32 accumulators
+                    rank0_addr = staging_mc_ptr + byte_offset
+                    w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
+                    acc0, acc1 = bf16x2_to_f32x2(w0)
+                    acc2, acc3 = bf16x2_to_f32x2(w1)
+                    acc4, acc5 = bf16x2_to_f32x2(w2)
+                    acc6, acc7 = bf16x2_to_f32x2(w3)
 
-                        # Accumulate across all ranks via IPC loads
-                        # First rank: load directly to init accumulators
-                        rank0_addr = staging_mc_ptr + byte_offset
-                        w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
-                        # Unpack 4 b32 words → 8 f32 accumulators
-                        acc0, acc1 = bf16x2_to_f32x2(w0)
-                        acc2, acc3 = bf16x2_to_f32x2(w1)
-                        acc4, acc5 = bf16x2_to_f32x2(w2)
-                        acc6, acc7 = bf16x2_to_f32x2(w3)
+                    # Accumulate from remaining ranks via IPC loads
+                    for rank_i in cutlass.range_constexpr(1, world_size):
+                        rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
+                        rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
+                        f0, f1 = bf16x2_to_f32x2(rw0)
+                        f2, f3 = bf16x2_to_f32x2(rw1)
+                        f4, f5 = bf16x2_to_f32x2(rw2)
+                        f6, f7 = bf16x2_to_f32x2(rw3)
+                        acc0 = acc0 + f0
+                        acc1 = acc1 + f1
+                        acc2 = acc2 + f2
+                        acc3 = acc3 + f3
+                        acc4 = acc4 + f4
+                        acc5 = acc5 + f5
+                        acc6 = acc6 + f6
+                        acc7 = acc7 + f7
 
-                        # Remaining ranks: load and accumulate
-                        for rank_i in cutlass.range_constexpr(1, world_size):
-                            rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
-                            rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
-                            f0, f1 = bf16x2_to_f32x2(rw0)
-                            f2, f3 = bf16x2_to_f32x2(rw1)
-                            f4, f5 = bf16x2_to_f32x2(rw2)
-                            f6, f7 = bf16x2_to_f32x2(rw3)
-                            acc0 = acc0 + f0
-                            acc1 = acc1 + f1
-                            acc2 = acc2 + f2
-                            acc3 = acc3 + f3
-                            acc4 = acc4 + f4
-                            acc5 = acc5 + f5
-                            acc6 = acc6 + f6
-                            acc7 = acc7 + f7
+                    # Pack f32 accumulators back to bf16 and store
+                    out_w0 = f32x2_to_bf16x2(acc0, acc1)
+                    out_w1 = f32x2_to_bf16x2(acc2, acc3)
+                    out_w2 = f32x2_to_bf16x2(acc4, acc5)
+                    out_w3 = f32x2_to_bf16x2(acc6, acc7)
 
-                        # Pack f32 accumulators back to bf16 b32 words
-                        out_w0 = f32x2_to_bf16x2(acc0, acc1)
-                        out_w1 = f32x2_to_bf16x2(acc2, acc3)
-                        out_w2 = f32x2_to_bf16x2(acc4, acc5)
-                        out_w3 = f32x2_to_bf16x2(acc6, acc7)
+                    out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
+                    st_global_v4_b32(out_addr, out_w0, out_w1, out_w2, out_w3)
 
-                        # Store to own rank's output buffer via IPC
-                        out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
-                        st_global_v4_b32(out_addr, out_w0, out_w1, out_w2, out_w3)
-
-                    # Signal completion for this tile
-                    threadfence_system()
-                    if ar_thread_idx == 0:
-                        barrier_arrive_mc(completion_barrier_mc_ptr + ar_tile_idx * 4)
-
-                    ar_tile_idx = ar_tile_idx + 1
+                # Signal completion (single barrier, not per-tile)
+                threadfence_system()
+                if ar_thread_idx == 0:
+                    barrier_arrive_mc(completion_barrier_mc_ptr)
             # else: world_size == 1, AR warps do nothing
 
         griddepcontrol_launch_dependents()
@@ -1475,6 +1468,9 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
     ):
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
+        # Total 2D tiles for AR warps: M-tiles * N-tiles
+        cta_n = cutlass.Int64(self.cta_tile_shape_mnk[1])
+        total_2d_tiles = cutlass.Int32(num_tiles * ((n + cta_n - 1) // cta_n))
 
         a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
@@ -1536,6 +1532,7 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             completion_barrier_mc_ptr=completion_barrier_mc_ptr,
             staging_rank_stride=staging_rank_stride,
             out_rank_stride=out_rank_stride,
+            total_2d_tiles=total_2d_tiles,
             rank=rank,
             world_size=world_size,
             out=out,
