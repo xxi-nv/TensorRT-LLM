@@ -798,6 +798,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             dtype=torch.int64,
             device=x.device)
 
+        # Rank stride tensors for IPC addressing across ranks
+        staging_rank_stride = torch.tensor([self._ep_nvls_staging.rank_stride],
+                                           dtype=torch.int64,
+                                           device=x.device)
+        out_rank_stride = torch.tensor([self._ep_nvls_output.rank_stride],
+                                       dtype=torch.int64,
+                                       device=x.device)
+
         # Get staging/output as torch tensors for the custom op
         permuted_m = total_num_padded_tokens.item() if isinstance(
             total_num_padded_tokens, torch.Tensor) else total_num_padded_tokens
@@ -809,6 +817,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         moe_output.zero_()
 
         # FC2 + AllReduce: fused 11-warp kernel
+        # When world_size > 1, the AR warps reduce across ranks via IPC and
+        # write reduced results to the NVLS output buffer in permuted order.
+        # When world_size == 1, AR warps no-op and epilogue scatter-adds
+        # directly to moe_output.
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
@@ -826,6 +838,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             out_mc_ptr=out_mc_ptr,
             tile_barrier_mc_ptr=tile_barrier_mc_ptr,
             completion_barrier_mc_ptr=completion_barrier_mc_ptr,
+            staging_rank_stride=staging_rank_stride,
+            out_rank_stride=out_rank_stride,
             num_experts=self.num_slots,
             top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
@@ -835,6 +849,27 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             world_size=ep_size,
             output_dtype=output_dtype,
         )
+
+        # Post-AR scatter: when world_size > 1, the AR warps wrote reduced
+        # results to the NVLS output buffer in permuted order. Scatter-add
+        # them to moe_output at the correct token positions.
+        if ep_size > 1:
+            nvls_out_flat = self._ep_nvls_output_tensor[ep_rank, :permuted_m *
+                                                        n]
+            nvls_out = nvls_out_flat.view(permuted_m, n)
+
+            # permuted_idx_to_expanded_idx maps permuted_row → expanded_idx
+            # expanded_idx = token_idx * effective_top_k + topk_slot
+            expanded_idx = permuted_idx_to_expanded_idx[:permuted_m]
+            token_idx = expanded_idx // effective_top_k
+
+            # Scatter-add: handles duplicate token indices (multiple
+            # top_k slots mapping to the same token) correctly.
+            moe_output.index_add_(0, token_idx, nvls_out[:permuted_m])
+
+        # Signal that the fused ReduceScatter is done, so ConfigurableMoE
+        # can skip calling comm.combine().
+        self._v4_rs_done = True
 
         return moe_output
 
@@ -917,6 +952,25 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         return x
 
+    def _should_use_v4_ep(self) -> bool:
+        """Check if V4 EP (fused FC2 + AllReduce) should be used.
+
+        Requires:
+        - EP size > 1 (multi-rank expert parallelism)
+        - MNNVL IPC memory support (NVLink connectivity)
+        - Blackwell SM (SM 100/103)
+        """
+        if not hasattr(self, 'mapping') or self.mapping.moe_ep_size <= 1:
+            return False
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            return False
+        try:
+            from ..._mnnvl_utils import MnnvlMemory
+            return MnnvlMemory.supports_mnnvl()
+        except Exception:
+            return False
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -946,6 +1000,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             final_hidden_states tensor.
         """
         if self.has_nvfp4:
+            # V4 EP: fused FC2 + AllReduce when EP > 1 and MNNVL is available
+            if self._should_use_v4_ep():
+                return self.run_moe_nvfp4_v4_ep(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    moe_output=moe_output)
             return self.run_moe_nvfp4(
                 x=x,
                 token_selected_experts=token_selected_experts,

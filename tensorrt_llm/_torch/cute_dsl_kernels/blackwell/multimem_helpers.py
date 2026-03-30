@@ -239,6 +239,104 @@ def barrier_reset(flag_addr, *, loc=None, ip=None):
 
 
 # ---------------------------------------------------------------------------
+# ld.global.v4.b32  loads 4×b32 = 128 bits (as raw bit patterns)
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def ld_global_v4_b32(addr, *, loc=None, ip=None):
+    """Load 4×b32 (128 bits) from global memory as Int32 values.
+
+    Used in the IPC unicast path to load bf16 data from each rank's buffer.
+    Returns raw b32 values (each containing 2 packed bf16 values).
+
+    Args:
+        addr: Global memory pointer.
+
+    Returns:
+        Tuple of 4 Int32 values (each holding 2 packed bf16).
+    """
+    results = llvm.inline_asm(
+        T.struct([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [addr.ir_value()],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = cutlass.Int32(llvm.extractvalue(T.i32(), results, [0]))
+    v1 = cutlass.Int32(llvm.extractvalue(T.i32(), results, [1]))
+    v2 = cutlass.Int32(llvm.extractvalue(T.i32(), results, [2]))
+    v3 = cutlass.Int32(llvm.extractvalue(T.i32(), results, [3]))
+    return v0, v1, v2, v3
+
+
+# ---------------------------------------------------------------------------
+# BF16 unpack/pack and conversion helpers for IPC reduce path
+#
+# Each b32 word holds 2 packed bf16 values. For cross-rank accumulation
+# we unpack to f32, sum, and re-pack to bf16.
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def bf16x2_to_f32x2(packed_b32, *, loc=None, ip=None):
+    """Unpack one b32 word containing 2 bf16 into 2 f32 values.
+
+    Uses mov.b32 to split the packed value, then cvt.f32.bf16 for each half.
+
+    Args:
+        packed_b32: Int32 holding 2 packed bf16 values.
+
+    Returns:
+        Tuple (f32_lo, f32_hi) — the two bf16 values converted to f32.
+    """
+    results = llvm.inline_asm(
+        T.struct([T.f32(), T.f32()]),
+        [packed_b32.ir_value()],
+        "{.reg .b16 %lo, %hi;mov.b32 {%lo, %hi}, $2;cvt.f32.bf16 $0, %lo;cvt.f32.bf16 $1, %hi;}",
+        "=f,=f,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    lo = cutlass.Float32(llvm.extractvalue(T.f32(), results, [0]))
+    hi = cutlass.Float32(llvm.extractvalue(T.f32(), results, [1]))
+    return lo, hi
+
+
+@dsl_user_op
+def f32x2_to_bf16x2(f32_lo, f32_hi, *, loc=None, ip=None):
+    """Pack 2 f32 values into one b32 word as 2 bf16 (with rounding).
+
+    Uses cvt.rn.bf16.f32 + mov.b32 to pack.
+
+    Args:
+        f32_lo: Float32 — lower bf16 slot.
+        f32_hi: Float32 — upper bf16 slot.
+
+    Returns:
+        Int32 holding 2 packed bf16.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [f32_lo.ir_value(), f32_hi.ir_value()],
+        "{"
+        ".reg .b16 %lo, %hi;"
+        "cvt.rn.bf16.f32 %lo, $1;"
+        "cvt.rn.bf16.f32 %hi, $2;"
+        "mov.b32 $0, {%lo, %hi};"
+        "}",
+        "=r,f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+# ---------------------------------------------------------------------------
 # Threadfence for cross-rank visibility
 # ---------------------------------------------------------------------------
 

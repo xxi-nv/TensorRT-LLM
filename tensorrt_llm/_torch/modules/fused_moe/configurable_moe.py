@@ -783,7 +783,12 @@ class ConfigurableMoE(MoE):
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
         # ========== Step 9: Communication - Combine ==========
-        if self.comm is not None:
+        # Skip combine when V4 EP fused ReduceScatter was used — the kernel
+        # already reduced across ranks and scattered to the output.
+        v4_rs_done = getattr(self.backend, "_v4_rs_done", False)
+        if v4_rs_done:
+            self.backend._v4_rs_done = False
+        elif self.comm is not None:
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
             # Use unified combine interface (reads dispatch state from strategy)

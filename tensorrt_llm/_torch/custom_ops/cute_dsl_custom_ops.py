@@ -1645,7 +1645,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
              tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
              num_non_exiting_tiles, token_final_scales, staging_mc_ptr_tensor,
              out_mc_ptr_tensor, tile_barrier_mc_ptr_tensor,
-             completion_barrier_mc_ptr_tensor, out) = inputs
+             completion_barrier_mc_ptr_tensor, staging_rank_stride_tensor,
+             out_rank_stride_tensor, out) = inputs
 
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
@@ -1657,11 +1658,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             k // self.scaling_vector_size
             num_tokens = out.size(0)
 
-            # Extract raw pointers from 1-element int64 tensors
+            # Extract raw pointers and strides from 1-element int64 tensors
             staging_mc_ptr = staging_mc_ptr_tensor.item()
             out_mc_ptr = out_mc_ptr_tensor.item()
             tile_barrier_mc_ptr = tile_barrier_mc_ptr_tensor.item()
             completion_barrier_mc_ptr = completion_barrier_mc_ptr_tensor.item()
+            staging_rank_stride = staging_rank_stride_tensor.item()
+            out_rank_stride = out_rank_stride_tensor.item()
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1746,6 +1749,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     out_mc_ptr,
                     tile_barrier_mc_ptr,
                     completion_barrier_mc_ptr,
+                    staging_rank_stride,
+                    out_rank_stride,
                     out_ptr,
                     m,
                     n,
@@ -1780,6 +1785,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 out_mc_ptr,
                 tile_barrier_mc_ptr,
                 completion_barrier_mc_ptr,
+                staging_rank_stride,
+                out_rank_stride,
                 out_ptr,
                 m,
                 n,
@@ -1814,6 +1821,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         out_mc_ptr: torch.Tensor,
         tile_barrier_mc_ptr: torch.Tensor,
         completion_barrier_mc_ptr: torch.Tensor,
+        staging_rank_stride: torch.Tensor,
+        out_rank_stride: torch.Tensor,
         num_experts: int,
         top_k: int,
         num_local_experts: int,
@@ -1845,6 +1854,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             out_mc_ptr,
             tile_barrier_mc_ptr,
             completion_barrier_mc_ptr,
+            staging_rank_stride,
+            out_rank_stride,
             out,
         ]
 

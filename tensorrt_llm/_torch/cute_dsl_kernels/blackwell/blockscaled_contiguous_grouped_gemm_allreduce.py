@@ -55,8 +55,10 @@ from .multimem_helpers import (
     barrier_arrive_mc,
     barrier_reset,
     barrier_try_wait_eq,
-    multimem_ld_reduce_add_v4_f32,
-    multimem_st_v4_f32,
+    bf16x2_to_f32x2,
+    f32x2_to_bf16x2,
+    ld_global_v4_b32,
+    st_global_v4_b32,
     threadfence_system,
 )
 from .utils import (
@@ -154,6 +156,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         out_mc_ptr: cutlass.Int64,
         tile_barrier_mc_ptr: cutlass.Int64,
         completion_barrier_mc_ptr: cutlass.Int64,
+        staging_rank_stride: cutlass.Int64,
+        out_rank_stride: cutlass.Int64,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         out: cute.Tensor,
@@ -175,10 +179,12 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             stream: CUDA stream
             permuted_idx_to_expanded_idx: Permuted to expanded index mapping
             token_final_scales: Router scales [num_tokens, top_k]
-            staging_mc_ptr: Multicast ptr for staging buffer (for multimem ops)
-            out_mc_ptr: Multicast ptr for reduced output
-            tile_barrier_mc_ptr: Multicast ptr for tile barrier flags
-            completion_barrier_mc_ptr: Multicast ptr for completion barrier flags
+            staging_mc_ptr: Base IPC VA for staging buffer (rank 0's offset)
+            out_mc_ptr: Base IPC VA for reduced output
+            tile_barrier_mc_ptr: Base IPC VA for tile barrier flags
+            completion_barrier_mc_ptr: Base IPC VA for completion barrier flags
+            staging_rank_stride: Byte stride between ranks in staging IPC buffer
+            out_rank_stride: Byte stride between ranks in output IPC buffer
             rank: Current EP rank
             world_size: Number of EP ranks
             out: Final output tensor (for scatter-add after reduce)
@@ -404,6 +410,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             out_mc_ptr,
             tile_barrier_mc_ptr,
             completion_barrier_mc_ptr,
+            staging_rank_stride,
+            out_rank_stride,
             rank,
             world_size,
             out,
@@ -455,6 +463,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         out_mc_ptr: cutlass.Int64,
         tile_barrier_mc_ptr: cutlass.Int64,
         completion_barrier_mc_ptr: cutlass.Int64,
+        staging_rank_stride: cutlass.Int64,
+        out_rank_stride: cutlass.Int64,
         rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         out: cute.Tensor,
@@ -1341,14 +1351,14 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 # AR thread index across 4 warps: 0-127
                 ar_thread_idx = (warp_idx - 7) * 32 + (tidx % 32)
 
-                # Elements per tile: cta_tile_m * cta_tile_n
+                # Elements per tile: cta_tile_m * cta_tile_n (bf16 elements)
                 cta_tile_m = cutlass.Int32(self.cta_tile_shape_mnk[0])
                 cta_tile_n = cutlass.Int32(self.cta_tile_shape_mnk[1])
                 elements_per_tile = cta_tile_m * cta_tile_n
 
-                # Each AR thread processes elements_per_tile / 128 elements
-                # in strides of 4 floats (128 bits) per iteration
-                vec_width = cutlass.Int32(4)  # 4 x f32 = 128 bits
+                # Each 128-bit load covers 4 b32 words = 8 bf16 elements.
+                # vec_width is in units of bf16 elements per vector load.
+                vec_width = cutlass.Int32(8)  # 8 bf16 = 128 bits
 
                 # Spin-wait for tiles and process
                 ar_tile_idx = cutlass.Int32(0)
@@ -1366,7 +1376,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                     if ar_thread_idx == 0:
                         barrier_reset(tile_barrier_addr)
 
-                    # Reduce this tile's data across ranks
+                    # IPC reduce: load bf16 from each rank's staging via IPC,
+                    # accumulate in f32, convert back to bf16 and store to output.
                     tile_start_elem = ar_tile_idx * elements_per_tile
                     elems_per_thread = elements_per_tile // 128  # 128 AR threads
 
@@ -1374,13 +1385,42 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                         elem_offset = tile_start_elem + ar_thread_idx * elems_per_thread + i
                         byte_offset = elem_offset * 2  # bf16 = 2 bytes
 
-                        # Multicast reduce-load from staging
-                        mc_addr = staging_mc_ptr + byte_offset
-                        v0, v1, v2, v3 = multimem_ld_reduce_add_v4_f32(mc_addr)
+                        # Accumulate across all ranks via IPC loads
+                        # First rank: load directly to init accumulators
+                        rank0_addr = staging_mc_ptr + byte_offset
+                        w0, w1, w2, w3 = ld_global_v4_b32(rank0_addr)
+                        # Unpack 4 b32 words → 8 f32 accumulators
+                        acc0, acc1 = bf16x2_to_f32x2(w0)
+                        acc2, acc3 = bf16x2_to_f32x2(w1)
+                        acc4, acc5 = bf16x2_to_f32x2(w2)
+                        acc6, acc7 = bf16x2_to_f32x2(w3)
 
-                        # Multicast store to output
-                        out_addr = out_mc_ptr + byte_offset
-                        multimem_st_v4_f32(out_addr, v0, v1, v2, v3)
+                        # Remaining ranks: load and accumulate
+                        for rank_i in cutlass.static_range(1, world_size):
+                            rank_addr = staging_mc_ptr + rank_i * staging_rank_stride + byte_offset
+                            rw0, rw1, rw2, rw3 = ld_global_v4_b32(rank_addr)
+                            f0, f1 = bf16x2_to_f32x2(rw0)
+                            f2, f3 = bf16x2_to_f32x2(rw1)
+                            f4, f5 = bf16x2_to_f32x2(rw2)
+                            f6, f7 = bf16x2_to_f32x2(rw3)
+                            acc0 = acc0 + f0
+                            acc1 = acc1 + f1
+                            acc2 = acc2 + f2
+                            acc3 = acc3 + f3
+                            acc4 = acc4 + f4
+                            acc5 = acc5 + f5
+                            acc6 = acc6 + f6
+                            acc7 = acc7 + f7
+
+                        # Pack f32 accumulators back to bf16 b32 words
+                        out_w0 = f32x2_to_bf16x2(acc0, acc1)
+                        out_w1 = f32x2_to_bf16x2(acc2, acc3)
+                        out_w2 = f32x2_to_bf16x2(acc4, acc5)
+                        out_w3 = f32x2_to_bf16x2(acc6, acc7)
+
+                        # Store to own rank's output buffer via IPC
+                        out_addr = out_mc_ptr + rank * out_rank_stride + byte_offset
+                        st_global_v4_b32(out_addr, out_w0, out_w1, out_w2, out_w3)
 
                     # Signal completion for this tile
                     threadfence_system()
@@ -1411,6 +1451,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         out_mc_ptr: cutlass.Int64,
         tile_barrier_mc_ptr: cutlass.Int64,
         completion_barrier_mc_ptr: cutlass.Int64,
+        staging_rank_stride: cutlass.Int64,
+        out_rank_stride: cutlass.Int64,
         out_ptr: cute.Pointer,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -1487,6 +1529,8 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             out_mc_ptr=out_mc_ptr,
             tile_barrier_mc_ptr=tile_barrier_mc_ptr,
             completion_barrier_mc_ptr=completion_barrier_mc_ptr,
+            staging_rank_stride=staging_rank_stride,
+            out_rank_stride=out_rank_stride,
             rank=rank,
             world_size=world_size,
             out=out,

@@ -1672,6 +1672,8 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
         0,
         0,
         0,  # mc pointers (unused for world_size=1)
+        0,
+        0,  # rank strides (unused for world_size=1)
         out_ar_ptr,
         m,
         n,
@@ -1702,6 +1704,8 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
         0,
         0,
         0,
+        0,
+        0,  # rank strides (unused for world_size=1)
         out_ar_ptr,
         m,
         n,
@@ -1724,4 +1728,458 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
     finite_ref = out_ref[out_ref.isfinite()]
     assert finite_ref.numel() > 0 and finite_ref.abs().max().item() > 0, (
         "Base kernel output has no finite non-zero values"
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuteDSL not available")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
+    reason="Requires SM100/SM103 (Blackwell)",
+)
+@pytest.mark.parametrize(
+    "m,n,k,l,top_k,world_size",
+    [
+        (256, 2048, 2048, 8, 2, 2),
+        (512, 2048, 2048, 8, 2, 4),
+    ],
+)
+def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E741
+    """Test 11-warp kernel IPC AllReduce correctness (simulated multi-GPU).
+
+    Simulates multi-GPU IPC reduce by allocating separate staging buffers for
+    each rank on a single GPU, running the kernel with world_size > 1, and
+    comparing against a manual summation of all ranks' staging buffers.
+
+    This test validates the IPC reduce datapath without requiring actual
+    multi-GPU setup. Run with: pytest -k test_allreduce_kernel_multi_gpu
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    sf_vec_size = 16
+    tile_size = 128
+    mma_tiler_mn = (128, 128)
+    cluster_shape_mn = (1, 1)
+    scale_k = k // sf_vec_size
+    num_tokens = m // top_k
+    num_tiles = m // tile_size
+
+    if not Sm100BlockScaledContiguousGroupedGemmAllReduceKernel.can_implement(
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=sf_vec_size,
+        out_dtype=cutlass.BFloat16,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        out_major="n",
+    ):
+        pytest.skip("Cannot implement this config")
+
+    # Allocate staging buffers: one per simulated rank, laid out contiguously
+    # to mimic IPC VA mapping where rank i's buffer = base + i * rank_stride
+    staging_rank_stride = m * n * 2  # bytes (bf16 = 2 bytes per element)
+    out_rank_stride = staging_rank_stride
+    staging_all = torch.zeros(world_size * m * n, dtype=torch.bfloat16, device=device)
+    output_all = torch.zeros(world_size * m * n, dtype=torch.bfloat16, device=device)
+    staging_base_ptr = staging_all.data_ptr()
+    output_base_ptr = output_all.data_ptr()
+
+    # Tile barriers: all ranks share the same barrier buffer
+    max_tiles = m // tile_size
+    barrier_bytes = max(max_tiles * 4, 4096)
+    tile_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
+    completion_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
+
+    make_ptr = cutlass.cute.runtime.make_ptr
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    hardware_info = cutlass.utils.HardwareInfo()
+    max_active_clusters = hardware_info.get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
+    # For each simulated rank, generate different random inputs and run
+    # the kernel's epilogue to populate the staging buffer. We then validate
+    # that the AR warps correctly sum across all ranks.
+    per_rank_inputs = []
+    for rank in range(world_size):
+        torch.manual_seed(42 + rank)
+        a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
+        b = torch.randint(0, 256, (l, n, k // 2), dtype=torch.uint8, device=device)
+        a_sf = torch.randint(0, 8, (m * scale_k,), dtype=torch.uint8, device=device)
+        b_sf = torch.randint(0, 8, (l, n, scale_k), dtype=torch.uint8, device=device)
+        alpha = torch.ones(l, dtype=torch.float32, device=device) * 0.1
+
+        tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32, device=device) % l
+        tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32, device=device)
+        permuted_idx_to_expanded_idx = torch.arange(m, dtype=torch.int32, device=device)
+        num_non_exiting_tiles = torch.tensor([num_tiles], dtype=torch.int32, device=device)
+        token_final_scales = torch.ones(num_tokens, top_k, dtype=torch.float32, device=device)
+
+        per_rank_inputs.append(
+            dict(
+                a=a,
+                b=b,
+                a_sf=a_sf,
+                b_sf=b_sf,
+                alpha=alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+            )
+        )
+
+    # Use rank 0's inputs for the kernel (all ranks share the same GEMM inputs
+    # in this test — the key test is whether IPC reduce across staging works).
+    # We populate each rank's staging buffer by running the kernel serially
+    # for each rank with world_size=1 first, then run one final kernel with
+    # world_size > 1 and the pre-populated staging buffers.
+
+    # Step 1: Populate each rank's staging buffer by running epilogue-only
+    # (world_size=1 to skip AR, writing to each rank's staging slice)
+    for rank in range(world_size):
+        inp = per_rank_inputs[rank]
+        out_dummy = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+
+        a_ptr = make_ptr(
+            cutlass.Float4E2M1FN,
+            inp["a"].data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
+        b_ptr = make_ptr(
+            cutlass.Float4E2M1FN,
+            inp["b"].data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
+        a_sf_ptr = make_ptr(
+            cutlass.Float8E4M3FN,
+            inp["a_sf"].data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        b_sf_ptr = make_ptr(
+            cutlass.Float8E4M3FN,
+            inp["b_sf"].data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        alpha_ptr = make_ptr(cutlass.Float32, inp["alpha"].data_ptr(), cute.AddressSpace.gmem)
+        out_ptr = make_ptr(
+            cutlass.BFloat16,
+            out_dummy.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        tig_ptr = make_ptr(
+            cutlass.Int32,
+            inp["tile_idx_to_expert_idx"].data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+        tmn_ptr = make_ptr(
+            cutlass.Int32,
+            inp["tile_idx_to_mn_limit"].data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+        pie_ptr = make_ptr(
+            cutlass.Int32,
+            inp["permuted_idx_to_expanded_idx"].data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+        nne_ptr = make_ptr(
+            cutlass.Int32,
+            inp["num_non_exiting_tiles"].data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+        tfs_ptr = make_ptr(
+            cutlass.Float32,
+            inp["token_final_scales"].data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+
+        # Run kernel with world_size=1 to populate staging only
+        # (AR warps no-op, epilogue scatter-adds to out_dummy — we only care
+        # about what was written to staging before scatter-add, but for
+        # world_size=1, epilogue writes to out directly, not staging.)
+        # We need world_size > 1 for the epilogue to write to staging.
+        # But then AR warps would try to reduce. This is a chicken-and-egg
+        # problem. Instead, use the finalize-fusion kernel to compute the
+        # expected output per rank, then compute the reference as the sum.
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+        )
+
+        base_kernel = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_blkred=True,
+            raster_along_m=False,
+        )
+        compiled_base = cute.compile(
+            base_kernel.wrapper,
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            out_ptr,
+            alpha_ptr,
+            tig_ptr,
+            tmn_ptr,
+            pie_ptr,
+            nne_ptr,
+            tfs_ptr,
+            m,
+            n,
+            k,
+            l,
+            num_tokens,
+            top_k,
+            tile_size=tile_size,
+            scaling_vector_size=sf_vec_size,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+        compiled_base(
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            out_ptr,
+            alpha_ptr,
+            tig_ptr,
+            tmn_ptr,
+            pie_ptr,
+            nne_ptr,
+            tfs_ptr,
+            m,
+            n,
+            k,
+            l,
+            num_tokens,
+            top_k,
+            stream=stream,
+        )
+        torch.cuda.synchronize()
+
+        # Store this rank's output for reference (already scatter-added by
+        # the finalize-fusion kernel with token_final_scales * alpha applied)
+        per_rank_inputs[rank]["out_ref"] = out_dummy.clone()
+
+    # Step 2: Compute reference output = sum of all ranks' outputs
+    ref_output = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+    for rank in range(world_size):
+        # Convert to float for accurate summation, then back to bf16
+        ref_output = (ref_output.float() + per_rank_inputs[rank]["out_ref"].float()).to(
+            torch.bfloat16
+        )
+
+    # Step 3: Simulate the IPC reduce path. To test the AR warps, we need
+    # to populate staging buffers (one per rank) with the FC2 output data.
+    # We run the allreduce kernel with world_size > 1 and pre-populated
+    # staging. The epilogue writes to staging (for world_size > 1), then
+    # AR warps reduce across ranks.
+    #
+    # Since we can't run actual multi-rank epilogues on a single GPU, we
+    # instead directly populate the staging buffers with known data and test
+    # only the AR warp reduce logic.
+    #
+    # Populate staging[rank] with rank-specific bf16 data patterns.
+    staging_all.zero_()
+    for rank in range(world_size):
+        torch.manual_seed(100 + rank)
+        staging_slice = staging_all[rank * m * n : (rank + 1) * m * n]
+        staging_slice.copy_(torch.randn(m * n, dtype=torch.bfloat16, device=device) * 0.01)
+
+    # Reset barriers and output
+    tile_barriers.zero_()
+    completion_barriers.zero_()
+    output_all.zero_()
+
+    # Pre-set tile barriers to world_size (as if all ranks' epilogues arrived)
+    tile_barriers[:num_tiles] = world_size
+
+    # Run the allreduce kernel as rank 0 with the staging buffers pre-populated.
+    # The AR warps should read from all ranks' staging via IPC, sum, and store.
+    inp = per_rank_inputs[0]
+    ar_kernel = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+
+    # Create staging for rank 0 (the epilogue will write to this, overwriting
+    # our test data). To avoid this, we use a separate staging buffer for the
+    # GEMM epilogue and only test the AR reduction.
+    staging_gemm = torch.zeros(m, n, dtype=torch.bfloat16, device=device)
+    out_test = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+
+    a_ptr = make_ptr(
+        cutlass.Float4E2M1FN,
+        inp["a"].data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    b_ptr = make_ptr(
+        cutlass.Float4E2M1FN,
+        inp["b"].data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    a_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        inp["a_sf"].data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    b_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        inp["b_sf"].data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    alpha_ptr = make_ptr(cutlass.Float32, inp["alpha"].data_ptr(), cute.AddressSpace.gmem)
+    staging_gemm_ptr = make_ptr(
+        cutlass.BFloat16,
+        staging_gemm.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    out_test_ptr = make_ptr(
+        cutlass.BFloat16,
+        out_test.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    tig_ptr = make_ptr(
+        cutlass.Int32,
+        inp["tile_idx_to_expert_idx"].data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    tmn_ptr = make_ptr(
+        cutlass.Int32,
+        inp["tile_idx_to_mn_limit"].data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    pie_ptr = make_ptr(
+        cutlass.Int32,
+        inp["permuted_idx_to_expanded_idx"].data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    nne_ptr = make_ptr(
+        cutlass.Int32,
+        inp["num_non_exiting_tiles"].data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    tfs_ptr = make_ptr(
+        cutlass.Float32,
+        inp["token_final_scales"].data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+
+    rank_val = 0
+    compiled_ar = cute.compile(
+        ar_kernel.wrapper,
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        staging_gemm_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        staging_base_ptr,  # staging_mc_ptr: base of all ranks' staging
+        output_base_ptr,  # out_mc_ptr: base of all ranks' output
+        tile_barriers.data_ptr(),  # tile_barrier_mc_ptr
+        completion_barriers.data_ptr(),  # completion_barrier_mc_ptr
+        staging_rank_stride,  # staging_rank_stride
+        out_rank_stride,  # out_rank_stride
+        out_test_ptr,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        rank_val,
+        world_size,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+    )
+    compiled_ar(
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        staging_gemm_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        staging_base_ptr,
+        output_base_ptr,
+        tile_barriers.data_ptr(),
+        completion_barriers.data_ptr(),
+        staging_rank_stride,
+        out_rank_stride,
+        out_test_ptr,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+
+    # Verify the AR warps' output in the NVLS output buffer (rank 0's slice)
+    ar_output = output_all[: m * n].view(m, n)
+
+    # Compute expected: sum of all ranks' staging data
+    expected = torch.zeros(m, n, dtype=torch.float32, device=device)
+    for rank in range(world_size):
+        staging_rank = staging_all[rank * m * n : (rank + 1) * m * n].view(m, n)
+        expected += staging_rank.float()
+    expected_bf16 = expected.to(torch.bfloat16)
+
+    # Compare AR output vs expected (bf16 sum allows small tolerance)
+    max_diff = torch.nan_to_num(ar_output - expected_bf16).abs().max().item()
+    assert torch.allclose(ar_output, expected_bf16, atol=1e-2, rtol=1e-2), (
+        f"IPC AllReduce output differs from expected sum: "
+        f"max_diff={max_diff}, "
+        f"nan_ar={ar_output.isnan().sum().item()}, "
+        f"nan_ref={expected_bf16.isnan().sum().item()}"
+    )
+
+    # Verify output has non-zero values
+    finite_out = ar_output[ar_output.isfinite()]
+    assert finite_out.numel() > 0 and finite_out.abs().max().item() > 0, (
+        "AllReduce output has no finite non-zero values"
     )
