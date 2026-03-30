@@ -1770,7 +1770,9 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E74
     cluster_shape_mn = (1, 1)
     scale_k = k // sf_vec_size
     num_tokens = m // top_k
-    num_tiles = m // tile_size
+    num_tiles = m // tile_size  # M-tiles (for num_non_exiting_tiles)
+    tile_n = mma_tiler_mn[1]
+    num_2d_tiles = num_tiles * (n // tile_n)  # Total 2D tiles (M × N)
 
     if not Sm100BlockScaledContiguousGroupedGemmAllReduceKernel.can_implement(
         ab_dtype=cutlass.Float4E2M1FN,
@@ -1798,9 +1800,8 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E74
     staging_base_ptr = staging_all.data_ptr()
     output_base_ptr = output_all.data_ptr()
 
-    # Tile barriers: all ranks share the same barrier buffer
-    max_tiles = m // tile_size
-    barrier_bytes = max(max_tiles * 4, 4096)
+    # Tile barriers: need one per 2D tile
+    barrier_bytes = max(num_2d_tiles * 4, 4096)
     tile_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
     completion_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
 
@@ -2014,7 +2015,8 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size):  # noqa: E74
     output_all.zero_()
 
     # Pre-set tile barriers to world_size (as if all ranks' epilogues arrived)
-    tile_barriers[:num_tiles] = world_size
+    # Need to cover all 2D tiles (M-tiles * N-tiles), not just M-tiles.
+    tile_barriers[:num_2d_tiles] = world_size
 
     # Run the allreduce kernel as rank 0 with the staging buffers pre-populated.
     # The AR warps should read from all ranks' staging via IPC, sum, and store.

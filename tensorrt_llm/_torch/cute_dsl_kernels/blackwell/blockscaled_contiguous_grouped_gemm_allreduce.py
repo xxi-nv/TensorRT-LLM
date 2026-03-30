@@ -1360,9 +1360,14 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
                 # vec_width is in units of bf16 elements per vector load.
                 vec_width = cutlass.Int32(8)  # 8 bf16 = 128 bits
 
+                # Total 2D tiles = M-tiles * N-tiles-per-M-tile.
+                # num_non_exiting_tiles[0] counts M-tiles only.
+                n_dim = cutlass.Int32(cute.size(staging.shape[1]))
+                n_tiles_per_m = (n_dim + cta_tile_n - cutlass.Int32(1)) // cta_tile_n
+                total_tiles = num_non_exiting_tiles[0] * n_tiles_per_m
+
                 # Spin-wait for tiles and process
                 ar_tile_idx = cutlass.Int32(0)
-                total_tiles = num_non_exiting_tiles[0]
 
                 while ar_tile_idx < total_tiles:
                     # Wait for this tile's barrier to reach world_size
