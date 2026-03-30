@@ -1469,7 +1469,9 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
         # Total 2D tiles for AR warps: M-tiles * N-tiles
-        cta_n = cutlass.Int64(self.cta_tile_shape_mnk[1])
+        # Use self.mma_tiler[1] (set in __init__) because cta_tile_shape_mnk
+        # is only available after _setup_attributes() runs inside __call__().
+        cta_n = cutlass.Int64(self.mma_tiler[1])
         total_2d_tiles = cutlass.Int32(num_tiles * ((n + cta_n - 1) // cta_n))
 
         a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
