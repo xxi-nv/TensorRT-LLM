@@ -13,15 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Benchmark for FlashMoE EP communication strategies.
+Benchmark for FlashMoE fused GEMM+AllReduce kernel strategies.
 
-Compares V1 (NCCL AllReduce) vs V4 (fused GEMM+AllReduce) latency.
+Modes:
+  kernel:   Single-GPU overhead: 7-warp base vs 11-warp (world_size=1)
+  strategy: Simulated multi-GPU: compare AR strategy 0 (batch) vs 1 (overlapped)
 
-Usage (single GPU, V4 kernel-only benchmark):
+Usage:
   python bench_flashmoe_ep.py --mode kernel --m 1024 --n 7168 --k 2048 --experts 8
+  python bench_flashmoe_ep.py --mode strategy --m 1024 --n 7168 --k 2048 --experts 8 --world_size 2
+  python bench_flashmoe_ep.py --mode strategy --m 1024 --n 7168 --k 2048 --experts 8 --world_size 4
 
-Multi-GPU (requires MPI):
-  mpirun -n 4 python bench_flashmoe_ep.py --mode full --m 1024 --n 7168 --k 2048 --experts 8
+Multi-config sweep:
+  python bench_flashmoe_ep.py --mode sweep
 """
 
 import argparse
@@ -29,25 +33,49 @@ import argparse
 import torch
 
 
-def bench_allreduce_kernel_single_gpu(m, n, k, l, top_k=2, tile_size=128, warmup=10, iters=100):  # noqa: E741
-    """Benchmark the 11-warp AllReduce kernel on a single GPU.
+def _import_kernels():
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
 
-    Measures kernel launch overhead vs the base finalize-fusion kernel.
-    AR warps are no-op when world_size=1.
-    """
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    return (
+        cutlass,
+        cute,
+        cuda,
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+
+def _time_kernel(compiled_fn, args, warmup, iters):
+    """Time a compiled kernel, returning average ms per iteration."""
+    for _ in range(warmup):
+        compiled_fn(*args)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        compiled_fn(*args)
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def bench_kernel_overhead(m, n, k, l, top_k=2, tile_size=128, warmup=10, iters=100):  # noqa: E741
+    """Benchmark 11-warp vs 7-warp overhead (world_size=1, AR warps idle)."""
     try:
-        import cutlass
-        import cutlass.cute as cute
-        from cuda.bindings import driver as cuda
-
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
-            Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
-        )
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
-            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
-        )
+        cutlass, cute, cuda, ARKernel, BaseKernel = _import_kernels()
     except ImportError as e:
-        print(f"Cannot import required modules: {e}")
+        print(f"Cannot import: {e}")
         return
 
     device = torch.device("cuda")
@@ -60,7 +88,6 @@ def bench_allreduce_kernel_single_gpu(m, n, k, l, top_k=2, tile_size=128, warmup
 
     make_ptr = cutlass.cute.runtime.make_ptr
 
-    # Allocate inputs
     a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
     b = torch.randint(0, 256, (l, n, k // 2), dtype=torch.uint8, device=device)
     a_sf = torch.randint(0, 256, (m * scale_k,), dtype=torch.uint8, device=device)
@@ -79,220 +106,441 @@ def bench_allreduce_kernel_single_gpu(m, n, k, l, top_k=2, tile_size=128, warmup
     hw = cutlass.utils.HardwareInfo()
     max_clusters = hw.get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
 
-    def make_ptrs():
-        return (
-            make_ptr(cutlass.Float4E2M1FN, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32),
-            make_ptr(cutlass.Float4E2M1FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32),
-            make_ptr(
-                cutlass.Float8E4M3FN, a_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(
-                cutlass.Float8E4M3FN, b_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(cutlass.Int32, permuted_idx.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(cutlass.Int32, num_non_exit.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(cutlass.Float32, token_scales.data_ptr(), cute.AddressSpace.gmem),
-            make_ptr(
-                cutlass.BFloat16, staging.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        )
+    def _ptr(dtype, tensor, align=None):
+        kw = {"assumed_align": align} if align else {}
+        return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, **kw)
 
-    print(f"\nBenchmark: M={m}, N={n}, K={k}, L={l}, top_k={top_k}")
-    print(f"  tile_size={tile_size}, mma_tiler_mn={mma_tiler_mn}")
-    print(f"  warmup={warmup}, iters={iters}")
+    p_a = _ptr(cutlass.Float4E2M1FN, a, 32)
+    p_b = _ptr(cutlass.Float4E2M1FN, b, 32)
+    p_asf = _ptr(cutlass.Float8E4M3FN, a_sf, 16)
+    p_bsf = _ptr(cutlass.Float8E4M3FN, b_sf, 16)
+    p_alpha = _ptr(cutlass.Float32, alpha)
+    p_tig = _ptr(cutlass.Int32, tile_idx_to_expert_idx)
+    p_tmn = _ptr(cutlass.Int32, tile_idx_to_mn_limit)
+    p_pie = _ptr(cutlass.Int32, permuted_idx)
+    p_nne = _ptr(cutlass.Int32, num_non_exit)
+    p_tfs = _ptr(cutlass.Float32, token_scales)
+    p_stg = _ptr(cutlass.BFloat16, staging, 16)
+    p_out = _ptr(cutlass.BFloat16, out, 16)
 
-    # Compile and benchmark base kernel
-    p = make_ptrs()
-    base = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+    print(f"\n=== Kernel Overhead: M={m}, N={n}, K={k}, L={l}, top_k={top_k} ===")
+    print(f"    tile_size={tile_size}, warmup={warmup}, iters={iters}")
+
+    # Base 7-warp kernel
+    base = BaseKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         use_blkred=True,
         raster_along_m=False,
     )
-    compiled_base = cute.compile(
-        base.wrapper,
-        p[0],
-        p[1],
-        p[2],
-        p[3],
-        p[11],
-        p[4],
-        p[5],
-        p[6],
-        p[7],
-        p[8],
-        p[9],
+    base_args_compile = [
+        p_a,
+        p_b,
+        p_asf,
+        p_bsf,
+        p_out,
+        p_alpha,
+        p_tig,
+        p_tmn,
+        p_pie,
+        p_nne,
+        p_tfs,
         m,
         n,
         k,
         l,
         num_tokens,
         top_k,
+    ]
+    compiled_base = cute.compile(
+        base.wrapper,
+        *base_args_compile,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         max_active_clusters=max_clusters,
         stream=stream,
     )
+    base_ms = _time_kernel_kw(compiled_base, base_args_compile, stream, warmup, iters)
+    print(f"    Base (7-warp):      {base_ms:.3f} ms")
 
+    # 11-warp kernel (world_size=1, ar_strategy=0)
+    ar = ARKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+    ar_args_compile = [
+        p_a,
+        p_b,
+        p_asf,
+        p_bsf,
+        p_stg,
+        p_alpha,
+        p_tig,
+        p_tmn,
+        p_pie,
+        p_nne,
+        p_tfs,
+        0,
+        0,
+        0,
+        0,  # mc pointers (unused)
+        0,
+        0,  # rank strides (unused)
+        p_out,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+        0,
+        1,
+        0,  # rank=0, world_size=1, ar_strategy=0
+    ]
+    compiled_ar = cute.compile(
+        ar.wrapper,
+        *ar_args_compile,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_clusters,
+        stream=stream,
+    )
+    # Runtime args: same but without Constexpr (rank, world_size, ar_strategy)
+    ar_run_args = [
+        p_a,
+        p_b,
+        p_asf,
+        p_bsf,
+        p_stg,
+        p_alpha,
+        p_tig,
+        p_tmn,
+        p_pie,
+        p_nne,
+        p_tfs,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        p_out,
+        m,
+        n,
+        k,
+        l,
+        num_tokens,
+        top_k,
+    ]
+    ar_ms = _time_kernel_kw(compiled_ar, ar_run_args, stream, warmup, iters)
+    print(f"    AR (11-warp, ws=1): {ar_ms:.3f} ms")
+    print(f"    Overhead:           {(ar_ms / base_ms - 1) * 100:.1f}%")
+
+    return base_ms, ar_ms
+
+
+def _time_kernel_kw(compiled_fn, args, stream, warmup, iters):
+    """Time a compiled kernel with stream as keyword arg."""
     for _ in range(warmup):
-        compiled_base(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[11],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
-            p[8],
-            p[9],
-            m,
-            n,
-            k,
-            l,
-            num_tokens,
-            top_k,
-            stream=stream,
-        )
+        compiled_fn(*args, stream=stream)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        compiled_base(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[11],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
-            p[8],
-            p[9],
-            m,
-            n,
-            k,
-            l,
-            num_tokens,
-            top_k,
-            stream=stream,
-        )
+        compiled_fn(*args, stream=stream)
     end.record()
     torch.cuda.synchronize()
-    base_ms = start.elapsed_time(end) / iters
-    print(f"  Base kernel (7-warp):     {base_ms:.3f} ms")
+    return start.elapsed_time(end) / iters
 
-    # Compile and benchmark AllReduce kernel (world_size=1)
-    ar = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-        use_blkred=True,
-        raster_along_m=False,
-    )
-    compiled_ar = cute.compile(
-        ar.wrapper,
-        p[0],
-        p[1],
-        p[2],
-        p[3],
-        p[10],
-        p[4],
-        p[5],
-        p[6],
-        p[7],
-        p[8],
-        p[9],
-        0,
-        0,
-        0,
-        0,
-        p[11],
-        m,
-        n,
-        k,
-        l,
-        num_tokens,
-        top_k,
-        0,
-        1,  # rank=0, world_size=1
-        tile_size=tile_size,
-        scaling_vector_size=sf_vec_size,
-        max_active_clusters=max_clusters,
-        stream=stream,
+
+def bench_ar_strategies(
+    m,
+    n,
+    k,
+    l,  # noqa: E741
+    top_k=2,
+    tile_size=128,
+    world_size=2,
+    warmup=10,
+    iters=100,
+):
+    """Benchmark AR strategy 0 (batch) vs 1 (overlapped) with simulated multi-GPU.
+
+    Pre-populates staging buffers and pre-sets barriers to world_size so that
+    AR warps run the full reduce path without spin-waiting. This measures:
+      GEMM + epilogue (writes to staging) + AR reduce (reads staging, writes output)
+    """
+    try:
+        cutlass, cute, cuda, ARKernel, _ = _import_kernels()
+    except ImportError as e:
+        print(f"Cannot import: {e}")
+        return
+
+    device = torch.device("cuda")
+    sf_vec_size = 16
+    scale_k = k // sf_vec_size
+    num_tokens = m // top_k
+    num_tiles = m // tile_size
+    tile_n = 128
+    num_2d_tiles = num_tiles * (n // tile_n)
+    mma_tiler_mn = (tile_size, tile_n)
+    cluster_shape_mn = (tile_size // 128, 1)
+
+    make_ptr = cutlass.cute.runtime.make_ptr
+
+    # Shared GEMM inputs (rank 0)
+    torch.manual_seed(42)
+    a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
+    b = torch.randint(0, 256, (l, n, k // 2), dtype=torch.uint8, device=device)
+    a_sf = torch.randint(0, 8, (m * scale_k,), dtype=torch.uint8, device=device)
+    b_sf = torch.randint(0, 8, (l, n, scale_k), dtype=torch.uint8, device=device)
+    alpha = torch.ones(l, dtype=torch.float32, device=device) * 0.1
+    tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32, device=device) % l
+    tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32, device=device)
+    permuted_idx = torch.arange(m, dtype=torch.int32, device=device)
+    num_non_exit = torch.tensor([num_tiles], dtype=torch.int32, device=device)
+    token_scales = torch.ones(num_tokens, top_k, dtype=torch.float32, device=device)
+
+    # Staging: world_size separate buffers laid out contiguously (IPC simulation)
+    staging_rank_stride = m * n * 2  # bytes (bf16)
+    out_rank_stride = staging_rank_stride
+    staging_all = torch.zeros(world_size * m * n, dtype=torch.bfloat16, device=device)
+    output_all = torch.zeros(world_size * m * n, dtype=torch.bfloat16, device=device)
+    staging_gemm = torch.zeros(m, n, dtype=torch.bfloat16, device=device)
+    out_test = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+
+    # Barriers: one i32 per 2D tile
+    barrier_bytes = max(num_2d_tiles * 4, 4096)
+    tile_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
+    completion_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
+
+    # Populate staging with small random data for each rank
+    for rank_i in range(world_size):
+        torch.manual_seed(100 + rank_i)
+        staging_all[rank_i * m * n : (rank_i + 1) * m * n].copy_(
+            torch.randn(m * n, dtype=torch.bfloat16, device=device) * 0.01
+        )
+
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    hw = cutlass.utils.HardwareInfo()
+    max_clusters = hw.get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
+
+    def _ptr(dtype, tensor, align=None):
+        kw = {"assumed_align": align} if align else {}
+        return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, **kw)
+
+    p_a = _ptr(cutlass.Float4E2M1FN, a, 32)
+    p_b = _ptr(cutlass.Float4E2M1FN, b, 32)
+    p_asf = _ptr(cutlass.Float8E4M3FN, a_sf, 16)
+    p_bsf = _ptr(cutlass.Float8E4M3FN, b_sf, 16)
+    p_alpha = _ptr(cutlass.Float32, alpha)
+    p_tig = _ptr(cutlass.Int32, tile_idx_to_expert_idx)
+    p_tmn = _ptr(cutlass.Int32, tile_idx_to_mn_limit)
+    p_pie = _ptr(cutlass.Int32, permuted_idx)
+    p_nne = _ptr(cutlass.Int32, num_non_exit)
+    p_tfs = _ptr(cutlass.Float32, token_scales)
+    p_stg_gemm = _ptr(cutlass.BFloat16, staging_gemm, 16)
+    p_out = _ptr(cutlass.BFloat16, out_test, 16)
+
+    print(f"\n=== AR Strategy Benchmark: M={m}, N={n}, K={k}, L={l}, world_size={world_size} ===")
+    print(
+        f"    tiles={num_tiles}(M)×{n // tile_n}(N)={num_2d_tiles}(2D), "
+        f"warmup={warmup}, iters={iters}"
     )
 
-    for _ in range(warmup):
-        compiled_ar(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[10],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
-            p[8],
-            p[9],
-            0,
-            0,
-            0,
-            0,
-            p[11],
+    results = {}
+    for strategy in [0, 1]:
+        # Compile for this strategy
+        ar = ARKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_blkred=True,
+            raster_along_m=False,
+        )
+        compile_args = [
+            p_a,
+            p_b,
+            p_asf,
+            p_bsf,
+            p_stg_gemm,
+            p_alpha,
+            p_tig,
+            p_tmn,
+            p_pie,
+            p_nne,
+            p_tfs,
+            staging_all.data_ptr(),
+            output_all.data_ptr(),
+            tile_barriers.data_ptr(),
+            completion_barriers.data_ptr(),
+            staging_rank_stride,
+            out_rank_stride,
+            p_out,
             m,
             n,
             k,
             l,
             num_tokens,
             top_k,
-            # rank and world_size are Constexpr, baked in at compile time
+            0,
+            world_size,
+            strategy,  # rank=0, world_size, ar_strategy
+        ]
+        compiled = cute.compile(
+            ar.wrapper,
+            *compile_args,
+            tile_size=tile_size,
+            scaling_vector_size=sf_vec_size,
+            max_active_clusters=max_clusters,
             stream=stream,
         )
-    torch.cuda.synchronize()
-
-    start.record()
-    for _ in range(iters):
-        compiled_ar(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[10],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
-            p[8],
-            p[9],
-            0,
-            0,
-            0,
-            0,
-            p[11],
+        # Runtime args (no Constexpr: rank, world_size, ar_strategy are baked in)
+        run_args = [
+            p_a,
+            p_b,
+            p_asf,
+            p_bsf,
+            p_stg_gemm,
+            p_alpha,
+            p_tig,
+            p_tmn,
+            p_pie,
+            p_nne,
+            p_tfs,
+            staging_all.data_ptr(),
+            output_all.data_ptr(),
+            tile_barriers.data_ptr(),
+            completion_barriers.data_ptr(),
+            staging_rank_stride,
+            out_rank_stride,
+            p_out,
             m,
             n,
             k,
             l,
             num_tokens,
             top_k,
-            # rank and world_size are Constexpr, baked in at compile time
-            stream=stream,
+        ]
+
+        # Before each iteration, reset barriers to world_size and clear output
+        def run_once():
+            tile_barriers[:num_2d_tiles] = world_size
+            completion_barriers.zero_()
+            output_all.zero_()
+            compiled(*run_args, stream=stream)
+
+        # Warmup (includes barrier reset overhead)
+        for _ in range(warmup):
+            run_once()
+        torch.cuda.synchronize()
+
+        # Timed runs: reset barriers in bulk, then time kernel iterations.
+        # To avoid measuring barrier reset overhead, pre-set barriers for all
+        # iterations and run the kernel. But completion_barriers need reset too.
+        # Compromise: measure full run_once() and subtract barrier overhead.
+        #
+        # Actually, a simpler approach: for benchmarking, we can set barriers
+        # once before the timed loop. The AR warps read barriers and reduce,
+        # but the epilogue also writes to barriers (incrementing them). So after
+        # each kernel run, tile_barriers will be world_size + (number of CTAs
+        # that wrote to each barrier). For strategy correctness we'd need reset,
+        # but for timing purposes this is fine since AR warps just check >= world_size.
+        #
+        # The completion_barrier is incremented by AR warps, which we don't wait
+        # on in this benchmark.
+        tile_barriers[:num_2d_tiles] = world_size
+        completion_barriers.zero_()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            compiled(*run_args, stream=stream)
+        end.record()
+        torch.cuda.synchronize()
+        ms = start.elapsed_time(end) / iters
+        results[strategy] = ms
+        sname = "batch" if strategy == 0 else "overlapped"
+        print(f"    Strategy {strategy} ({sname:>10}): {ms:.3f} ms")
+
+    if results:
+        s0 = results.get(0, 0)
+        s1 = results.get(1, 0)
+        if s0 > 0 and s1 > 0:
+            faster = 0 if s0 < s1 else 1
+            slower = 1 - faster
+            speedup = results[slower] / results[faster]
+            fname = "batch" if faster == 0 else "overlapped"
+            print(f"    Winner: strategy {faster} ({fname}), {speedup:.2f}x faster")
+
+    return results
+
+
+def bench_sweep(warmup=5, iters=50):
+    """Run a sweep of configs comparing strategies."""
+    configs = [
+        # (m, n, k, l, top_k, world_size)
+        (256, 2048, 2048, 8, 2, 2),
+        (256, 2048, 2048, 8, 2, 4),
+        (512, 2048, 2048, 8, 2, 2),
+        (512, 2048, 2048, 8, 2, 4),
+        (1024, 7168, 2048, 8, 2, 2),
+        (1024, 7168, 2048, 8, 2, 4),
+        (2048, 7168, 2048, 8, 2, 2),
+        (2048, 7168, 2048, 8, 2, 4),
+        (4096, 7168, 2048, 64, 8, 2),
+        (4096, 7168, 2048, 64, 8, 4),
+    ]
+
+    print("=" * 80)
+    print("FlashMoE Fused GEMM+AllReduce Strategy Sweep")
+    print("=" * 80)
+
+    all_results = []
+    for cfg in configs:
+        c_m, c_n, c_k, c_experts, c_topk, c_ws = cfg
+        r = bench_ar_strategies(
+            m=c_m,
+            n=c_n,
+            k=c_k,
+            l=c_experts,
+            top_k=c_topk,
+            world_size=c_ws,
+            warmup=warmup,
+            iters=iters,
         )
-    end.record()
-    torch.cuda.synchronize()
-    ar_ms = start.elapsed_time(end) / iters
-    print(f"  AR kernel (11-warp, ws=1): {ar_ms:.3f} ms")
-    print(f"  Overhead: {(ar_ms / base_ms - 1) * 100:.1f}%")
+        if r:
+            all_results.append((*cfg, r))
+
+    # Summary table
+    if all_results:
+        print("\n" + "=" * 80)
+        print(
+            f"{'M':>6} {'N':>6} {'K':>6} {'L':>4} {'k':>2} {'ws':>3} "
+            f"{'S0(ms)':>8} {'S1(ms)':>8} {'Winner':>10} {'Speedup':>8}"
+        )
+        print("-" * 80)
+        for c_m, c_n, c_k, c_experts, c_topk, c_ws, r in all_results:
+            s0 = r.get(0, 0)
+            s1 = r.get(1, 0)
+            if s0 > 0 and s1 > 0:
+                faster = 0 if s0 < s1 else 1
+                speedup = max(s0, s1) / min(s0, s1)
+                fname = "batch" if faster == 0 else "overlap"
+                print(
+                    f"{c_m:>6} {c_n:>6} {c_k:>6} {c_experts:>4} "
+                    f"{c_topk:>2} {c_ws:>3} "
+                    f"{s0:>8.3f} {s1:>8.3f} {fname:>10} {speedup:>7.2f}x"
+                )
+        print("=" * 80)
 
 
 def main():
@@ -301,8 +549,8 @@ def main():
         "--mode",
         type=str,
         default="kernel",
-        choices=["kernel", "full"],
-        help="kernel: single-GPU kernel benchmark, full: multi-GPU EP",
+        choices=["kernel", "strategy", "sweep"],
+        help="kernel: overhead test, strategy: compare S0 vs S1, sweep: multi-config",
     )
     parser.add_argument("--m", type=int, default=1024)
     parser.add_argument("--n", type=int, default=7168)
@@ -310,12 +558,13 @@ def main():
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--tile_size", type=int, default=128)
+    parser.add_argument("--world_size", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
 
     if args.mode == "kernel":
-        bench_allreduce_kernel_single_gpu(
+        bench_kernel_overhead(
             m=args.m,
             n=args.n,
             k=args.k,
@@ -325,9 +574,20 @@ def main():
             warmup=args.warmup,
             iters=args.iters,
         )
-    else:
-        print("Full multi-GPU EP benchmark requires MPI launch.")
-        print("Will be added when multi-GPU IPC path is validated.")
+    elif args.mode == "strategy":
+        bench_ar_strategies(
+            m=args.m,
+            n=args.n,
+            k=args.k,
+            l=args.experts,
+            top_k=args.top_k,
+            tile_size=args.tile_size,
+            world_size=args.world_size,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    elif args.mode == "sweep":
+        bench_sweep(warmup=args.warmup, iters=args.iters)
 
 
 if __name__ == "__main__":
