@@ -1539,9 +1539,10 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
     # Generate random inputs
     a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
     b = torch.randint(0, 256, (l, n, k // 2), dtype=torch.uint8, device=device)
-    a_sf = torch.randint(0, 256, (m * scale_k,), dtype=torch.uint8, device=device)
-    b_sf = torch.randint(0, 256, (l, n, scale_k), dtype=torch.uint8, device=device)
-    alpha = torch.ones(l, dtype=torch.float32, device=device)
+    # Use small scale factors to avoid BF16 overflow (consistent with existing cuteDSL tests)
+    a_sf = torch.randint(0, 8, (m * scale_k,), dtype=torch.uint8, device=device)
+    b_sf = torch.randint(0, 8, (l, n, scale_k), dtype=torch.uint8, device=device)
+    alpha = torch.ones(l, dtype=torch.float32, device=device) * 0.1
 
     tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32, device=device) % l
     tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32, device=device)
@@ -1713,15 +1714,14 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
     )
     torch.cuda.synchronize()
 
-    # Compare results — both kernels may produce NaN/inf at the same positions
-    # due to random MX-FP4 inputs causing BF16 overflow; use equal_nan=True.
-    nan_ar = out_ar.isnan().sum().item()
-    nan_ref = out_ref.isnan().sum().item()
-    assert nan_ar == nan_ref, f"NaN count mismatch: AR={nan_ar}, ref={nan_ref}"
-    # Check non-NaN values match
-    valid_mask = ~out_ar.isnan() & ~out_ref.isnan()
-    if valid_mask.any():
-        max_diff = (out_ar[valid_mask].float() - out_ref[valid_mask].float()).abs().max().item()
-        assert max_diff < 1e-2, f"AllReduce kernel (world_size=1) differs from base by {max_diff}"
-    # Verify output is not all zeros (kernel actually wrote something)
-    assert out_ref.abs().max().item() > 0, "Base kernel output is all zeros"
+    # Compare results
+    assert torch.allclose(out_ar, out_ref, atol=0, rtol=0, equal_nan=True), (
+        f"AllReduce kernel (world_size=1) differs from base: "
+        f"max_diff={torch.nan_to_num(out_ar - out_ref).abs().max().item()}, "
+        f"nan_ar={out_ar.isnan().sum().item()}, nan_ref={out_ref.isnan().sum().item()}"
+    )
+    # Verify output has non-zero finite values (kernel actually computed something)
+    finite_ref = out_ref[out_ref.isfinite()]
+    assert finite_ref.numel() > 0 and finite_ref.abs().max().item() > 0, (
+        "Base kernel output has no finite non-zero values"
+    )
