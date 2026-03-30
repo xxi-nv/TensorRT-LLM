@@ -255,8 +255,7 @@ def bench_allreduce_kernel_single_gpu(m, n, k, l, top_k=2, tile_size=128, warmup
             l,
             num_tokens,
             top_k,
-            0,
-            1,
+            # rank and world_size are Constexpr, baked in at compile time
             stream=stream,
         )
     torch.cuda.synchronize()
@@ -286,8 +285,7 @@ def bench_allreduce_kernel_single_gpu(m, n, k, l, top_k=2, tile_size=128, warmup
             l,
             num_tokens,
             top_k,
-            0,
-            1,
+            # rank and world_size are Constexpr, baked in at compile time
             stream=stream,
         )
     end.record()

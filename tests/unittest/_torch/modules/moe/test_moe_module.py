@@ -1708,8 +1708,7 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
         l,
         num_tokens,
         top_k,
-        0,
-        1,
+        # rank and world_size are Constexpr, baked in at compile time
         stream=stream,
     )
     torch.cuda.synchronize()
