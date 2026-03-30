@@ -28,8 +28,22 @@ Two paths are provided:
 """
 
 import cutlass
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+
+def _llvm_struct(*element_types):
+    """Create LLVM literal struct type, compatible across cutlass DSL versions.
+
+    Some cutlass DSL versions provide T.struct(); older ones do not.
+    Falls back to ir.Type.parse() which is always available.
+    """
+    if hasattr(T, "struct"):
+        return T.struct(list(element_types))
+    type_strs = [str(t) for t in element_types]
+    return ir.Type.parse(f"!llvm.struct<({', '.join(type_strs)})>")
+
 
 # ---------------------------------------------------------------------------
 # Multicast reduce-load: multimem.ld_reduce.global.add.v4.f32
@@ -51,7 +65,7 @@ def multimem_ld_reduce_add_v4_f32(mc_addr, *, loc=None, ip=None):
         Tuple of 4 Float32 values (128-bit vector load).
     """
     results = llvm.inline_asm(
-        T.struct([T.f32(), T.f32(), T.f32(), T.f32()]),
+        _llvm_struct(T.f32(), T.f32(), T.f32(), T.f32()),
         [mc_addr.ir_value()],
         "multimem.ld_reduce.global.add.v4.f32 {$0, $1, $2, $3}, [$4];",
         "=f,=f,=f,=f,l",
@@ -148,7 +162,7 @@ def ld_global_v4_f32(addr, *, loc=None, ip=None):
         Tuple of 4 Float32 values.
     """
     results = llvm.inline_asm(
-        T.struct([T.f32(), T.f32(), T.f32(), T.f32()]),
+        _llvm_struct(T.f32(), T.f32(), T.f32(), T.f32()),
         [addr.ir_value()],
         "ld.global.v4.f32 {$0, $1, $2, $3}, [$4];",
         "=f,=f,=f,=f,l",
@@ -257,7 +271,7 @@ def ld_global_v4_b32(addr, *, loc=None, ip=None):
         Tuple of 4 Int32 values (each holding 2 packed bf16).
     """
     results = llvm.inline_asm(
-        T.struct([T.i32(), T.i32(), T.i32(), T.i32()]),
+        _llvm_struct(T.i32(), T.i32(), T.i32(), T.i32()),
         [addr.ir_value()],
         "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
@@ -293,7 +307,7 @@ def bf16x2_to_f32x2(packed_b32, *, loc=None, ip=None):
         Tuple (f32_lo, f32_hi) — the two bf16 values converted to f32.
     """
     results = llvm.inline_asm(
-        T.struct([T.f32(), T.f32()]),
+        _llvm_struct(T.f32(), T.f32()),
         [packed_b32.ir_value()],
         "{.reg .b16 %lo, %hi;mov.b32 {%lo, %hi}, $2;cvt.f32.bf16 $0, %lo;cvt.f32.bf16 $1, %hi;}",
         "=f,=f,r",
