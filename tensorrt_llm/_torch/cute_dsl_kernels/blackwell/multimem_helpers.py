@@ -192,11 +192,13 @@ def barrier_arrive_mc(flag_addr, *, loc=None, ip=None):
     Args:
         flag_addr: Pointer to the int32 flag in multicast memory.
     """
-    # atom.global.add.u32 on multicast address
+    # atom.sys.global.add.u32 — system scope atomic for cross-GPU visibility.
+    # Default (unscoped) atom.global.add defaults to GPU scope in PTX,
+    # which is insufficient for IPC/MNNVL cross-GPU barrier signaling.
     llvm.inline_asm(
         T.i32(),
         [flag_addr.ir_value()],
-        "atom.global.add.u32 $0, [$1], 1;",
+        "atom.relaxed.sys.global.add.u32 $0, [$1], 1;",
         "=r,l",
         has_side_effects=True,
         loc=loc,
@@ -220,10 +222,14 @@ def barrier_try_wait_eq(flag_addr, expected, *, loc=None, ip=None):
     Returns:
         Int32: Current value of the flag.
     """
+    # ld.global.acquire.sys — system scope acquire for cross-GPU visibility.
+    # GPU-scope acquire only orders loads within the same GPU, not across
+    # GPUs. System scope is required to see staging data written by remote
+    # GPUs (after their threadfence_system + barrier arrive).
     result = llvm.inline_asm(
         T.i32(),
         [flag_addr.ir_value()],
-        "ld.global.acquire.gpu.b32 $0, [$1];",
+        "ld.global.acquire.sys.b32 $0, [$1];",
         "=r,l",
         has_side_effects=True,
         loc=loc,
@@ -241,10 +247,12 @@ def barrier_reset(flag_addr, *, loc=None, ip=None):
     Args:
         flag_addr: Pointer to the int32 flag.
     """
+    # st.global.release.sys — system scope release for cross-GPU visibility.
+    # Ensures the zero write is visible to remote GPUs' acquire loads.
     llvm.inline_asm(
         None,
         [flag_addr.ir_value()],
-        "st.global.release.gpu.b32 [$0], 0;",
+        "st.global.release.sys.b32 [$0], 0;",
         "l",
         has_side_effects=True,
         loc=loc,
