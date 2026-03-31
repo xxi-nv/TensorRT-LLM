@@ -795,9 +795,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         staging_mc_ptr = torch.tensor([self._ep_nvls_staging.ptr],
                                       dtype=torch.int64,
                                       device=x.device)
-        out_mc_ptr = torch.tensor([self._ep_nvls_output.ptr],
-                                  dtype=torch.int64,
-                                  device=x.device)
         tile_barrier_mc_ptr = torch.tensor([self._ep_nvls_tile_barriers.ptr],
                                            dtype=torch.int64,
                                            device=x.device)
@@ -806,44 +803,40 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             dtype=torch.int64,
             device=x.device)
 
-        # Rank stride tensors for IPC addressing across ranks
+        # Rank stride for IPC reads of other ranks' staging buffers
         staging_rank_stride = torch.tensor([self._ep_nvls_staging.rank_stride],
                                            dtype=torch.int64,
                                            device=x.device)
-        out_rank_stride = torch.tensor([self._ep_nvls_output.rank_stride],
-                                       dtype=torch.int64,
-                                       device=x.device)
-
-        # Get staging/output as torch tensors for the custom op
-        permuted_m = total_num_padded_tokens.item() if isinstance(
-            total_num_padded_tokens, torch.Tensor) else total_num_padded_tokens
-        n = self.hidden_size
-        staging = self._ep_nvls_staging_tensor[ep_rank, :permuted_m * n].view(
-            permuted_m, n)
 
         # Allocate moe_output if not provided (e.g., AllGather dispatch
         # path where NVLinkOneSided workspace is not available).
         num_tokens = token_selected_experts.size(0)
+        n = self.hidden_size
         if moe_output is None:
             moe_output = torch.zeros(num_tokens,
-                                     self.hidden_size,
+                                     n,
                                      dtype=output_dtype,
                                      device=x.device)
         else:
-            # Zero the moe_output for scatter-add
+            # Zero for scatter-add accumulation in kernel epilogue
             moe_output.zero_()
 
-        # FC2 GEMM with scatter-add epilogue.
-        #
-        # We use world_size=1 so the kernel scatter-adds FC2 results directly
-        # to moe_output at token positions (via permuted_idx_to_expanded_idx).
-        # Each rank only processes its local experts, so moe_output contains
-        # partial contributions.  ConfigurableMoE.combine() handles the
-        # cross-rank ReduceScatter to produce the final output.
-        #
-        # NOTE: The fused AllReduce (world_size>1) is NOT used for EP because
-        # each rank has a different permutation from moe_sort, making row-wise
-        # AllReduce on the staging buffer incorrect.
+        # Staging buffer: [num_tokens, n] (token-indexed layout).
+        # All ranks use the same token_idx mapping (expanded_idx // top_k)
+        # so the staging layout is globally consistent for AllReduce.
+        staging = self._ep_nvls_staging_tensor[ep_rank, :num_tokens * n].view(
+            num_tokens, n)
+
+        # AR warps write reduced output directly to moe_output.
+        # Set out_mc_ptr to moe_output's device pointer, out_rank_stride=0.
+        out_mc_ptr = torch.tensor([moe_output.data_ptr()],
+                                  dtype=torch.int64,
+                                  device=x.device)
+        out_rank_stride = torch.tensor([0], dtype=torch.int64, device=x.device)
+
+        # FC2 GEMM + fused AllReduce.
+        # Epilogue scatter-writes to staging[token_idx, :], then AR warps
+        # reduce across ranks and store directly to moe_output.
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
@@ -868,14 +861,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
-            rank=0,
-            world_size=1,
+            rank=ep_rank,
+            world_size=ep_size,
             output_dtype=output_dtype,
         )
 
-        # Do NOT set _v4_rs_done — let ConfigurableMoE.combine() run.
-        # combine() does the ReduceScatter to sum partial contributions
-        # from all EP ranks and extract each rank's token portion.
+        # Signal ConfigurableMoE.combine() to skip ReduceScatter and
+        # instead extract this rank's portion from the full AllReduced output.
+        self._v4_rs_done = True
 
         return moe_output
 
