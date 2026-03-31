@@ -1371,7 +1371,15 @@ class Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
             if cutlass.const_expr(world_size > 1):
                 # Ensure all staging writes from this CTA are visible
                 # to other GPUs before signaling completion.
+                # ALL epilogue threads must complete threadfence_system()
+                # before thread 0 signals, because each thread's fence
+                # only covers that thread's own stores.
                 threadfence_system()
+                # Barrier ensures all epilogue threads' fences complete
+                # before thread 0 does the atomicAdd. Without this,
+                # thread 0 could signal completion while other threads'
+                # staging writes are not yet visible to remote GPUs.
+                self.epilog_sync_barrier.arrive_and_wait()
                 if epi_tidx == 0:
                     num_ctas_total = get_num_ctas()
                     old_count = atomic_add_return_old(cta_exit_counter_ptr)
