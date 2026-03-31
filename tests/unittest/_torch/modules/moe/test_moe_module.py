@@ -2728,6 +2728,15 @@ def _test_configurable_moe_v4_ep_worker_impl(
             max_num_tokens=test_max_num_tokens,
         )
 
+        # Force AllGatherReduceScatter comm strategy.
+        # V4 EP AllReduce requires globally consistent token ordering across
+        # all ranks (same token at same row in staging). AllGather guarantees
+        # this; NvlinkOneSided A2A does NOT (each rank gets different tokens).
+        # On GB200 the auto-selected strategy is NvlinkOneSided, so we must
+        # force AllGather to exercise the V4 EP code path.
+        old_comm_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
+        os.environ["TRTLLM_FORCE_COMM_METHOD"] = "ALLGATHER"
+
         with create_moe(
             routing_method=routing_method,
             reduce_results=True,
@@ -2773,79 +2782,27 @@ def _test_configurable_moe_v4_ep_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # --- Debug: compare V4 EP vs non-V4 EP (ReduceScatter) ---
-            # Disable V4 EP and run again to isolate the bug
-            import types
-
-            backend = fused_moe.backend
-            orig_should_use = backend._should_use_v4_ep
-
-            backend._should_use_v4_ep = types.MethodType(lambda self: False, backend)
-            with torch.inference_mode():
-                output_non_v4 = fused_moe.forward(
-                    x,
-                    router_logits,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                )
-            torch.cuda.synchronize()
-            # Restore original method
-            backend._should_use_v4_ep = orig_should_use
-
             # Debug output
-            print(f"\n=== RANK {rank} DEBUG V4 EP ===")
-            print(f"output(v4) shape: {output.shape}, ref shape: {ref_output.shape}")
-            print(f"output(non-v4) shape: {output_non_v4.shape}")
-
-            # V4 vs ref
-            diff_v4 = (output.float() - ref_output.float()).abs()
-            print(
-                f"V4 vs ref: abs diff max={diff_v4.max().item():.6f}, "
-                f"mean={diff_v4.mean().item():.6f}"
-            )
-
-            # Non-V4 vs ref
-            diff_nv4 = (output_non_v4.float() - ref_output.float()).abs()
-            print(
-                f"non-V4 vs ref: abs diff max={diff_nv4.max().item():.6f}, "
-                f"mean={diff_nv4.mean().item():.6f}"
-            )
-
-            # V4 vs non-V4
-            diff_v4_nv4 = (output.float() - output_non_v4.float()).abs()
-            print(
-                f"V4 vs non-V4: abs diff max={diff_v4_nv4.max().item():.6f}, "
-                f"mean={diff_v4_nv4.mean().item():.6f}"
-            )
-
-            # Sample values
-            print(f"output(v4)[:3,:5]:\n{output[:3, :5]}")
-            print(f"output(non-v4)[:3,:5]:\n{output_non_v4[:3, :5]}")
+            print(f"\n=== RANK {rank} DEBUG ===")
+            print(f"output shape: {output.shape}, ref shape: {ref_output.shape}")
+            print(f"comm type: {type(fused_moe.comm).__name__}")
+            print(f"v4_active: {fused_moe.backend._should_use_v4_ep()}")
+            diff = (output.float() - ref_output.float()).abs()
+            print(f"abs diff max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
+            print(f"output[:3,:5]:\n{output[:3, :5]}")
             print(f"ref_output[:3,:5]:\n{ref_output[:3, :5]}")
-
-            # Nonzero counts
-            print(f"v4 nonzero: {output.count_nonzero().item()}/{output.numel()}")
-            print(f"non-v4 nonzero: {output_non_v4.count_nonzero().item()}/{output_non_v4.numel()}")
+            print(f"output nonzero: {output.count_nonzero().item()}/{output.numel()}")
             print(f"ref nonzero: {ref_output.count_nonzero().item()}/{ref_output.numel()}")
-
-            # Per-row analysis for first few tokens
-            for t in range(min(4, output.shape[0])):
-                v4_row = output[t].float()
-                nv4_row = output_non_v4[t].float()
-                ref_row = ref_output[t].float()
-                v4_nz = v4_row.count_nonzero().item()
-                nv4_nz = nv4_row.count_nonzero().item()
-                ref_nz = ref_row.count_nonzero().item()
-                print(
-                    f"  token {t}: v4_nz={v4_nz}, nv4_nz={nv4_nz}, ref_nz={ref_nz}, "
-                    f"v4_max={v4_row.abs().max().item():.4f}, "
-                    f"nv4_max={nv4_row.abs().max().item():.4f}, "
-                    f"ref_max={ref_row.abs().max().item():.4f}"
-                )
-
             print(f"=== END RANK {rank} ===\n")
 
             # Check accuracy
             ref_fused_moe.check_accuracy(output, ref_output)
+
+        # Restore env
+        if old_comm_method is None:
+            os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
+        else:
+            os.environ["TRTLLM_FORCE_COMM_METHOD"] = old_comm_method
 
 
 @pytest.mark.skipif(

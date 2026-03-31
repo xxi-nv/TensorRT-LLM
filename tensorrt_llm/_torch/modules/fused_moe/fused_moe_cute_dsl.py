@@ -1017,8 +1017,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             final_hidden_states tensor.
         """
         if self.has_nvfp4:
-            # V4 EP: fused FC2 + AllReduce when EP > 1 and MNNVL is available
-            if self._should_use_v4_ep():
+            # V4 EP: fused FC2 + AllReduce when EP > 1 and MNNVL is available.
+            # V4 EP AllReduce requires globally consistent token ordering across
+            # all ranks (same token at same row in staging). This is guaranteed
+            # by AllGather dispatch but NOT by NvlinkOneSided A2A dispatch,
+            # which gives each rank a different token subset/ordering.
+            # When NvlinkOneSided is used, moe_output is provided from the
+            # workspace (non-None); with AllGather, moe_output is None.
+            if self._should_use_v4_ep() and moe_output is None:
                 return self.run_moe_nvfp4_v4_ep(
                     x=x,
                     token_selected_experts=token_selected_experts,
