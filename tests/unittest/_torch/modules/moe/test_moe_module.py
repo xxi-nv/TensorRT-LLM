@@ -2773,6 +2773,21 @@ def _test_configurable_moe_v4_ep_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
+            # Debug: dump shapes and sample values
+            print(f"\n=== RANK {rank} DEBUG ===")
+            print(f"output shape: {output.shape}, ref shape: {ref_output.shape}")
+            print(f"output dtype: {output.dtype}, ref dtype: {ref_output.dtype}")
+            print(f"output[:3,:5]:\n{output[:3, :5]}")
+            print(f"ref_output[:3,:5]:\n{ref_output[:3, :5]}")
+            diff = (output.float() - ref_output.float()).abs()
+            print(f"abs diff max: {diff.max().item():.6f}, mean: {diff.mean().item():.6f}")
+            print(f"output abs max: {output.float().abs().max().item():.6f}")
+            print(f"ref abs max: {ref_output.float().abs().max().item():.6f}")
+            # Check if output is all zeros
+            print(f"output nonzero count: {output.count_nonzero().item()}/{output.numel()}")
+            print(f"ref nonzero count: {ref_output.count_nonzero().item()}/{ref_output.numel()}")
+            print(f"=== END RANK {rank} ===\n")
+
             # Check accuracy
             ref_fused_moe.check_accuracy(output, ref_output)
 
