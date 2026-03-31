@@ -2197,3 +2197,425 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
     assert finite_out.numel() > 0 and finite_out.abs().max().item() > 0, (
         "AllReduce output has no finite non-zero values"
     )
+
+
+def _test_allreduce_ipc_worker(m, n, k, num_experts, top_k, world_size, ar_strategy):
+    """Worker for real multi-GPU IPC AllReduce test.
+
+    Each MPI rank:
+    1. Sets CUDA device and creates EP mapping
+    2. Allocates MoEEpAllReduceMnnvlMemory (IPC VA mapped across ranks)
+    3. Runs finalize-fusion kernel to get per-rank FC2 output
+    4. Copies FC2 output to rank's staging slice in NVLS memory
+    5. Pre-sets tile barriers, launches 11-warp kernel
+    6. Verifies AR warps correctly reduce across all ranks
+    """
+    try:
+        return _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_strategy)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_strategy):  # noqa: C901
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+
+    from tensorrt_llm._mnnvl_utils import MoEEpAllReduceMnnvlMemory
+    from tensorrt_llm.mapping import Mapping
+
+    rank = mpi_rank()
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # EP mapping: all ranks in one EP group
+    mapping = Mapping(
+        world_size=world_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    mapping.rank = rank
+
+    sf_vec_size = 16
+    tile_size = 128
+    mma_tiler_mn = (128, 128)
+    cluster_shape_mn = (1, 1)
+    scale_k = k // sf_vec_size
+    num_tokens = m // top_k
+    num_tiles = m // tile_size
+    tile_n = mma_tiler_mn[1]
+    num_2d_tiles = num_tiles * (n // tile_n)
+
+    # --- Allocate NVLS IPC memory (synchronized via MPI allgather) ---
+    staging_bytes = m * n * 2  # bf16
+    output_bytes = m * n * 2
+    barrier_bytes = max(num_2d_tiles * 4, 4096)
+
+    staging_mem = MoEEpAllReduceMnnvlMemory(mapping, staging_bytes)
+    output_mem = MoEEpAllReduceMnnvlMemory(mapping, output_bytes)
+    tile_barrier_mem = MoEEpAllReduceMnnvlMemory(mapping, barrier_bytes)
+    completion_barrier_mem = MoEEpAllReduceMnnvlMemory(mapping, barrier_bytes)
+
+    staging_tensor = staging_mem.as_torch_strided_tensor(torch.bfloat16)
+    output_tensor = output_mem.as_torch_strided_tensor(torch.bfloat16)
+    tile_barrier_tensor = tile_barrier_mem.as_torch_strided_tensor(torch.int32)
+
+    ep_comm = MoEEpAllReduceMnnvlMemory.get_comm(mapping)
+    assert ep_comm.Get_size() == world_size, (
+        f"EP communicator size {ep_comm.Get_size()} != world_size {world_size}"
+    )
+
+    # --- Generate per-rank GEMM data and compute FC2 reference output ---
+    with torch.device(device):
+        torch.manual_seed(42 + rank)
+        a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8)
+        b = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
+        a_sf = torch.randint(0, 8, (m * scale_k,), dtype=torch.uint8)
+        b_sf = torch.randint(0, 8, (num_experts, n, scale_k), dtype=torch.uint8)
+        alpha = torch.ones(num_experts, dtype=torch.float32) * 0.1
+
+        tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32) % num_experts
+        tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32)
+        permuted_idx_to_expanded_idx = torch.arange(m, dtype=torch.int32)
+        num_non_exiting_tiles = torch.tensor([num_tiles], dtype=torch.int32)
+        token_final_scales = torch.ones(num_tokens, top_k, dtype=torch.float32)
+
+    # Run finalize-fusion (7-warp) kernel for per-rank reference output
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    make_ptr = cutlass.cute.runtime.make_ptr
+    torch_stream = torch.cuda.current_stream(device)
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    hardware_info = cutlass.utils.HardwareInfo()
+    max_active_clusters = hardware_info.get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
+    ref_output = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+    a_ptr = make_ptr(
+        cutlass.Float4E2M1FN,
+        a.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    b_ptr = make_ptr(
+        cutlass.Float4E2M1FN,
+        b.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    a_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        a_sf.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    b_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        b_sf.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    alpha_ptr = make_ptr(
+        cutlass.Float32,
+        alpha.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    out_ref_ptr = make_ptr(
+        cutlass.BFloat16,
+        ref_output.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    tig_ptr = make_ptr(
+        cutlass.Int32,
+        tile_idx_to_expert_idx.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    tmn_ptr = make_ptr(
+        cutlass.Int32,
+        tile_idx_to_mn_limit.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    pie_ptr = make_ptr(
+        cutlass.Int32,
+        permuted_idx_to_expanded_idx.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    nne_ptr = make_ptr(
+        cutlass.Int32,
+        num_non_exiting_tiles.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+    tfs_ptr = make_ptr(
+        cutlass.Float32,
+        token_final_scales.data_ptr(),
+        cute.AddressSpace.gmem,
+    )
+
+    base_kernel = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+    compiled_base = cute.compile(
+        base_kernel.wrapper,
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        out_ref_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        m,
+        n,
+        k,
+        num_experts,
+        num_tokens,
+        top_k,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+    )
+    compiled_base(
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        out_ref_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        m,
+        n,
+        k,
+        num_experts,
+        num_tokens,
+        top_k,
+        stream=stream,
+    )
+    torch.cuda.synchronize(device)
+
+    # ref_output now holds this rank's FC2 output (scatter-added with scales).
+    # For the IPC reduce test, we need the RAW staging data (before scatter).
+    # Generate simple known patterns for staging instead.
+    torch.manual_seed(100 + rank)
+    staging_data = torch.randn(m * n, dtype=torch.bfloat16, device=device) * 0.01
+    staging_tensor[rank, : m * n].copy_(staging_data)
+    torch.cuda.synchronize(device)
+
+    # MPI barrier: ensure all ranks have written their staging data
+    ep_comm.barrier()
+
+    # --- Pre-set tile barriers and zero output ---
+    output_tensor.zero_()
+    if rank == 0:
+        # Barrier memory is IPC-mapped; rank 0 sets it for all.
+        barrier_view = tile_barrier_tensor[0]
+        barrier_view[:num_2d_tiles] = world_size
+    torch.cuda.synchronize(device)
+    ep_comm.barrier()
+
+    # --- Run 11-warp AllReduce kernel ---
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+
+    # Separate staging buffer for the GEMM epilogue (not the IPC staging)
+    staging_gemm = torch.zeros(m, n, dtype=torch.bfloat16, device=device)
+    out_test = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=device)
+
+    staging_gemm_ptr = make_ptr(
+        cutlass.BFloat16,
+        staging_gemm.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    out_test_ptr = make_ptr(
+        cutlass.BFloat16,
+        out_test.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+
+    # Resolve auto strategy
+    concrete_ar_strategy = ar_strategy
+    if concrete_ar_strategy < 0:
+        total_2d = num_tiles * (n // tile_n)
+        concrete_ar_strategy = 1 if total_2d * world_size >= 256 else 0
+
+    ar_kernel = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        use_blkred=True,
+        raster_along_m=False,
+    )
+    compiled_ar = cute.compile(
+        ar_kernel.wrapper,
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        staging_gemm_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        staging_mem.ptr,  # staging_mc_ptr: IPC base address
+        output_mem.ptr,  # out_mc_ptr: IPC base address
+        tile_barrier_mem.ptr,  # tile_barrier_mc_ptr
+        completion_barrier_mem.ptr,  # completion_barrier_mc_ptr
+        staging_mem.rank_stride,  # staging_rank_stride
+        output_mem.rank_stride,  # out_rank_stride
+        out_test_ptr,
+        m,
+        n,
+        k,
+        num_experts,
+        num_tokens,
+        top_k,
+        rank,  # Constexpr: this rank
+        world_size,  # Constexpr
+        concrete_ar_strategy,  # Constexpr
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+    )
+    compiled_ar(
+        a_ptr,
+        b_ptr,
+        a_sf_ptr,
+        b_sf_ptr,
+        staging_gemm_ptr,
+        alpha_ptr,
+        tig_ptr,
+        tmn_ptr,
+        pie_ptr,
+        nne_ptr,
+        tfs_ptr,
+        staging_mem.ptr,
+        output_mem.ptr,
+        tile_barrier_mem.ptr,
+        completion_barrier_mem.ptr,
+        staging_mem.rank_stride,
+        output_mem.rank_stride,
+        out_test_ptr,
+        m,
+        n,
+        k,
+        num_experts,
+        num_tokens,
+        top_k,
+        stream=stream,
+    )
+    torch.cuda.synchronize(device)
+    ep_comm.barrier()
+
+    # --- Verify: AR output in this rank's NVLS output slice ---
+    ar_output = output_tensor[rank, : m * n].clone().view(m, n)
+
+    # Compute expected: sum of ALL ranks' staging data
+    expected = torch.zeros(m, n, dtype=torch.float32, device=device)
+    for r in range(world_size):
+        rank_staging = staging_tensor[r, : m * n].view(m, n)
+        expected += rank_staging.float()
+    expected_bf16 = expected.to(torch.bfloat16)
+
+    max_diff = torch.nan_to_num(ar_output - expected_bf16).abs().max().item()
+    assert torch.allclose(ar_output, expected_bf16, atol=1e-2, rtol=1e-2), (
+        f"Rank {rank}: IPC AllReduce output mismatch: "
+        f"max_diff={max_diff}, "
+        f"nan_ar={ar_output.isnan().sum().item()}, "
+        f"nan_ref={expected_bf16.isnan().sum().item()}"
+    )
+
+    finite_out = ar_output[ar_output.isfinite()]
+    assert finite_out.numel() > 0 and finite_out.abs().max().item() > 0, (
+        f"Rank {rank}: AllReduce output has no finite non-zero values"
+    )
+
+    return None
+
+
+@pytest.mark.parametrize(
+    "m,n,k,num_experts,top_k,world_size,ar_strategy",
+    [
+        (256, 2048, 2048, 8, 2, 2, 0),
+        (256, 2048, 2048, 8, 2, 2, 1),
+    ],
+)
+def test_allreduce_kernel_real_ipc(m, n, k, num_experts, top_k, world_size, ar_strategy):
+    """Test 11-warp kernel with REAL IPC AllReduce on multiple GPUs.
+
+    Requires MPI launch with enough ranks:
+      mpirun -n 3 pytest -k test_allreduce_kernel_real_ipc
+
+    Each rank:
+    1. Allocates MoEEpAllReduceMnnvlMemory (cross-rank IPC via fabric handles)
+    2. Writes rank-specific staging data to its NVLS slice
+    3. Pre-sets tile barriers, launches the 11-warp kernel
+    4. Verifies AR warps correctly reduce across all ranks via IPC
+    """
+    import cutlass
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("Requires SM 100/103 (Blackwell)")
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+
+    if not Sm100BlockScaledContiguousGroupedGemmAllReduceKernel.can_implement(
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        out_dtype=cutlass.BFloat16,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        m=m,
+        n=n,
+        k=k,
+        l=num_experts,
+        a_major="k",
+        b_major="k",
+        out_major="n",
+    ):
+        pytest.skip("Cannot implement this config")
+
+    def init_worker(custom_paths):
+        for custom_path in custom_paths:
+            if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
+                sys.path.append(custom_path)
+
+    with MPIPoolExecutor(
+        initializer=init_worker,
+        initargs=(sys.path,),
+        max_workers=world_size,
+    ) as executor:
+        results = list(
+            executor.map(
+                _test_allreduce_ipc_worker,
+                *zip(*[(m, n, k, num_experts, top_k, world_size, ar_strategy)] * world_size),
+            )
+        )
+        for r in results:
+            assert r is None

@@ -437,11 +437,17 @@ class MoEEpAllReduceMnnvlMemory(MnnvlMemory):
 
     @classmethod
     def get_comm(cls, mapping: Mapping):
-        """Get EP-based communicator (ranks in same EP group)."""
+        """Get EP-based communicator (ranks in same EP group).
+
+        All EP ranks that share the same (pp_rank, moe_tp_rank) position
+        must be in the same communicator so they can exchange IPC fabric
+        handles via MPI allgather.  Using moe_tp_size/moe_tp_rank (instead
+        of tp_size/tp_rank) ensures EP ranks are grouped together.
+        """
         if cls.comm is not None:
             return cls.comm
         comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
+            mapping.pp_rank * mapping.moe_tp_size + mapping.moe_tp_rank,
             mapping.moe_ep_rank,
         )
         cls.comm = comm

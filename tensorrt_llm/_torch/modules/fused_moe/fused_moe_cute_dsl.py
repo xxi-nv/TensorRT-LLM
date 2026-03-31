@@ -810,7 +810,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         permuted_m = total_num_padded_tokens.item() if isinstance(
             total_num_padded_tokens, torch.Tensor) else total_num_padded_tokens
         n = self.hidden_size
-        staging = self._ep_nvls_staging_tensor[0, :permuted_m * n].view(
+        staging = self._ep_nvls_staging_tensor[ep_rank, :permuted_m * n].view(
             permuted_m, n)
 
         # Zero the moe_output for scatter-add
