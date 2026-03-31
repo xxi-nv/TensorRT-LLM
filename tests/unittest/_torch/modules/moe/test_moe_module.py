@@ -2773,19 +2773,75 @@ def _test_configurable_moe_v4_ep_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # Debug: dump shapes and sample values
-            print(f"\n=== RANK {rank} DEBUG ===")
-            print(f"output shape: {output.shape}, ref shape: {ref_output.shape}")
-            print(f"output dtype: {output.dtype}, ref dtype: {ref_output.dtype}")
-            print(f"output[:3,:5]:\n{output[:3, :5]}")
+            # --- Debug: compare V4 EP vs non-V4 EP (ReduceScatter) ---
+            # Disable V4 EP and run again to isolate the bug
+            import types
+
+            backend = fused_moe.backend
+            orig_should_use = backend._should_use_v4_ep
+
+            backend._should_use_v4_ep = types.MethodType(lambda self: False, backend)
+            with torch.inference_mode():
+                output_non_v4 = fused_moe.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+            # Restore original method
+            backend._should_use_v4_ep = orig_should_use
+
+            # Debug output
+            print(f"\n=== RANK {rank} DEBUG V4 EP ===")
+            print(f"output(v4) shape: {output.shape}, ref shape: {ref_output.shape}")
+            print(f"output(non-v4) shape: {output_non_v4.shape}")
+
+            # V4 vs ref
+            diff_v4 = (output.float() - ref_output.float()).abs()
+            print(
+                f"V4 vs ref: abs diff max={diff_v4.max().item():.6f}, "
+                f"mean={diff_v4.mean().item():.6f}"
+            )
+
+            # Non-V4 vs ref
+            diff_nv4 = (output_non_v4.float() - ref_output.float()).abs()
+            print(
+                f"non-V4 vs ref: abs diff max={diff_nv4.max().item():.6f}, "
+                f"mean={diff_nv4.mean().item():.6f}"
+            )
+
+            # V4 vs non-V4
+            diff_v4_nv4 = (output.float() - output_non_v4.float()).abs()
+            print(
+                f"V4 vs non-V4: abs diff max={diff_v4_nv4.max().item():.6f}, "
+                f"mean={diff_v4_nv4.mean().item():.6f}"
+            )
+
+            # Sample values
+            print(f"output(v4)[:3,:5]:\n{output[:3, :5]}")
+            print(f"output(non-v4)[:3,:5]:\n{output_non_v4[:3, :5]}")
             print(f"ref_output[:3,:5]:\n{ref_output[:3, :5]}")
-            diff = (output.float() - ref_output.float()).abs()
-            print(f"abs diff max: {diff.max().item():.6f}, mean: {diff.mean().item():.6f}")
-            print(f"output abs max: {output.float().abs().max().item():.6f}")
-            print(f"ref abs max: {ref_output.float().abs().max().item():.6f}")
-            # Check if output is all zeros
-            print(f"output nonzero count: {output.count_nonzero().item()}/{output.numel()}")
-            print(f"ref nonzero count: {ref_output.count_nonzero().item()}/{ref_output.numel()}")
+
+            # Nonzero counts
+            print(f"v4 nonzero: {output.count_nonzero().item()}/{output.numel()}")
+            print(f"non-v4 nonzero: {output_non_v4.count_nonzero().item()}/{output_non_v4.numel()}")
+            print(f"ref nonzero: {ref_output.count_nonzero().item()}/{ref_output.numel()}")
+
+            # Per-row analysis for first few tokens
+            for t in range(min(4, output.shape[0])):
+                v4_row = output[t].float()
+                nv4_row = output_non_v4[t].float()
+                ref_row = ref_output[t].float()
+                v4_nz = v4_row.count_nonzero().item()
+                nv4_nz = nv4_row.count_nonzero().item()
+                ref_nz = ref_row.count_nonzero().item()
+                print(
+                    f"  token {t}: v4_nz={v4_nz}, nv4_nz={nv4_nz}, ref_nz={ref_nz}, "
+                    f"v4_max={v4_row.abs().max().item():.4f}, "
+                    f"nv4_max={nv4_row.abs().max().item():.4f}, "
+                    f"ref_max={ref_row.abs().max().item():.4f}"
+                )
+
             print(f"=== END RANK {rank} ===\n")
 
             # Check accuracy
