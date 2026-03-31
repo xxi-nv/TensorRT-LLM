@@ -882,7 +882,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # be out-of-range.  Filter to only valid (non-padding) rows.
             expanded_idx = permuted_idx_to_expanded_idx[:permuted_m]
             token_idx = expanded_idx // effective_top_k
-            valid_mask = token_idx < num_tokens
+            valid_mask = (token_idx >= 0) & (token_idx < num_tokens)
             token_idx_valid = token_idx[valid_mask]
             nvls_out_valid = nvls_out[valid_mask]
 
