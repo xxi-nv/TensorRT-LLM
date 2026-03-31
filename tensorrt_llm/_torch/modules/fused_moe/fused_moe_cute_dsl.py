@@ -786,10 +786,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
         )
 
-        # Zero staging and barrier buffers
-        self._ep_nvls_staging_tensor.zero_()
-        self._ep_nvls_tile_barrier_tensor.zero_()
-        self._ep_nvls_completion_barrier_tensor.zero_()
+        # Zero only THIS rank's NVLS staging and barrier buffers.
+        # The NVLS tensor has shape [num_ranks, segment_elems] and is backed
+        # by IPC memory, so .zero_() on the full tensor would write zeros to
+        # ALL ranks' memory via IPC, causing a cross-GPU data race when
+        # ranks execute independently (rank A's memset can clobber rank B's
+        # kernel output).  Indexing by ep_rank restricts the memset to this
+        # rank's local segment only.
+        self._ep_nvls_staging_tensor[ep_rank].zero_()
+        self._ep_nvls_tile_barrier_tensor[ep_rank].zero_()
+        self._ep_nvls_completion_barrier_tensor[ep_rank].zero_()
 
         # Create pointer tensors (1-element int64) for passing raw ptrs to custom op
         staging_mc_ptr = torch.tensor([self._ep_nvls_staging.ptr],
