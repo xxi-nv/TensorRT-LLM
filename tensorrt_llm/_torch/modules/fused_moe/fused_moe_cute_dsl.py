@@ -455,9 +455,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         top_k = self.routing_method.top_k
         ep_size = self.mapping.moe_ep_size
         tile_size = 128  # default CTA tile M
+        num_local_experts = self.expert_size_per_partition
 
         # Staging buffer: [max_permuted_m, hidden_size] in bf16
-        max_permuted_m = max_num_tokens * ep_size * top_k
+        # moe_sort pads each expert group to tile_size boundary, so the
+        # total padded rows = expanded_rows + num_local_experts * tile_size
+        # (worst case: each expert gets tile_size - 1 padding rows).
+        max_expanded = max_num_tokens * ep_size * top_k
+        max_permuted_m = max_expanded + num_local_experts * tile_size
         # Align to tile_size for clean tile boundaries
         max_permuted_m = (
             (max_permuted_m + tile_size - 1) // tile_size) * tile_size
@@ -473,9 +478,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self.mapping, output_bytes)
         self._ep_nvls_output_ipc_ptrs = self._ep_nvls_output.get_ipc_ptrs()
 
-        # Tile barriers: one int32 flag per tile
-        max_tiles = max_permuted_m // tile_size
-        barrier_bytes = max_tiles * 4  # 4 bytes per int32 flag
+        # Tile barriers: one int32 flag per 2D tile (M-tiles x N-tiles)
+        tile_n = 128  # MMA tile N dimension
+        max_m_tiles = max_permuted_m // tile_size
+        max_n_tiles = (self.hidden_size + tile_n - 1) // tile_n
+        max_2d_tiles = max_m_tiles * max_n_tiles
+        barrier_bytes = max_2d_tiles * 4  # 4 bytes per int32 flag
         # Align to page size
         barrier_bytes = max(barrier_bytes, 4096)
 
