@@ -2681,7 +2681,9 @@ def _test_configurable_moe_v4_ep_worker_impl(
         torch.cuda.manual_seed(0)
 
         # Create routing method and input tensors
-        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, num_experts=num_experts)
+        routing_method = _create_routing_method(
+            RenormalizeMoeRoutingMethod, top_k=top_k, num_experts=num_experts, dtype=dtype
+        )
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
         router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
 
