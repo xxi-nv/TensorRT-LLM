@@ -1744,6 +1744,9 @@ def test_allreduce_kernel_single_gpu(m, n, k, l, top_k):  # noqa: E741
         (256, 2048, 2048, 8, 2, 2, 1),
         (512, 2048, 2048, 8, 2, 4, 0),
         (512, 2048, 2048, 8, 2, 4, 1),
+        # Auto-select: M=256 should pick strategy 0, M=512/ws=4 picks 1
+        (256, 2048, 2048, 8, 2, 2, -1),
+        (512, 2048, 2048, 8, 2, 4, -1),
     ],
 )
 def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):  # noqa: E741
@@ -2102,6 +2105,11 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
     )
 
     rank_val = 0
+    # Resolve auto strategy (-1) to a concrete value for cute.compile()
+    if ar_strategy < 0:
+        tile_n = mma_tiler_mn[1]
+        total_2d = num_tiles * (n // tile_n)
+        ar_strategy = 1 if total_2d * world_size >= 256 else 0
     compiled_ar = cute.compile(
         ar_kernel.wrapper,
         a_ptr,
