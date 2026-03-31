@@ -1799,9 +1799,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 l,
                 num_tokens,
                 self.top_k,
-                self.rank,
-                self.world_size,
-                self.ar_strategy,
                 stream=stream,
             )
             return out
