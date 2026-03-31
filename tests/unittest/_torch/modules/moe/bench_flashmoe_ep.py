@@ -16,16 +16,20 @@
 Benchmark for FlashMoE fused GEMM+AllReduce kernel strategies.
 
 Modes:
-  kernel:   Single-GPU overhead: 7-warp base vs 11-warp (world_size=1)
-  strategy: Simulated multi-GPU: compare AR strategy 0 (batch) vs 1 (overlapped)
+  kernel:    Single-GPU overhead: 7-warp base vs 11-warp (world_size=1)
+  strategy:  Simulated multi-GPU: compare AR strategy 0 (batch) vs 1 (overlapped)
+  ipc:       Real multi-GPU IPC: uses MoEEpAllReduceMnnvlMemory for cross-GPU AllReduce
+  ipc_sweep: Multi-config sweep with real IPC
 
 Usage:
   python bench_flashmoe_ep.py --mode kernel --m 1024 --n 7168 --k 2048 --experts 8
   python bench_flashmoe_ep.py --mode strategy --m 1024 --n 7168 --k 2048 --experts 8 --world_size 2
   python bench_flashmoe_ep.py --mode strategy --m 1024 --n 7168 --k 2048 --experts 8 --world_size 4
-
-Multi-config sweep:
   python bench_flashmoe_ep.py --mode sweep
+
+Real IPC (requires MPI launch, e.g., NTASKS=3 for 2 GPUs + 1 controller):
+  mpirun -n 3 python bench_flashmoe_ep.py --mode ipc --m 1024 --n 7168 --k 2048 --experts 8
+  mpirun -n 5 python bench_flashmoe_ep.py --mode ipc_sweep
 """
 
 import argparse
@@ -543,14 +547,369 @@ def bench_sweep(warmup=5, iters=50):
         print("=" * 80)
 
 
+def _bench_ipc_worker(m, n, k, num_experts, top_k, world_size, warmup, iters):
+    """MPI worker: benchmark 11-warp kernel with real IPC AllReduce.
+
+    Each rank allocates MoEEpAllReduceMnnvlMemory, runs the kernel with
+    actual IPC pointers, and measures real cross-GPU AllReduce latency.
+    """
+    try:
+        return _bench_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, warmup, iters)
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+
+def _bench_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, warmup, iters):
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+
+    from tensorrt_llm._mnnvl_utils import MoEEpAllReduceMnnvlMemory
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_allreduce import (
+        Sm100BlockScaledContiguousGroupedGemmAllReduceKernel,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    try:
+        from mpi4py.MPI import COMM_WORLD
+    except ImportError:
+        print("mpi4py not available, cannot run IPC benchmark")
+        return None
+
+    rank = COMM_WORLD.Get_rank()
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # EP mapping: all ranks in one EP group
+    mapping = Mapping(
+        world_size=world_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    mapping.rank = rank
+
+    sf_vec_size = 16
+    tile_size = 128
+    mma_tiler_mn = (128, 128)
+    cluster_shape_mn = (1, 1)
+    scale_k = k // sf_vec_size
+    num_tokens = m // top_k
+    num_tiles = m // tile_size
+    tile_n = mma_tiler_mn[1]
+    num_2d_tiles = num_tiles * (n // tile_n)
+
+    # Allocate NVLS IPC memory (cross-rank fabric handles via MPI allgather)
+    staging_bytes = m * n * 2  # bf16
+    output_bytes = m * n * 2
+    barrier_bytes = max(num_2d_tiles * 4, 4096)
+
+    staging_mem = MoEEpAllReduceMnnvlMemory(mapping, staging_bytes)
+    output_mem = MoEEpAllReduceMnnvlMemory(mapping, output_bytes)
+    tile_barrier_mem = MoEEpAllReduceMnnvlMemory(mapping, barrier_bytes)
+    completion_barrier_mem = MoEEpAllReduceMnnvlMemory(mapping, barrier_bytes)
+
+    staging_tensor = staging_mem.as_torch_strided_tensor(torch.bfloat16)
+    output_tensor = output_mem.as_torch_strided_tensor(torch.bfloat16)
+    tile_barrier_tensor = tile_barrier_mem.as_torch_strided_tensor(torch.int32)
+
+    ep_comm = MoEEpAllReduceMnnvlMemory.get_comm(mapping)
+
+    # Generate per-rank GEMM data
+    with torch.device(device):
+        torch.manual_seed(42 + rank)
+        a = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8)
+        b = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
+        a_sf = torch.randint(0, 8, (m * scale_k,), dtype=torch.uint8)
+        b_sf = torch.randint(0, 8, (num_experts, n, scale_k), dtype=torch.uint8)
+        alpha = torch.ones(num_experts, dtype=torch.float32) * 0.1
+        tile_idx_to_expert_idx = torch.arange(num_tiles, dtype=torch.int32) % num_experts
+        tile_idx_to_mn_limit = torch.full((num_tiles,), m, dtype=torch.int32)
+        permuted_idx = torch.arange(m, dtype=torch.int32)
+        num_non_exit = torch.tensor([num_tiles], dtype=torch.int32)
+        token_scales = torch.ones(num_tokens, top_k, dtype=torch.float32)
+        staging_gemm = torch.zeros(m, n, dtype=torch.bfloat16)
+        out_test = torch.zeros(num_tokens, n, dtype=torch.bfloat16)
+
+    # Populate staging with known data for each rank
+    torch.manual_seed(100 + rank)
+    staging_data = torch.randn(m * n, dtype=torch.bfloat16, device=device) * 0.01
+    staging_tensor[rank, : m * n].copy_(staging_data)
+    torch.cuda.synchronize(device)
+    ep_comm.barrier()
+
+    make_ptr = cutlass.cute.runtime.make_ptr
+    torch_stream = torch.cuda.current_stream(device)
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    hw = cutlass.utils.HardwareInfo()
+    max_clusters = hw.get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1])
+
+    a_ptr = make_ptr(cutlass.Float4E2M1FN, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+    b_ptr = make_ptr(cutlass.Float4E2M1FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+    a_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN, a_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    b_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN, b_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    tig_ptr = make_ptr(cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem)
+    tmn_ptr = make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem)
+    pie_ptr = make_ptr(cutlass.Int32, permuted_idx.data_ptr(), cute.AddressSpace.gmem)
+    nne_ptr = make_ptr(cutlass.Int32, num_non_exit.data_ptr(), cute.AddressSpace.gmem)
+    tfs_ptr = make_ptr(cutlass.Float32, token_scales.data_ptr(), cute.AddressSpace.gmem)
+    stg_ptr = make_ptr(
+        cutlass.BFloat16, staging_gemm.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    out_ptr = make_ptr(
+        cutlass.BFloat16, out_test.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+
+    results = {}
+    for strategy in [0, 1]:
+        # Compile kernel for this strategy
+        ar_kernel = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_blkred=True,
+            raster_along_m=False,
+        )
+        compile_args = [
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            stg_ptr,
+            alpha_ptr,
+            tig_ptr,
+            tmn_ptr,
+            pie_ptr,
+            nne_ptr,
+            tfs_ptr,
+            staging_mem.ptr,
+            output_mem.ptr,
+            tile_barrier_mem.ptr,
+            completion_barrier_mem.ptr,
+            staging_mem.rank_stride,
+            output_mem.rank_stride,
+            out_ptr,
+            m,
+            n,
+            k,
+            num_experts,
+            num_tokens,
+            top_k,
+            rank,
+            world_size,
+            strategy,
+        ]
+        compiled = cute.compile(
+            ar_kernel.wrapper,
+            *compile_args,
+            tile_size=tile_size,
+            scaling_vector_size=sf_vec_size,
+            max_active_clusters=max_clusters,
+            stream=stream,
+        )
+        # Runtime args (Constexpr rank/world_size/strategy are baked in)
+        run_args = [
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            stg_ptr,
+            alpha_ptr,
+            tig_ptr,
+            tmn_ptr,
+            pie_ptr,
+            nne_ptr,
+            tfs_ptr,
+            staging_mem.ptr,
+            output_mem.ptr,
+            tile_barrier_mem.ptr,
+            completion_barrier_mem.ptr,
+            staging_mem.rank_stride,
+            output_mem.rank_stride,
+            out_ptr,
+            m,
+            n,
+            k,
+            num_experts,
+            num_tokens,
+            top_k,
+        ]
+
+        # Warmup (all ranks synchronize between iterations via barrier)
+        for _ in range(warmup):
+            # Reset staging + barriers
+            staging_tensor[rank, : m * n].copy_(staging_data)
+            output_tensor.zero_()
+            torch.cuda.synchronize(device)
+            ep_comm.barrier()
+            if rank == 0:
+                barrier_view = tile_barrier_tensor[0]
+                barrier_view[:num_2d_tiles] = world_size
+            torch.cuda.synchronize(device)
+            ep_comm.barrier()
+            compiled(*run_args, stream=stream)
+            torch.cuda.synchronize(device)
+            ep_comm.barrier()
+
+        # Timed runs
+        times_ms = []
+        for _ in range(iters):
+            # Reset barriers and staging for each iteration
+            staging_tensor[rank, : m * n].copy_(staging_data)
+            output_tensor.zero_()
+            torch.cuda.synchronize(device)
+            ep_comm.barrier()
+            if rank == 0:
+                barrier_view = tile_barrier_tensor[0]
+                barrier_view[:num_2d_tiles] = world_size
+            torch.cuda.synchronize(device)
+            ep_comm.barrier()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            compiled(*run_args, stream=stream)
+            end.record()
+            torch.cuda.synchronize(device)
+            times_ms.append(start.elapsed_time(end))
+            ep_comm.barrier()
+
+        avg_ms = sum(times_ms) / len(times_ms)
+        median_ms = sorted(times_ms)[len(times_ms) // 2]
+        min_ms = min(times_ms)
+        results[strategy] = {
+            "avg": avg_ms,
+            "median": median_ms,
+            "min": min_ms,
+        }
+        if rank == 0:
+            sname = "batch" if strategy == 0 else "overlapped"
+            print(
+                f"    Strategy {strategy} ({sname:>10}): "
+                f"avg={avg_ms:.3f}ms  median={median_ms:.3f}ms  min={min_ms:.3f}ms"
+            )
+
+    if rank == 0 and len(results) == 2:
+        s0_avg = results[0]["avg"]
+        s1_avg = results[1]["avg"]
+        faster = 0 if s0_avg < s1_avg else 1
+        slower = 1 - faster
+        speedup = results[slower]["avg"] / results[faster]["avg"]
+        fname = "batch" if faster == 0 else "overlapped"
+        print(f"    Winner: strategy {faster} ({fname}), {speedup:.2f}x faster")
+
+    return results if rank == 0 else None
+
+
+def bench_ipc(m, n, k, num_experts, top_k, world_size, warmup=10, iters=50):
+    """Launch real IPC benchmark via MPIPoolExecutor."""
+
+    from mpi4py.futures import MPIPoolExecutor
+
+    if world_size is None:
+        world_size = min(torch.cuda.device_count(), 4)
+
+    print(
+        f"\n=== Real IPC Benchmark: M={m}, N={n}, K={k}, L={num_experts}, world_size={world_size} ==="
+    )
+    print(f"    warmup={warmup}, iters={iters}")
+
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = list(
+            executor.map(
+                _bench_ipc_worker,
+                *zip(*[(m, n, k, num_experts, top_k, world_size, warmup, iters)] * world_size),
+            )
+        )
+    # Only rank 0 returns non-None
+    return next((r for r in results if r is not None), None)
+
+
+def bench_ipc_sweep(warmup=5, iters=30):
+    """Multi-config sweep with real IPC AllReduce."""
+
+    from mpi4py.futures import MPIPoolExecutor
+
+    world_size = min(torch.cuda.device_count(), 4)
+
+    configs = [
+        # (m, n, k, num_experts, top_k)
+        (256, 2048, 2048, 8, 2),
+        (512, 2048, 2048, 8, 2),
+        (1024, 2048, 2048, 8, 2),
+        (1024, 7168, 2048, 8, 2),
+        (2048, 7168, 2048, 8, 2),
+        (4096, 7168, 2048, 64, 8),
+    ]
+
+    print("=" * 90)
+    print(f"FlashMoE Real IPC AllReduce Sweep  (world_size={world_size})")
+    print("=" * 90)
+
+    all_results = []
+    for c_m, c_n, c_k, c_exp, c_topk in configs:
+        print(f"\n=== M={c_m}, N={c_n}, K={c_k}, L={c_exp}, top_k={c_topk}, ws={world_size} ===")
+
+        with MPIPoolExecutor(max_workers=world_size) as executor:
+            results = list(
+                executor.map(
+                    _bench_ipc_worker,
+                    *zip(*[(c_m, c_n, c_k, c_exp, c_topk, world_size, warmup, iters)] * world_size),
+                )
+            )
+        r = next((x for x in results if x is not None), None)
+        if r:
+            all_results.append((c_m, c_n, c_k, c_exp, c_topk, world_size, r))
+
+    # Summary table
+    if all_results:
+        print("\n" + "=" * 90)
+        print(
+            f"{'M':>6} {'N':>6} {'K':>6} {'L':>4} {'k':>2} {'ws':>3} "
+            f"{'S0_avg':>8} {'S1_avg':>8} {'S0_med':>8} {'S1_med':>8} "
+            f"{'Winner':>10} {'Speedup':>8}"
+        )
+        print("-" * 90)
+        for c_m, c_n, c_k, c_exp, c_topk, c_ws, r in all_results:
+            s0 = r.get(0, {})
+            s1 = r.get(1, {})
+            s0_avg = s0.get("avg", 0)
+            s1_avg = s1.get("avg", 0)
+            s0_med = s0.get("median", 0)
+            s1_med = s1.get("median", 0)
+            if s0_avg > 0 and s1_avg > 0:
+                faster = 0 if s0_avg < s1_avg else 1
+                speedup = max(s0_avg, s1_avg) / min(s0_avg, s1_avg)
+                fname = "batch" if faster == 0 else "overlap"
+                print(
+                    f"{c_m:>6} {c_n:>6} {c_k:>6} {c_exp:>4} "
+                    f"{c_topk:>2} {c_ws:>3} "
+                    f"{s0_avg:>8.3f} {s1_avg:>8.3f} "
+                    f"{s0_med:>8.3f} {s1_med:>8.3f} "
+                    f"{fname:>10} {speedup:>7.2f}x"
+                )
+        print("=" * 90)
+
+
 def main():
     parser = argparse.ArgumentParser(description="FlashMoE EP benchmark")
     parser.add_argument(
         "--mode",
         type=str,
         default="kernel",
-        choices=["kernel", "strategy", "sweep"],
-        help="kernel: overhead test, strategy: compare S0 vs S1, sweep: multi-config",
+        choices=["kernel", "strategy", "sweep", "ipc", "ipc_sweep"],
+        help="kernel: overhead test, strategy: simulated multi-GPU, "
+        "sweep: multi-config simulated, ipc: real IPC multi-GPU, "
+        "ipc_sweep: multi-config real IPC",
     )
     parser.add_argument("--m", type=int, default=1024)
     parser.add_argument("--n", type=int, default=7168)
@@ -588,6 +947,19 @@ def main():
         )
     elif args.mode == "sweep":
         bench_sweep(warmup=args.warmup, iters=args.iters)
+    elif args.mode == "ipc":
+        bench_ipc(
+            m=args.m,
+            n=args.n,
+            k=args.k,
+            num_experts=args.experts,
+            top_k=args.top_k,
+            world_size=args.world_size,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    elif args.mode == "ipc_sweep":
+        bench_ipc_sweep(warmup=args.warmup, iters=args.iters)
 
 
 if __name__ == "__main__":

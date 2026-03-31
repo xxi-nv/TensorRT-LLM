@@ -2730,10 +2730,15 @@ def _test_configurable_moe_v4_ep_worker_impl(
             # Check V4 is actually active
             sm_version = get_sm_version()
             v4_expected = sm_version in (100, 103) and MnnvlMemory.supports_mnnvl()
-            v4_active = fused_moe.backend._should_use_v4_ep()
+            backend = fused_moe.backend
+            has_mapping = hasattr(backend, "mapping")
+            ep_size = backend.mapping.moe_ep_size if has_mapping else -1
+            v4_active = backend._should_use_v4_ep()
             assert v4_active == v4_expected, (
                 f"V4 EP active={v4_active} but expected={v4_expected} "
-                f"(SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()})"
+                f"(SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()}, "
+                f"has_mapping={has_mapping}, ep_size={ep_size}, "
+                f"backend_cls={type(backend).__name__})"
             )
             if not v4_active:
                 pytest.skip(
