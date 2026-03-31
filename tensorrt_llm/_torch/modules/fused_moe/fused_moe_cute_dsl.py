@@ -450,7 +450,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Args:
             max_num_tokens: Maximum number of tokens per rank (for buffer sizing).
         """
-        from ..._mnnvl_utils import MoEEpAllReduceMnnvlMemory
+        from ...._mnnvl_utils import MoEEpAllReduceMnnvlMemory
 
         top_k = self.routing_method.top_k
         ep_size = self.mapping.moe_ep_size
@@ -975,7 +975,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if sm_version not in (100, 103):
             return False
         try:
-            from ..._mnnvl_utils import MnnvlMemory
+            from ...._mnnvl_utils import MnnvlMemory
             return MnnvlMemory.supports_mnnvl()
         except Exception:
             return False
