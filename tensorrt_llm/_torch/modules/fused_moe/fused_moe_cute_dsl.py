@@ -833,11 +833,17 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # Zero the moe_output for scatter-add
             moe_output.zero_()
 
-        # FC2 + AllReduce: fused 11-warp kernel
-        # When world_size > 1, the AR warps reduce across ranks via IPC and
-        # write reduced results to the NVLS output buffer in permuted order.
-        # When world_size == 1, AR warps no-op and epilogue scatter-adds
-        # directly to moe_output.
+        # FC2 GEMM with scatter-add epilogue.
+        #
+        # We use world_size=1 so the kernel scatter-adds FC2 results directly
+        # to moe_output at token positions (via permuted_idx_to_expanded_idx).
+        # Each rank only processes its local experts, so moe_output contains
+        # partial contributions.  ConfigurableMoE.combine() handles the
+        # cross-rank ReduceScatter to produce the final output.
+        #
+        # NOTE: The fused AllReduce (world_size>1) is NOT used for EP because
+        # each rank has a different permutation from moe_sort, making row-wise
+        # AllReduce on the staging buffer incorrect.
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
@@ -862,37 +868,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
-            rank=ep_rank,
-            world_size=ep_size,
+            rank=0,
+            world_size=1,
             output_dtype=output_dtype,
         )
 
-        # Post-AR scatter: when world_size > 1, the AR warps wrote reduced
-        # results to the NVLS output buffer in permuted order. Scatter-add
-        # them to moe_output at the correct token positions.
-        if ep_size > 1:
-            nvls_out_flat = self._ep_nvls_output_tensor[ep_rank, :permuted_m *
-                                                        n]
-            nvls_out = nvls_out_flat.view(permuted_m, n)
-
-            # permuted_idx_to_expanded_idx maps permuted_row → expanded_idx
-            # expanded_idx = token_idx * effective_top_k + topk_slot
-            # NOTE: moe_sort pads each expert group to tile_size boundary.
-            # Padding rows have uninitialized expanded_idx values that can
-            # be out-of-range.  Filter to only valid (non-padding) rows.
-            expanded_idx = permuted_idx_to_expanded_idx[:permuted_m]
-            token_idx = expanded_idx // effective_top_k
-            valid_mask = (token_idx >= 0) & (token_idx < num_tokens)
-            token_idx_valid = token_idx[valid_mask]
-            nvls_out_valid = nvls_out[valid_mask]
-
-            # Scatter-add: handles duplicate token indices (multiple
-            # top_k slots mapping to the same token) correctly.
-            moe_output.index_add_(0, token_idx_valid, nvls_out_valid)
-
-        # Signal that the fused ReduceScatter is done, so ConfigurableMoE
-        # can skip calling comm.combine().
-        self._v4_rs_done = True
+        # Do NOT set _v4_rs_done — let ConfigurableMoE.combine() run.
+        # combine() does the ReduceScatter to sum partial contributions
+        # from all EP ranks and extract each rank's token portion.
 
         return moe_output
 
