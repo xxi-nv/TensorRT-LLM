@@ -244,6 +244,9 @@ def run_single_gpu_test(
         0,  # out_mc_ptr
         0,  # tile_barrier_mc_ptr
         0,  # completion_barrier_mc_ptr
+        0,  # staging_rank_stride
+        0,  # out_rank_stride
+        0,  # cta_exit_counter_ptr
         cutlass.cute.runtime.make_ptr(
             cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
         ),
@@ -287,10 +290,13 @@ def run_single_gpu_test(
         cutlass.cute.runtime.make_ptr(
             cutlass.Float32, token_final_scales.data_ptr(), cute.AddressSpace.gmem
         ),
-        0,
-        0,
-        0,
-        0,
+        0,  # staging_mc_ptr
+        0,  # out_mc_ptr
+        0,  # tile_barrier_mc_ptr
+        0,  # completion_barrier_mc_ptr
+        0,  # staging_rank_stride
+        0,  # out_rank_stride
+        0,  # cta_exit_counter_ptr
         cutlass.cute.runtime.make_ptr(
             cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
         ),
@@ -300,8 +306,6 @@ def run_single_gpu_test(
         l,
         num_tokens,
         top_k,
-        rank,
-        world_size,
         stream=stream,
     )
     torch.cuda.synchronize()

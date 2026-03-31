@@ -786,16 +786,27 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
         )
 
-        # Zero only THIS rank's NVLS staging and barrier buffers.
-        # The NVLS tensor has shape [num_ranks, segment_elems] and is backed
-        # by IPC memory, so .zero_() on the full tensor would write zeros to
-        # ALL ranks' memory via IPC, causing a cross-GPU data race when
-        # ranks execute independently (rank A's memset can clobber rank B's
-        # kernel output).  Indexing by ep_rank restricts the memset to this
-        # rank's local segment only.
+        # Zero staging buffer for this rank's segment only.
+        # Regular stores through MC VA write to LOCAL physical memory,
+        # so this does NOT affect other ranks' data.
         self._ep_nvls_staging_tensor[ep_rank].zero_()
-        self._ep_nvls_tile_barrier_tensor[ep_rank].zero_()
-        self._ep_nvls_completion_barrier_tensor[ep_rank].zero_()
+        # Zero ALL segments of tile barrier and completion barrier
+        # on the LOCAL GPU. Barriers are accessed at offsets within
+        # segment 0 (mc_ptr + offset), so ALL ranks must zero their
+        # local segment 0. tensor.zero_() zeros all local segments
+        # including segment 0 — safe because regular MC VA stores
+        # only affect local physical memory (no cross-GPU race).
+        self._ep_nvls_tile_barrier_tensor.zero_()
+        self._ep_nvls_completion_barrier_tensor.zero_()
+
+        # CTA exit counter: device-local (non-MC) memory for
+        # inter-CTA coordination. Must be zeroed before each call.
+        if not hasattr(self, '_cta_exit_counter'):
+            self._cta_exit_counter = torch.zeros(1,
+                                                 dtype=torch.int32,
+                                                 device=x.device)
+        else:
+            self._cta_exit_counter.zero_()
 
         # Create pointer tensors (1-element int64) for passing raw ptrs to custom op
         staging_mc_ptr = torch.tensor([self._ep_nvls_staging.ptr],
@@ -862,6 +873,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             completion_barrier_mc_ptr=completion_barrier_mc_ptr,
             staging_rank_stride=staging_rank_stride,
             out_rank_stride=out_rank_stride,
+            cta_exit_counter=self._cta_exit_counter,
             num_experts=self.num_slots,
             top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,

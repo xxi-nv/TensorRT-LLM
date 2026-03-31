@@ -1810,6 +1810,7 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
     barrier_bytes = max(num_2d_tiles * 4, 4096)
     tile_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
     completion_barriers = torch.zeros(barrier_bytes // 4, dtype=torch.int32, device=device)
+    cta_exit_counter = torch.zeros(1, dtype=torch.int32, device=device)
 
     make_ptr = cutlass.cute.runtime.make_ptr
     torch_stream = torch.cuda.current_stream()
@@ -2129,6 +2130,7 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
         completion_barriers.data_ptr(),  # completion_barrier_mc_ptr
         staging_rank_stride,  # staging_rank_stride
         out_rank_stride,  # out_rank_stride
+        cta_exit_counter.data_ptr(),  # cta_exit_counter_ptr
         out_test_ptr,
         m,
         n,
@@ -2144,6 +2146,7 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
         max_active_clusters=max_active_clusters,
         stream=stream,
     )
+    cta_exit_counter.zero_()
     compiled_ar(
         a_ptr,
         b_ptr,
@@ -2162,6 +2165,7 @@ def test_allreduce_kernel_multi_gpu(m, n, k, l, top_k, world_size, ar_strategy):
         completion_barriers.data_ptr(),
         staging_rank_stride,
         out_rank_stride,
+        cta_exit_counter.data_ptr(),
         out_test_ptr,
         m,
         n,
@@ -2261,7 +2265,7 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
 
     staging_tensor = staging_mem.as_torch_strided_tensor(torch.bfloat16)
     output_tensor = output_mem.as_torch_strided_tensor(torch.bfloat16)
-    tile_barrier_tensor = tile_barrier_mem.as_torch_strided_tensor(torch.int32)
+    completion_barrier_tensor = completion_barrier_mem.as_torch_strided_tensor(torch.int32)
 
     ep_comm = MoEEpAllReduceMnnvlMemory.get_comm(mapping)
     assert ep_comm.Get_size() == world_size, (
@@ -2422,12 +2426,12 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
     # MPI barrier: ensure all ranks have written their staging data
     ep_comm.barrier()
 
-    # --- Pre-set tile barriers and zero output ---
+    # --- Pre-set completion barrier and zero output ---
     output_tensor.zero_()
     if rank == 0:
-        # Barrier memory is IPC-mapped; rank 0 sets it for all.
-        barrier_view = tile_barrier_tensor[0]
-        barrier_view[:num_2d_tiles] = world_size
+        # Completion barrier is IPC-mapped; rank 0 sets it for all.
+        completion_barrier_view = completion_barrier_tensor[0]
+        completion_barrier_view[0] = world_size
     torch.cuda.synchronize(device)
     ep_comm.barrier()
 
@@ -2459,6 +2463,9 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
         total_2d = num_tiles * (n // tile_n)
         concrete_ar_strategy = 1 if total_2d * world_size >= 256 else 0
 
+    # CTA exit counter for inter-CTA coordination
+    cta_exit_counter = torch.zeros(1, dtype=torch.int32, device=device)
+
     ar_kernel = Sm100BlockScaledContiguousGroupedGemmAllReduceKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
@@ -2485,6 +2492,7 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
         completion_barrier_mem.ptr,  # completion_barrier_mc_ptr
         staging_mem.rank_stride,  # staging_rank_stride
         output_mem.rank_stride,  # out_rank_stride
+        cta_exit_counter.data_ptr(),  # cta_exit_counter_ptr
         out_test_ptr,
         m,
         n,
@@ -2500,6 +2508,7 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
         max_active_clusters=max_active_clusters,
         stream=stream,
     )
+    cta_exit_counter.zero_()
     compiled_ar(
         a_ptr,
         b_ptr,
@@ -2518,6 +2527,7 @@ def _test_allreduce_ipc_worker_impl(m, n, k, num_experts, top_k, world_size, ar_
         completion_barrier_mem.ptr,
         staging_mem.rank_stride,
         output_mem.rank_stride,
+        cta_exit_counter.data_ptr(),  # cta_exit_counter_ptr
         out_test_ptr,
         m,
         n,

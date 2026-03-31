@@ -1649,7 +1649,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
              num_non_exiting_tiles, token_final_scales, staging_mc_ptr_tensor,
              out_mc_ptr_tensor, tile_barrier_mc_ptr_tensor,
              completion_barrier_mc_ptr_tensor, staging_rank_stride_tensor,
-             out_rank_stride_tensor, out) = inputs
+             out_rank_stride_tensor, cta_exit_counter, out) = inputs
 
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
@@ -1668,6 +1668,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             completion_barrier_mc_ptr = completion_barrier_mc_ptr_tensor.item()
             staging_rank_stride = staging_rank_stride_tensor.item()
             out_rank_stride = out_rank_stride_tensor.item()
+            cta_exit_counter_ptr = cta_exit_counter.data_ptr()
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1755,6 +1756,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     completion_barrier_mc_ptr,
                     staging_rank_stride,
                     out_rank_stride,
+                    cta_exit_counter_ptr,
                     out_ptr,
                     m,
                     n,
@@ -1792,6 +1794,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 completion_barrier_mc_ptr,
                 staging_rank_stride,
                 out_rank_stride,
+                cta_exit_counter_ptr,
                 out_ptr,
                 m,
                 n,
@@ -1829,7 +1832,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell",
-        mutates_args=("staging", "out"),
+        mutates_args=("staging", "out", "cta_exit_counter"),
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_allreduce_inplace_blackwell(
         input: torch.Tensor,
@@ -1850,6 +1853,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         completion_barrier_mc_ptr: torch.Tensor,
         staging_rank_stride: torch.Tensor,
         out_rank_stride: torch.Tensor,
+        cta_exit_counter: torch.Tensor,
         num_experts: int,
         top_k: int,
         num_local_experts: int,
@@ -1889,6 +1893,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             completion_barrier_mc_ptr,
             staging_rank_stride,
             out_rank_stride,
+            cta_exit_counter,
             out,
         ]
 

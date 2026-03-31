@@ -367,3 +367,65 @@ def threadfence_system(*, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+# ---------------------------------------------------------------------------
+# Device-local atomic add returning old value (for CTA exit counter)
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def atomic_add_return_old(addr, *, loc=None, ip=None):
+    """Atomic increment on a device-local global memory flag, returning old value.
+
+    Unlike barrier_arrive_mc which targets multicast addresses, this is for
+    regular device memory used for intra-GPU CTA coordination.
+
+    Args:
+        addr: Pointer to int32 flag in device global memory (NOT multicast).
+
+    Returns:
+        Int32: The old value before the increment.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr.ir_value()],
+        "atom.global.add.u32 $0, [$1], 1;",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+# ---------------------------------------------------------------------------
+# Grid dimension query (for CTA exit counter coordination)
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def get_num_ctas(*, loc=None, ip=None):
+    """Get total number of CTAs in the grid (nctaid.x * nctaid.y).
+
+    Used to detect the last CTA that finishes its epilogue tiles
+    for CTA-level completion barrier signaling.
+
+    Returns:
+        Int32: nctaid.x * nctaid.y (total CTA count).
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [],
+        "{"
+        ".reg .u32 %nx, %ny;"
+        "mov.u32 %nx, %nctaid.x;"
+        "mov.u32 %ny, %nctaid.y;"
+        "mul.lo.u32 $0, %nx, %ny;"
+        "}",
+        "=r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
