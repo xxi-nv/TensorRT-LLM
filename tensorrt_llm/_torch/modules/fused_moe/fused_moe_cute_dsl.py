@@ -717,7 +717,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: torch.Tensor,
-        moe_output: torch.Tensor,
+        moe_output: Optional[torch.Tensor] = None,
         tile_size: int = 128,
     ) -> torch.Tensor:
         """V4 EP: Fused FC2 GEMM + AllReduce via 11-warp kernel.
@@ -813,8 +813,17 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         staging = self._ep_nvls_staging_tensor[ep_rank, :permuted_m * n].view(
             permuted_m, n)
 
-        # Zero the moe_output for scatter-add
-        moe_output.zero_()
+        # Allocate moe_output if not provided (e.g., AllGather dispatch
+        # path where NVLinkOneSided workspace is not available).
+        num_tokens = token_selected_experts.size(0)
+        if moe_output is None:
+            moe_output = torch.zeros(num_tokens,
+                                     self.hidden_size,
+                                     dtype=output_dtype,
+                                     device=x.device)
+        else:
+            # Zero the moe_output for scatter-add
+            moe_output.zero_()
 
         # FC2 + AllReduce: fused 11-warp kernel
         # When world_size > 1, the AR warps reduce across ranks via IPC and

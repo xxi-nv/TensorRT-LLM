@@ -2619,3 +2619,194 @@ def test_allreduce_kernel_real_ipc(m, n, k, num_experts, top_k, world_size, ar_s
         )
         for r in results:
             assert r is None
+
+
+# ============================================================================
+# End-to-End ConfigurableMoE V4 EP Test
+# ============================================================================
+
+# V4 EP requires: CUTEDSL + NVFP4 + EP > 1 + SM100/103 + MNNVL.
+# This test runs through the full ConfigurableMoE forward path with
+# AllGather dispatch → V4 fused FC2+AllReduce → skip combine.
+
+V4_EP_TEST_CONFIGS = [
+    # (num_experts, top_k, hidden_size, intermediate_size, seq_len)
+    (8, 2, 512, 512, 8),
+    (60, 4, 2048, 1408, 4),
+]
+
+
+def _test_configurable_moe_v4_ep_worker(
+    num_experts, top_k, hidden_size, intermediate_size, seq_len, world_size
+):
+    """Worker for ConfigurableMoE V4 EP end-to-end test.
+
+    Each MPI rank creates a ConfigurableMoE with CUTEDSL backend, NVFP4 quant,
+    and DEP (EP-only) parallelism.  The forward path goes through AllGather
+    dispatch → run_moe_nvfp4_v4_ep (fused FC2+AllReduce) → scatter output.
+    """
+    try:
+        _test_configurable_moe_v4_ep_worker_impl(
+            num_experts, top_k, hidden_size, intermediate_size, seq_len, world_size
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _test_configurable_moe_v4_ep_worker_impl(
+    num_experts, top_k, hidden_size, intermediate_size, seq_len, world_size
+):
+    from tensorrt_llm._utils import get_sm_version
+
+    rank = mpi_rank()
+    torch.cuda.set_device(rank)
+    dtype = torch.bfloat16
+    quant_algo = QuantAlgo.NVFP4
+
+    # DEP mode: attention DP + MoE EP
+    mapping = Mapping(
+        world_size=world_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    mapping.rank = rank
+
+    all_rank_num_tokens = [seq_len] * world_size
+
+    with torch.device(f"cuda:{rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        # Create routing method and input tensors
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, num_experts=num_experts)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        # Setup quantization
+        backend_type = MoeBackendType.CUTEDSL
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        num_local_experts = num_experts // mapping.moe_ep_size
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            num_local_experts=num_local_experts,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        test_max_num_tokens = max(256, seq_len)
+
+        model_cfg = _create_model_config(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=backend_type.value,
+            max_num_tokens=test_max_num_tokens,
+        )
+
+        with create_moe(
+            routing_method=routing_method,
+            reduce_results=True,
+            model_config=model_cfg,
+        ) as fused_moe:
+            fused_moe.load_weights([weights])
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{rank}")
+
+            # Check V4 is actually active
+            sm_version = get_sm_version()
+            v4_expected = sm_version in (100, 103) and MnnvlMemory.supports_mnnvl()
+            v4_active = fused_moe.backend._should_use_v4_ep()
+            assert v4_active == v4_expected, (
+                f"V4 EP active={v4_active} but expected={v4_expected} "
+                f"(SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()})"
+            )
+            if not v4_active:
+                pytest.skip(
+                    f"V4 EP not available: SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()}"
+                )
+
+            # Run forward
+            with torch.inference_mode():
+                output = fused_moe.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            # Reference: single-GPU (no EP)
+            ref_fused_moe = quantize_util.create_ref_module(routing_method)
+            ref_fused_moe.moe_tp_size = 1
+            ref_fused_moe.load_weights([weights])
+            ref_fused_moe.cuda(f"cuda:{rank}")
+
+            with torch.inference_mode():
+                ref_output = ref_fused_moe.forward(x, router_logits)
+
+            # Check accuracy
+            ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="needs >= 2 GPUs for V4 EP test",
+)
+@pytest.mark.parametrize(
+    "num_experts,top_k,hidden_size,intermediate_size,seq_len",
+    V4_EP_TEST_CONFIGS,
+    ids=[f"e{ne}_k{k}_h{h}_i{i}_s{s}" for ne, k, h, i, s in V4_EP_TEST_CONFIGS],
+)
+def test_configurable_moe_v4_ep(num_experts, top_k, hidden_size, intermediate_size, seq_len):
+    """End-to-end test for V4 EP (fused FC2+AllReduce) through ConfigurableMoE.
+
+    Tests the full forward path: AllGather dispatch → V4 fused GEMM+AllReduce →
+    scatter output.  Requires GB200 (SM100/103) with MNNVL support.
+
+    Run with: mpirun -n 3 pytest -k test_configurable_moe_v4_ep -vs
+    (first MPI rank is the MPIPoolExecutor controller)
+    """
+    world_size = min(torch.cuda.device_count(), 4)
+
+    def init_worker(custom_paths):
+        for custom_path in custom_paths:
+            if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
+                sys.path.append(custom_path)
+
+    with MPIPoolExecutor(
+        initializer=init_worker,
+        initargs=(sys.path,),
+        max_workers=world_size,
+    ) as executor:
+        results = list(
+            executor.map(
+                _test_configurable_moe_v4_ep_worker,
+                *zip(
+                    *[
+                        (
+                            num_experts,
+                            top_k,
+                            hidden_size,
+                            intermediate_size,
+                            seq_len,
+                            world_size,
+                        )
+                    ]
+                    * world_size
+                ),
+            )
+        )
+        for r in results:
+            assert r is None

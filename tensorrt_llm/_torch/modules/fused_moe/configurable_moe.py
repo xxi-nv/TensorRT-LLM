@@ -783,11 +783,26 @@ class ConfigurableMoE(MoE):
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
         # ========== Step 9: Communication - Combine ==========
-        # Skip combine when V4 EP fused ReduceScatter was used — the kernel
-        # already reduced across ranks and scattered to the output.
+        # Skip combine when V4 EP fused AllReduce was used — the kernel
+        # already reduced across ranks.  When AllGather dispatch was used,
+        # AllReduce gives every rank the full output for ALL tokens, so we
+        # need to extract this rank's portion (the scatter that ReduceScatter
+        # would have done).
         v4_rs_done = getattr(self.backend, "_v4_rs_done", False)
         if v4_rs_done:
             self.backend._v4_rs_done = False
+            if isinstance(self.comm, AllGatherReduceScatter):
+                ep_rank = self.mapping.moe_ep_rank
+                ep_size = self.mapping.moe_ep_size
+                sizes = getattr(self.comm, "_dispatch_state", {}).get("sizes")
+                if sizes:
+                    offset = sum(sizes[:ep_rank])
+                    final_hidden_states = final_hidden_states[offset : offset + sizes[ep_rank]]
+                else:
+                    chunk = final_hidden_states.shape[0] // ep_size
+                    final_hidden_states = final_hidden_states[
+                        ep_rank * chunk : (ep_rank + 1) * chunk
+                    ]
         elif self.comm is not None:
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
