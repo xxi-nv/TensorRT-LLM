@@ -877,12 +877,18 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
             # permuted_idx_to_expanded_idx maps permuted_row → expanded_idx
             # expanded_idx = token_idx * effective_top_k + topk_slot
+            # NOTE: moe_sort pads each expert group to tile_size boundary.
+            # Padding rows have uninitialized expanded_idx values that can
+            # be out-of-range.  Filter to only valid (non-padding) rows.
             expanded_idx = permuted_idx_to_expanded_idx[:permuted_m]
             token_idx = expanded_idx // effective_top_k
+            valid_mask = token_idx < num_tokens
+            token_idx_valid = token_idx[valid_mask]
+            nvls_out_valid = nvls_out[valid_mask]
 
             # Scatter-add: handles duplicate token indices (multiple
             # top_k slots mapping to the same token) correctly.
-            moe_output.index_add_(0, token_idx, nvls_out[:permuted_m])
+            moe_output.index_add_(0, token_idx_valid, nvls_out_valid)
 
         # Signal that the fused ReduceScatter is done, so ConfigurableMoE
         # can skip calling comm.combine().
