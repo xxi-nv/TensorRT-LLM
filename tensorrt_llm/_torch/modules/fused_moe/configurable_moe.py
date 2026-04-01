@@ -230,6 +230,24 @@ class ConfigurableMoE(MoE):
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
 
+        # V4 EP fused AllReduce requires AllGather dispatch for globally
+        # consistent token ordering across ranks. AllToAll strategies
+        # (NvlinkOneSided, etc.) give each rank a different token subset,
+        # which makes row-wise AllReduce incorrect. When the backend
+        # supports V4 EP, automatically switch to AllGather.
+        if (
+            isinstance(self.backend, CuteDslFusedMoE)
+            and self.comm is not None
+            and not isinstance(self.comm, AllGatherReduceScatter)
+            and self.backend._should_use_v4_ep()
+        ):
+            logger.info(
+                f"Switching communication from {self.comm.__class__.__name__} "
+                f"to AllGatherReduceScatter for V4 EP fused AllReduce."
+            )
+            self.comm.destroy()
+            self.comm = AllGatherReduceScatter(mapping=self.mapping)
+
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size

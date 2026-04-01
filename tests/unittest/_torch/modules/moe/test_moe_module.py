@@ -76,6 +76,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod,
     create_moe,
 )
+from tensorrt_llm._torch.modules.fused_moe.communication import AllGatherReduceScatter
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
@@ -2728,15 +2729,8 @@ def _test_configurable_moe_v4_ep_worker_impl(
             max_num_tokens=test_max_num_tokens,
         )
 
-        # Force AllGatherReduceScatter comm strategy.
-        # V4 EP AllReduce requires globally consistent token ordering across
-        # all ranks (same token at same row in staging). AllGather guarantees
-        # this; NvlinkOneSided A2A does NOT (each rank gets different tokens).
-        # On GB200 the auto-selected strategy is NvlinkOneSided, so we must
-        # force AllGather to exercise the V4 EP code path.
-        old_comm_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
-        os.environ["TRTLLM_FORCE_COMM_METHOD"] = "ALLGATHER"
-
+        # ConfigurableMoE auto-switches to AllGatherReduceScatter when V4 EP
+        # is active (V4 AllReduce needs globally consistent token ordering).
         with create_moe(
             routing_method=routing_method,
             reduce_results=True,
@@ -2749,20 +2743,21 @@ def _test_configurable_moe_v4_ep_worker_impl(
             # Check V4 is actually active
             sm_version = get_sm_version()
             v4_expected = sm_version in (100, 103) and MnnvlMemory.supports_mnnvl()
-            backend = fused_moe.backend
-            has_mapping = hasattr(backend, "mapping")
-            ep_size = backend.mapping.moe_ep_size if has_mapping else -1
-            v4_active = backend._should_use_v4_ep()
+            v4_active = fused_moe.backend._should_use_v4_ep()
             assert v4_active == v4_expected, (
                 f"V4 EP active={v4_active} but expected={v4_expected} "
                 f"(SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()}, "
-                f"has_mapping={has_mapping}, ep_size={ep_size}, "
-                f"backend_cls={type(backend).__name__})"
+                f"backend_cls={type(fused_moe.backend).__name__})"
             )
             if not v4_active:
                 pytest.skip(
                     f"V4 EP not available: SM={sm_version}, MNNVL={MnnvlMemory.supports_mnnvl()}"
                 )
+
+            # Verify auto-switch to AllGather
+            assert isinstance(fused_moe.comm, AllGatherReduceScatter), (
+                f"Expected AllGatherReduceScatter for V4 EP, got {type(fused_moe.comm).__name__}"
+            )
 
             # Run forward
             with torch.inference_mode():
@@ -2782,27 +2777,8 @@ def _test_configurable_moe_v4_ep_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # Debug output
-            print(f"\n=== RANK {rank} DEBUG ===")
-            print(f"output shape: {output.shape}, ref shape: {ref_output.shape}")
-            print(f"comm type: {type(fused_moe.comm).__name__}")
-            print(f"v4_active: {fused_moe.backend._should_use_v4_ep()}")
-            diff = (output.float() - ref_output.float()).abs()
-            print(f"abs diff max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
-            print(f"output[:3,:5]:\n{output[:3, :5]}")
-            print(f"ref_output[:3,:5]:\n{ref_output[:3, :5]}")
-            print(f"output nonzero: {output.count_nonzero().item()}/{output.numel()}")
-            print(f"ref nonzero: {ref_output.count_nonzero().item()}/{ref_output.numel()}")
-            print(f"=== END RANK {rank} ===\n")
-
             # Check accuracy
             ref_fused_moe.check_accuracy(output, ref_output)
-
-        # Restore env
-        if old_comm_method is None:
-            os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
-        else:
-            os.environ["TRTLLM_FORCE_COMM_METHOD"] = old_comm_method
 
 
 @pytest.mark.skipif(
