@@ -483,7 +483,7 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
 
         # Per-expert-group FC1 tile counters: int32 each
         self._counters_bytes = num_expert_groups * 4
-        # Completion barrier (int32) + CTA exit counter (int32)
+        # CTA exit counter (int32, offset 0) + rank ready flag (int32, offset 4)
         self._barriers_bytes = 8
 
         # Compute offsets (each sub-buffer aligned)
