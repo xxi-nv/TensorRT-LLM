@@ -74,18 +74,20 @@ def _create_reference_weights(
     )
 
     # Scale factors (uint8, representing float8_e4m3fn)
+    # b_sf shape must be [L, N_packed, K/sf_vec_size] where N_packed = b.size(1)
+    # (the NVFP4-packed N dimension, i.e. N // 2)
     sf_vec_size = 16
     fc1_weight_scale = torch.randint(
         1,
         128,
-        (num_experts, 2 * intermediate_size // sf_vec_size, hidden_size // sf_vec_size),
+        (num_experts, 2 * intermediate_size // 2, hidden_size // sf_vec_size),
         dtype=torch.uint8,
         device=device,
     )
     fc2_weight_scale = torch.randint(
         1,
         128,
-        (num_experts, hidden_size // sf_vec_size, intermediate_size // sf_vec_size),
+        (num_experts, hidden_size // 2, intermediate_size // sf_vec_size),
         dtype=torch.uint8,
         device=device,
     )

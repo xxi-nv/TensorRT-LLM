@@ -2965,6 +2965,7 @@ class FlashMoeFusedKernel:
     # wrapper: Convert raw pointers to CuTe tensors and invoke kernel
     # =================================================================
 
+    @cute.jit
     def wrapper(
         self,
         # FC1 pointers
