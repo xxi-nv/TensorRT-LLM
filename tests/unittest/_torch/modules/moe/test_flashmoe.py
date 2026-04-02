@@ -459,3 +459,146 @@ class TestFlashMoEKernelConfig:
         all_warp_ids.add(kernel.sched_warp_id)
 
         assert len(all_warp_ids) == 11
+
+
+# ============================================================================
+# MPI-based AllReduce test (requires srun --mpi=pmix -n N pytest ...)
+# ============================================================================
+def _is_mpi_launched() -> bool:
+    """Check if this process was launched as part of an MPI job."""
+    return (
+        "OMPI_COMM_WORLD_SIZE" in os.environ
+        or "PMI_SIZE" in os.environ
+        or "SLURM_NTASKS" in os.environ
+    )
+
+
+def _flashmoe_ar_worker(
+    num_experts: int = 256,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    top_k: int = 8,
+    num_tokens_per_rank: int = 64,
+    max_num_tokens: int = 256,
+):
+    """MPI worker for FlashMoE AllReduce test.
+
+    Runs both IPC+AR path and non-IPC+NCCL path, compares outputs.
+    Must be launched via srun --mpi=pmix.
+    """
+    import tensorrt_llm as tllm
+    from tensorrt_llm._torch.modules.fused_moe.flashmoe import FlashMoE
+    from tensorrt_llm._torch.modules.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm.mapping import Mapping
+
+    rank = tllm.mpi_rank()
+    world_size = tllm.mpi_world_size()
+    ep_size = world_size
+
+    torch.cuda.set_device(rank)
+    tllm.MnnvlMemory.initialize()
+
+    # Initialize torch.distributed for NCCL reference path
+    if not torch.distributed.is_initialized():
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        torch.distributed.init_process_group(backend="nccl")
+
+    device = torch.device(f"cuda:{rank}")
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=world_size,
+        moe_ep_size=ep_size,
+        moe_tp_size=1,
+    )
+
+    experts_per_rank = num_experts // ep_size
+    weights = _create_reference_weights(
+        num_experts=experts_per_rank,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    def _create_flashmoe(use_ipc: bool) -> FlashMoE:
+        fm = FlashMoE(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            use_fused_kernel=True,
+            use_ipc=use_ipc,
+        )
+        fm.w3w1_weight = weights["w3w1_weight"]
+        fm.w2_weight = weights["w2_weight"]
+        fm.fc1_weight_scale = weights["fc1_weight_scale"]
+        fm.fc2_weight_scale = weights["fc2_weight_scale"]
+        fm.fc1_alpha = weights["fc1_alpha"]
+        fm.fc2_alpha = weights["fc2_alpha"]
+        fm.fc31_input_scale = weights["fc31_input_scale"]
+        fm.fc2_input_scale = weights["fc2_input_scale"]
+        return fm
+
+    # Create input (same seed per rank for reproducibility)
+    torch.manual_seed(42 + rank)
+    x = torch.randn(num_tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device)
+    router_logits = torch.randn(
+        num_tokens_per_rank, num_experts, dtype=torch.bfloat16, device=device
+    )
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+
+    # --- Reference path: fused kernel + NCCL AllReduce ---
+    flashmoe_ref = _create_flashmoe(use_ipc=False)
+    with torch.inference_mode():
+        ref_output = flashmoe_ref.forward(x, router_logits, routing_method)
+    torch.cuda.synchronize()
+
+    # --- Test path: fused kernel + in-kernel AR via IPC ---
+    flashmoe_ar = _create_flashmoe(use_ipc=True)
+    with torch.inference_mode():
+        ar_output = flashmoe_ar.forward(x, router_logits, routing_method)
+    torch.cuda.synchronize()
+
+    # Compare outputs
+    abs_diff = (ar_output - ref_output).abs()
+    max_diff = abs_diff.max().item()
+    mean_diff = abs_diff.mean().item()
+
+    print(f"[Rank {rank}] AR vs NCCL: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    # NVFP4 quantization allows some numerical difference
+    assert max_diff < 0.5, f"Rank {rank}: max abs diff too large: {max_diff:.6f}"
+    assert mean_diff < 0.1, f"Rank {rank}: mean abs diff too large: {mean_diff:.6f}"
+
+
+class TestFlashMoEAllReduceMPI:
+    """MPI-based FlashMoE in-kernel AllReduce tests.
+
+    These tests require MPI launch (srun --mpi=pmix -n N pytest ...) and
+    NVLink fabric (MNNVL) support. They compare the in-kernel AR result
+    against NCCL AllReduce as reference.
+    """
+
+    @pytest.mark.skipif(
+        get_sm_version() not in (100, 103),
+        reason="Requires Blackwell GPU",
+    )
+    @pytest.mark.skipif(
+        not _is_mpi_launched(),
+        reason="Requires MPI launch (srun --mpi=pmix)",
+    )
+    def test_flashmoe_ar_vs_nccl(self):
+        """Compare in-kernel AR against NCCL AllReduce reference."""
+        _flashmoe_ar_worker(
+            num_experts=256,
+            hidden_size=7168,
+            intermediate_size=2048,
+            top_k=8,
+            num_tokens_per_rank=64,
+            max_num_tokens=256,
+        )
