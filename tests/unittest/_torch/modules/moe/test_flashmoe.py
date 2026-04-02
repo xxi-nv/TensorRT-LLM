@@ -345,13 +345,26 @@ class TestFlashMoEMultiGPU:
         top_k,
     ):
         """Basic functional test: FlashMoE output shape and finiteness."""
+        import sys
+
         world_size = min(torch.cuda.device_count(), 4)
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
         from mpi4py.futures import MPIPoolExecutor
 
-        with MPIPoolExecutor(max_workers=world_size) as executor:
+        def init_worker(custom_paths):
+            import sys as _sys
+
+            for p in custom_paths:
+                if p not in _sys.path:
+                    _sys.path.append(p)
+
+        with MPIPoolExecutor(
+            initializer=init_worker,
+            initargs=(sys.path,),
+            max_workers=world_size,
+        ) as executor:
             results = executor.map(
                 _flashmoe_worker_impl,
                 *zip(
@@ -387,13 +400,26 @@ class TestFlashMoEMultiGPU:
         top_k,
     ):
         """Fused kernel test: single persistent FC1+FC2 kernel."""
+        import sys
+
         world_size = min(torch.cuda.device_count(), 4)
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
         from mpi4py.futures import MPIPoolExecutor
 
-        with MPIPoolExecutor(max_workers=world_size) as executor:
+        def init_worker(custom_paths):
+            import sys as _sys
+
+            for p in custom_paths:
+                if p not in _sys.path:
+                    _sys.path.append(p)
+
+        with MPIPoolExecutor(
+            initializer=init_worker,
+            initargs=(sys.path,),
+            max_workers=world_size,
+        ) as executor:
             results = executor.map(
                 _flashmoe_worker_impl,
                 *zip(
@@ -462,7 +488,7 @@ class TestFlashMoEKernelConfig:
         for wid in kernel.epilog_warp_id:
             assert wid not in all_warp_ids
             all_warp_ids.add(wid)
-        for wid in kernel.ldgsts_ar_warp_id:
+        for wid in kernel.ldgsts_a_warp_id:
             assert wid not in all_warp_ids
             all_warp_ids.add(wid)
         assert kernel.mma_warp_id not in all_warp_ids
