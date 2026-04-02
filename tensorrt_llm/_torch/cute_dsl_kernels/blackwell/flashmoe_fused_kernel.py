@@ -2652,7 +2652,7 @@ class FlashMoeFusedKernel:
 
         # --- FC2 MMA warp (warp 8): GEMM mainloop ---
         if warp_idx == self.mma_warp_id:
-            # Retrieve TMEM pointer (already allocated in FC1)
+            # Wait for FC2 epilogue warps (0-3) to re-allocate TMEM
             tmem.wait_for_alloc()
             fc2_acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             fc2_tCtAcc_base = cute.make_tensor(fc2_acc_tmem_ptr, tCtAcc_fake.layout)
