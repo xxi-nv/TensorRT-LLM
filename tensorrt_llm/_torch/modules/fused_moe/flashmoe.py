@@ -699,6 +699,33 @@ class FlashMoE(torch.nn.Module):
             stream=stream,
         )
 
+        # Diagnostic: sync and check fc1_done_counter before NCCL
+        # to determine if the fused kernel completed or is stuck.
+        import logging
+
+        logger = logging.getLogger(__name__)
+        try:
+            sync_event = torch.cuda.Event()
+            sync_event.record()
+            sync_event.synchronize()
+            fc1_val = fc1_done_counter.item()
+            logger.info(
+                "Fused kernel sync OK: fc1_done_counter=%d",
+                fc1_val,
+            )
+        except Exception as e:
+            logger.error("Fused kernel sync failed: %s", e)
+            try:
+                fc1_val = fc1_done_counter.cpu().item()
+                logger.error(
+                    "fc1_done_counter=%d — FC1 phase %s",
+                    fc1_val,
+                    "likely COMPLETED (>0)" if fc1_val > 0 else "STUCK (=0)",
+                )
+            except Exception:
+                logger.error("Cannot read fc1_done_counter")
+            raise
+
         # AllReduce: when AR is enabled, the kernel already reduced the output.
         # When AR is disabled, fall back to NCCL AllReduce.
         if not enable_ar and self.ep_size > 1:

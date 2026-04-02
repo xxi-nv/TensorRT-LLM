@@ -242,6 +242,15 @@ def _flashmoe_worker_impl(
     """
     import torch.distributed
 
+    # Disable PDL to rule out griddepcontrol_wait deadlock.
+    # PDL waits for a signal from the previous kernel; if the preceding
+    # kernel on the stream was not launched with use_pdl, the fused kernel
+    # may block at griddepcontrol.wait forever.
+    os.environ["TRTLLM_ENABLE_PDL"] = "0"
+
+    # Shorten NCCL timeout for faster failure detection (2 min vs 10 min)
+    os.environ["NCCL_TIMEOUT"] = "120"
+
     # Use torch.distributed instead of MPI for communication
     os.environ["TLLM_DISABLE_MPI"] = "1"
 
