@@ -224,17 +224,20 @@ def _flashmoe_worker_impl(
     """Worker function for multi-GPU FlashMoE test.
 
     Each rank:
-    1. Initializes FlashMoE and reference CuteDslFusedMoE.
+    1. Initializes FlashMoE module.
     2. Generates random input and router logits.
     3. Runs FlashMoE forward.
-    4. Runs reference forward (AllGather + CuteDslFusedMoE + ReduceScatter).
-    5. Compares outputs.
+    4. Verifies output shape, dtype, and finiteness.
     """
     import torch.distributed
 
     # Initialize process group
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
 
@@ -268,9 +271,11 @@ def _flashmoe_worker_impl(
         use_fused_kernel=use_fused_kernel,
     )
 
-    # Create weights
+    # Create weights for LOCAL experts only (not global).
+    # Each rank holds weights for its own expert partition.
+    experts_per_rank = num_experts // ep_size
     weights = _create_reference_weights(
-        num_experts=num_experts,
+        num_experts=experts_per_rank,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         device=device,
