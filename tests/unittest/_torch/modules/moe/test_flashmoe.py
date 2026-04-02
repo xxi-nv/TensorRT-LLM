@@ -21,6 +21,7 @@ Multi-GPU tests require 2+ GB200 GPUs (OCI) with NVLink fabric support.
 """
 
 import os
+import time
 
 import pytest
 import torch
@@ -317,10 +318,15 @@ def _flashmoe_worker_impl(
     routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
 
     # Run FlashMoE forward
+    t0 = time.time()
     with torch.inference_mode():
         flash_output = flashmoe.forward(x, router_logits, routing_method)
+    t1 = time.time()
+    print(f"[Rank {rank}] forward (incl. JIT compile) took {t1 - t0:.1f}s", flush=True)
 
     torch.cuda.synchronize()
+    t2 = time.time()
+    print(f"[Rank {rank}] cuda.synchronize took {t2 - t1:.1f}s", flush=True)
 
     # Verify output shape and dtype
     assert flash_output.shape == (num_tokens_per_rank, hidden_size), (
@@ -419,15 +425,21 @@ def _flashmoe_compare_worker_impl(
 
     # Run decomposed path (reference)
     flashmoe_ref = _create_flashmoe(use_fused=False)
+    t0 = time.time()
     with torch.inference_mode():
         ref_output = flashmoe_ref.forward(x, router_logits, routing_method)
     torch.cuda.synchronize()
+    print(f"[Rank {rank}] decomposed forward+sync took {time.time() - t0:.1f}s", flush=True)
 
     # Run fused path
     flashmoe_fused = _create_flashmoe(use_fused=True)
+    t0 = time.time()
     with torch.inference_mode():
         fused_output = flashmoe_fused.forward(x, router_logits, routing_method)
+    t1 = time.time()
+    print(f"[Rank {rank}] fused forward (incl. JIT) took {t1 - t0:.1f}s", flush=True)
     torch.cuda.synchronize()
+    print(f"[Rank {rank}] fused sync took {time.time() - t1:.1f}s", flush=True)
 
     # Compare outputs (both use NCCL AllReduce, so only kernel differs)
     # Mask out non-finite values (random weights can cause overflow)
@@ -449,6 +461,15 @@ def _flashmoe_compare_worker_impl(
         print(f"[Rank {rank}] WARNING: No finite values to compare")
 
     return None
+
+
+def _find_free_port():
+    """Find a free port on localhost."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def _spawn_wrapper(rank, world_size, fn_args):
@@ -490,6 +511,7 @@ class TestFlashMoEMultiGPU:
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
+        os.environ["MASTER_PORT"] = str(_find_free_port())
         torch.multiprocessing.spawn(
             _spawn_wrapper,
             args=(
@@ -506,6 +528,7 @@ class TestFlashMoEMultiGPU:
             (256, 7168, 2048, 8),  # DeepSeek-V3 config
         ],
     )
+    @pytest.mark.timeout(1800)
     def test_flashmoe_fused_kernel(
         self,
         num_experts,
@@ -518,6 +541,7 @@ class TestFlashMoEMultiGPU:
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
+        os.environ["MASTER_PORT"] = str(_find_free_port())
         torch.multiprocessing.spawn(
             _spawn_wrapper,
             args=(
@@ -534,6 +558,7 @@ class TestFlashMoEMultiGPU:
             (256, 7168, 2048, 8),  # DeepSeek-V3 config
         ],
     )
+    @pytest.mark.timeout(1800)
     def test_flashmoe_fused_vs_decomposed(
         self,
         num_experts,
@@ -546,6 +571,7 @@ class TestFlashMoEMultiGPU:
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
+        os.environ["MASTER_PORT"] = str(_find_free_port())
         torch.multiprocessing.spawn(
             _spawn_compare_wrapper,
             args=(
@@ -708,15 +734,21 @@ def _flashmoe_ar_worker(
 
     # --- Reference path: fused kernel + NCCL AllReduce ---
     flashmoe_ref = _create_flashmoe(use_ipc=False)
+    t0 = time.time()
     with torch.inference_mode():
         ref_output = flashmoe_ref.forward(x, router_logits, routing_method)
     torch.cuda.synchronize()
+    print(f"[Rank {rank}] ref forward+sync took {time.time() - t0:.1f}s", flush=True)
 
     # --- Test path: fused kernel + in-kernel AR via IPC ---
     flashmoe_ar = _create_flashmoe(use_ipc=True)
+    t0 = time.time()
     with torch.inference_mode():
         ar_output = flashmoe_ar.forward(x, router_logits, routing_method)
+    t1 = time.time()
+    print(f"[Rank {rank}] AR forward (incl. JIT) took {t1 - t0:.1f}s", flush=True)
     torch.cuda.synchronize()
+    print(f"[Rank {rank}] AR sync took {time.time() - t1:.1f}s", flush=True)
 
     # Compare outputs
     abs_diff = (ar_output - ref_output).abs()
