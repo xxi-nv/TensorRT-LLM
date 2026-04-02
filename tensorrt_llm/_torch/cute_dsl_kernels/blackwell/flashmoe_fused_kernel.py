@@ -3264,7 +3264,8 @@ class FlashMoeFusedKernel:
             ),
         )
         # FC1 SFC: MMA-friendly layout (output scale factors)
-        # Always provided (not optional) — caller must allocate fc1_c_sf
+        # L=1 because fc1_c output is a flat buffer (expert grouping is
+        # in the permuted M dimension, not the L dimension).
         fc1_sfc = cute.make_tensor(
             fc1_sfc_ptr,
             layout=cute.make_ordered_layout(
@@ -3274,7 +3275,7 @@ class FlashMoeFusedKernel:
                     m // 128,
                     4,
                     fc1_intermediate_sz // (scaling_vector_size * 4),
-                    l,
+                    1,
                 ),
                 order=(2, 1, 4, 0, 3, 5),
             ),
