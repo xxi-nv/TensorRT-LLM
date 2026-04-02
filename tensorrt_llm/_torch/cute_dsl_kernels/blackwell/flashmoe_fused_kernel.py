@@ -2959,9 +2959,6 @@ class FlashMoeFusedKernel:
         if cutlass.const_expr(TRTLLM_ENABLE_PDL):
             griddepcontrol_launch_dependents()
 
-        # TMEM deallocation
-        tmem.free(self.num_tmem_alloc_cols)
-
     # =================================================================
     # wrapper: Convert raw pointers to CuTe tensors and invoke kernel
     # =================================================================
