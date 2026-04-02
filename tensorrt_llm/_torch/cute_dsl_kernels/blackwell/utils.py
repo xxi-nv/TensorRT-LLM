@@ -395,3 +395,303 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
+
+
+# =========================================================================
+# AllReduce PTX helpers for FlashMoE in-kernel cross-rank reduction
+# =========================================================================
+
+
+@dsl_user_op
+def atomic_add_global_i32_return(addr, val, *, loc=None, ip=None):
+    """Atomically add val to i32 at global addr and return old value."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr.iterator.llvm_ptr, val.ir_value()],
+        "atom.global.add.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def fence_sc_sys(*, loc=None, ip=None):
+    """System-scope sequentially-consistent memory fence.
+
+    Ensures all prior memory operations (from this thread) are visible
+    to all threads across all GPUs before any subsequent operations.
+    Required before signaling readiness to remote ranks.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="fence.sc.sys;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_release_sys_i32(addr, val, *, loc=None, ip=None):
+    """Store i32 with release semantics, system scope.
+
+    Ensures all prior writes from this thread are visible to any thread
+    (including remote GPUs) that performs an acquire load of this location.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.iterator.llvm_ptr, val.ir_value()],
+        "st.release.sys.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_sys_i32(addr, *, loc=None, ip=None):
+    """Load i32 with acquire semantics, system scope.
+
+    Pairs with st_release_sys_i32. After this load returns a value written
+    by a release store, all writes that happened-before that store are
+    guaranteed visible to this thread.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr.iterator.llvm_ptr],
+        "ld.acquire.sys.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def ld_volatile_global_i32(addr, *, loc=None, ip=None):
+    """Volatile load i32 from global memory.
+
+    Bypasses L1/L2 caches. Used for polling CTA exit counters where
+    the writer is on the same device (no need for system-scope ordering).
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr.iterator.llvm_ptr],
+        "ld.volatile.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def ld_global_128b(addr, *, loc=None, ip=None):
+    """Load 128 bits (4 x i32) from global memory.
+
+    Used for vectorized bf16 loads during AllReduce: 128 bits = 8 bf16 values.
+    Returns 4 i32 values (each containing 2 packed bf16).
+    """
+    r0, r1, r2, r3 = llvm.inline_asm(
+        [T.i32(), T.i32(), T.i32(), T.i32()],
+        [addr.iterator.llvm_ptr],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return r0, r1, r2, r3
+
+
+@dsl_user_op
+def st_global_128b(addr, r0, r1, r2, r3, *, loc=None, ip=None):
+    """Store 128 bits (4 x i32) to global memory.
+
+    Used for vectorized bf16 stores during AllReduce.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.iterator.llvm_ptr, r0, r1, r2, r3],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_global_i64(addr, *, loc=None, ip=None):
+    """Load i64 from global memory. Used for reading IPC pointer values."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [addr.iterator.llvm_ptr],
+        "ld.global.b64 $0, [$1];",
+        "=l,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(result)
+
+
+@dsl_user_op
+def add_bf16x2(a_packed, b_packed, *, loc=None, ip=None):
+    """Add two packed bf16x2 values natively on SM90+.
+
+    Takes two i32 values (each containing 2 packed bf16), adds them
+    element-wise, and returns one i32 (packed bf16x2 result).
+    Uses native bf16x2 add instruction available on Blackwell (SM100).
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [a_packed, b_packed],
+        "add.rn.bf16x2 $0, $1, $2;",
+        "=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def ptr_add_i64(base, byte_offset, *, loc=None, ip=None):
+    """Add byte offset to a 64-bit pointer/address. Returns i64."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [base, byte_offset],
+        "add.u64 $0, $1, $2;",
+        "=l,l,l",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def ld_global_128b_from_i64_addr(addr_i64, *, loc=None, ip=None):
+    """Load 128 bits (4 x i32) from a 64-bit address value.
+
+    Unlike ld_global_128b which takes a cute pointer, this takes a raw
+    i64 address value (e.g., from reading an IPC pointer array).
+    """
+    r0, r1, r2, r3 = llvm.inline_asm(
+        [T.i32(), T.i32(), T.i32(), T.i32()],
+        [addr_i64],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return r0, r1, r2, r3
+
+
+@dsl_user_op
+def st_global_128b_to_i64_addr(addr_i64, r0, r1, r2, r3, *, loc=None, ip=None):
+    """Store 128 bits (4 x i32) to a 64-bit address value."""
+    llvm.inline_asm(
+        None,
+        [addr_i64, r0, r1, r2, r3],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+# ---- Address-based variants (take raw i64 addresses) ----
+
+
+@dsl_user_op
+def st_release_sys_i32_addr(addr_i64, val, *, loc=None, ip=None):
+    """Store i32 with release semantics at a raw i64 address.
+
+    Like st_release_sys_i32 but takes a raw i64 address value instead
+    of a cute tensor pointer.
+    """
+    llvm.inline_asm(
+        None,
+        [addr_i64, val.ir_value()],
+        "st.release.sys.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_sys_i32_addr(addr_i64, *, loc=None, ip=None):
+    """Load i32 with acquire semantics from a raw i64 address.
+
+    Like ld_acquire_sys_i32 but takes a raw i64 address value.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr_i64],
+        "ld.acquire.sys.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def ld_volatile_global_i32_addr(addr_i64, *, loc=None, ip=None):
+    """Volatile load i32 from a raw i64 address."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr_i64],
+        "ld.volatile.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def i32_to_i64(val, *, loc=None, ip=None):
+    """Zero-extend i32 to i64 for use in address arithmetic."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [val.ir_value()],
+        "cvt.u64.u32 $0, $1;",
+        "=l,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def i64_mul(a, b, *, loc=None, ip=None):
+    """Multiply two i64 values."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [a, b],
+        "mul.lo.u64 $0, $1, $2;",
+        "=l,l,l",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result

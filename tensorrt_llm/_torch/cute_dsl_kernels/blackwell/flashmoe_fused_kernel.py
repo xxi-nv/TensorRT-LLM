@@ -34,8 +34,16 @@ Architecture (per CTA, 11 warps = 352 threads):
 SMEM data buffers (sA, sB, sSFA, sSFB) are shared between phases since both
 use the same NVFP4 data type with identical MMA tile configuration.
 
-Current version (v1): No in-kernel IPC gather or AllReduce. Input is
-pre-gathered, AllReduce is done via NCCL after kernel completion.
+When enable_ar=True and ar_num_ranks>1, an AllReduce (AR) phase follows FC2:
+  Phase 3 -- AR (warps 4-7 only):
+    After all CTAs finish FC2 (CTA exit counter), warps 4-7 read each rank's
+    staging buffer via IPC, reduce bf16 values, and store to the output buffer.
+    Cross-rank synchronization uses system-scope release/acquire stores/loads
+    on IPC-accessible flag arrays.
+
+Current version (v1): No in-kernel IPC gather. Input is pre-gathered.
+AllReduce is optional (enable_ar flag). When disabled, AllReduce is done
+via NCCL after kernel completion.
 """
 
 from typing import Optional, Tuple, Type, Union
@@ -64,11 +72,22 @@ from .custom_pipeline import (
 )
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    add_bf16x2,
     atomic_add_func,
+    atomic_add_global_i32_return,
+    fence_sc_sys,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
+    i32_to_i64,
+    i64_mul,
+    ld_acquire_sys_i32_addr,
+    ld_global_128b_from_i64_addr,
+    ld_volatile_global_i32_addr,
+    ptr_add_i64,
     silu_f32,
+    st_global_128b_to_i64_addr,
+    st_release_sys_i32_addr,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
 )
@@ -77,12 +96,15 @@ from .utils import (
 class FlashMoeFusedKernel:
     """Two-phase persistent cuteDSL kernel: FC1 (gather+GEMM+SwiGLU) -> FC2 (GEMM+scatter-add).
 
+    Optionally includes in-kernel AllReduce (AR) phase for cross-rank
+    reduction when enable_ar=True and ar_num_ranks > 1.
+
     Warp layout (1CTA mode, mma_tiler_mn=(128,128)):
-      0-3   Epilogue   -- SwiGLU+quant (FC1) / scale+scatter-add (FC2)
-      4-7   LDGSTS     -- Gather A+SFA (FC1) / idle (FC2)
-      8     MMA        -- tcgen05.mma GEMM (both phases)
-      9     TMA        -- TMA B+SFB (FC1) / TMA A+B+SFA+SFB (FC2)
-      10    Scheduler  -- Dispatch tiles (both phases, sequential)
+      0-3   Epilogue   -- SwiGLU+quant (FC1) / scale+scatter-add (FC2) / idle (AR)
+      4-7   LDGSTS/AR  -- Gather A+SFA (FC1) / idle (FC2) / AllReduce (AR)
+      8     MMA        -- tcgen05.mma GEMM (both phases) / idle (AR)
+      9     TMA        -- TMA B+SFB (FC1) / TMA A+B+SFA+SFB (FC2) / idle (AR)
+      10    Scheduler  -- Dispatch tiles (both phases, sequential) / idle (AR)
     """
 
     PHASE_FC1 = 0
@@ -96,6 +118,8 @@ class FlashMoeFusedKernel:
         vectorized_f32: bool = True,
         topk: int = 8,
         raster_along_m: bool = False,
+        enable_ar: bool = False,
+        ar_num_ranks: int = 1,
     ):
         self.sf_vec_size = sf_vec_size
         self.tile_size = mma_tiler_mn[0]
@@ -107,6 +131,10 @@ class FlashMoeFusedKernel:
         self.raster_along_m = raster_along_m
         self.cta_group = tcgen05.CtaGroup.ONE
         self.occupancy = 1
+
+        # AllReduce config (compile-time constants)
+        self.enable_ar = enable_ar
+        self.ar_num_ranks = ar_num_ranks
 
         # Warp ID assignment (11 warps, 352 threads)
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -128,6 +156,11 @@ class FlashMoeFusedKernel:
         )
         self.threads_wo_sched = self.threads_per_warp * self.warps_wo_sched
 
+        # AR warp group: 4 warps * 32 threads = 128 threads
+        self.ar_threads = 32 * len(self.ldgsts_a_warp_id)
+        # Each 128-bit load = 8 bf16 values = 16 bytes
+        self.ar_vec_size = 8  # bf16 values per vectorized load
+
         # Named barriers
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
@@ -144,6 +177,10 @@ class FlashMoeFusedKernel:
         )
         # Phase transition barrier (all warps sync between FC1 and FC2)
         self.phase_barrier = pipeline.NamedBarrier(barrier_id=5, num_threads=self.threads_per_cta)
+        # AR phase barrier (all warps sync after FC2, before AR)
+        self.ar_phase_barrier = pipeline.NamedBarrier(
+            barrier_id=6, num_threads=self.threads_per_cta
+        )
 
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tmem_alloc_cols = 512
@@ -617,7 +654,7 @@ class FlashMoeFusedKernel:
         # FC2 tensors (FC2 A = fc1_c, FC2 SFA = fc1_sfc)
         fc2_a: cute.Tensor,  # [M, K2, L] NVFP4 FC1 output (same data as fc1_c)
         fc2_b: cute.Tensor,  # [N2, K2, L] NVFP4 w2 weights
-        fc2_out: cute.Tensor,  # [M', N2] BFloat16 output buffer
+        fc2_out: cute.Tensor,  # [M', N2] BFloat16 output buffer (or staging for AR)
         fc2_sfa: cute.Tensor,  # [..., L] scale factors for FC2 A
         fc2_sfb: cute.Tensor,  # [..., L] scale factors for w2
         # Shared metadata (from moe_sort, M-tile based)
@@ -630,9 +667,15 @@ class FlashMoeFusedKernel:
         fc2_alpha: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
+        # AllReduce parameters (only used when enable_ar=True)
+        ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64
+        ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
+        ar_cta_exit_counter: Optional[cute.Tensor] = None,  # [1] Int32
+        ar_rank_ready_flags: Optional[cute.Tensor] = None,  # [num_ranks] Int32
+        ar_local_rank: Optional[cutlass.Int32] = None,
         # Config
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
+        max_active_clusters: cutlass.Constexpr = None,
+        stream: cuda.CUstream = None,
     ):
         """Setup TMA atoms for both phases, define SharedStorage, launch kernel."""
         # --- Set data types ---
@@ -947,6 +990,13 @@ class FlashMoeFusedKernel:
             self.fc2_epi_layout,
             self.fc1_tile_sched_params,
             self.fc2_tile_sched_params,
+            # AR tensors (passed through even when disabled; kernel ignores via const_expr)
+            ar_staging_ipc_ptrs,
+            ar_output,
+            ar_cta_exit_counter,
+            ar_rank_ready_flags,
+            ar_local_rank if ar_local_rank is not None else cutlass.Int32(0),
+            grid[0],  # num_ctas for AR work partitioning
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1010,8 +1060,15 @@ class FlashMoeFusedKernel:
         fc2_epi_layout: cute.Layout,
         fc1_tile_sched_params: utils.PersistentTileSchedulerParams,
         fc2_tile_sched_params: utils.PersistentTileSchedulerParams,
+        # AllReduce parameters
+        ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
+        ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
+        ar_cta_exit_counter: Optional[cute.Tensor] = None,  # [1] Int32
+        ar_rank_ready_flags: Optional[cute.Tensor] = None,  # [num_ranks] Int32 (IPC)
+        ar_local_rank: cutlass.Int32 = None,
+        ar_num_ctas: cutlass.Int32 = None,
     ):
-        """Two-phase persistent GEMM kernel: FC1 -> barrier -> FC2."""
+        """Two-phase persistent GEMM kernel: FC1 -> barrier -> FC2 [-> AR]."""
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -2954,6 +3011,111 @@ class FlashMoeFusedKernel:
             tmem.free(fc2_epi_tmem_ptr)
 
         # ============================================================
+        # AR PHASE: In-kernel AllReduce (warps 4-7)
+        # ============================================================
+        # After FC2, warps 4-7 perform cross-rank AllReduce:
+        # 1. All warps sync (ar_phase_barrier)
+        # 2. CTA exit counter: last CTA signals rank readiness
+        # 3. Poll all ranks' ready flags
+        # 4. Read staging from all ranks via IPC, reduce, store to output
+        if cutlass.const_expr(self.enable_ar):
+            # All warps sync to ensure FC2 writes are complete
+            self.ar_phase_barrier.arrive_and_wait()
+
+            # Only warps 4-7 (128 threads) participate in AllReduce
+            if warp_idx >= self.ldgsts_a_warp_id[0] and warp_idx <= self.ldgsts_a_warp_id[-1]:
+                tidx, _, _ = cute.arch.thread_idx()
+                ar_thread_idx = tidx - self.ldgsts_a_warp_id[0] * self.threads_per_warp
+
+                # Precompute base addresses for CTA exit counter and flags
+                ar_counter_addr = ar_cta_exit_counter.iterator.llvm_ptr
+                ar_flags_base_addr = ar_rank_ready_flags.iterator.llvm_ptr
+
+                # Step 1: CTA exit counter — signal that this CTA is done with FC2
+                # Thread 0 of warp 4 atomically increments the counter
+                if warp_idx == self.ldgsts_a_warp_id[0]:
+                    with cute.arch.elect_one():
+                        atomic_add_global_i32_return(ar_cta_exit_counter, cutlass.Int32(1))
+
+                # Step 2: All AR threads spin until all local CTAs are done
+                ar_all_ctas_done = cutlass.Int32(0)
+                while ar_all_ctas_done < ar_num_ctas:
+                    ar_all_ctas_done = ld_volatile_global_i32_addr(ar_counter_addr)
+
+                # Step 3: System fence + signal rank readiness to remote ranks
+                # Only CTA 0 signals (dedup across CTAs)
+                bidx, _, _ = cute.arch.block_idx()
+                if bidx == 0:
+                    fence_sc_sys()
+                    if warp_idx == self.ldgsts_a_warp_id[0]:
+                        with cute.arch.elect_one():
+                            # Compute address: flags_base + local_rank * 4 (sizeof Int32)
+                            ar_local_rank_i64 = i32_to_i64(ar_local_rank)
+                            ar_local_flag_addr = ptr_add_i64(
+                                ar_flags_base_addr,
+                                i64_mul(ar_local_rank_i64, cutlass.Int64(4)),
+                            )
+                            st_release_sys_i32_addr(ar_local_flag_addr, cutlass.Int32(1))
+
+                # Step 4: Wait for all ranks to be ready
+                for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
+                    ar_r_i64 = i32_to_i64(cutlass.Int32(ar_r))
+                    ar_r_flag_addr = ptr_add_i64(
+                        ar_flags_base_addr,
+                        i64_mul(ar_r_i64, cutlass.Int64(4)),
+                    )
+                    ar_flag = cutlass.Int32(0)
+                    while ar_flag == 0:
+                        ar_flag = ld_acquire_sys_i32_addr(ar_r_flag_addr)
+
+                # Step 5: AllReduce — partition output across CTAs and AR threads
+                # Total bf16 elements = num_tokens * hidden_size (from fc2_out shape)
+                ar_num_tokens = fc2_out.shape[0]
+                ar_hidden_size = fc2_out.shape[1]
+                ar_total_elems = ar_num_tokens * ar_hidden_size
+
+                # Each vectorized step processes 8 bf16 values (128 bits)
+                ar_total_vecs = ar_total_elems // self.ar_vec_size
+
+                # Partition: each CTA handles a contiguous chunk, threads within
+                # CTA are interleaved for coalescing
+                ar_vecs_per_cta = (ar_total_vecs + ar_num_ctas - 1) // ar_num_ctas
+                ar_cta_start = bidx * ar_vecs_per_cta
+                ar_cta_end = (bidx + 1) * ar_vecs_per_cta
+                if ar_cta_end > ar_total_vecs:
+                    ar_cta_end = ar_total_vecs
+
+                # Precompute output base pointer
+                ar_out_base_addr = ar_output.iterator.llvm_ptr
+
+                ar_vec_idx = ar_cta_start + ar_thread_idx
+                while ar_vec_idx < ar_cta_end:
+                    # Byte offset for this vector (8 bf16 = 16 bytes)
+                    ar_byte_offset = i64_mul(i32_to_i64(ar_vec_idx), cutlass.Int64(16))
+
+                    # Load from first rank's staging and initialize accumulators
+                    # Read IPC pointer: staging_ipc_ptrs[0] (Int64)
+                    ar_ipc_ptr_0 = ar_staging_ipc_ptrs[0]
+                    ar_addr = ptr_add_i64(ar_ipc_ptr_0, ar_byte_offset)
+                    ar_acc0, ar_acc1, ar_acc2, ar_acc3 = ld_global_128b_from_i64_addr(ar_addr)
+
+                    # Accumulate from remaining ranks
+                    for ar_r in cutlass.range(1, self.ar_num_ranks, unroll_full=True):
+                        ar_ipc_ptr_r = ar_staging_ipc_ptrs[ar_r]
+                        ar_addr = ptr_add_i64(ar_ipc_ptr_r, ar_byte_offset)
+                        ar_v0, ar_v1, ar_v2, ar_v3 = ld_global_128b_from_i64_addr(ar_addr)
+                        ar_acc0 = add_bf16x2(ar_acc0, ar_v0)
+                        ar_acc1 = add_bf16x2(ar_acc1, ar_v1)
+                        ar_acc2 = add_bf16x2(ar_acc2, ar_v2)
+                        ar_acc3 = add_bf16x2(ar_acc3, ar_v3)
+
+                    # Store reduced result to output
+                    ar_out_addr = ptr_add_i64(ar_out_base_addr, ar_byte_offset)
+                    st_global_128b_to_i64_addr(ar_out_addr, ar_acc0, ar_acc1, ar_acc2, ar_acc3)
+
+                    ar_vec_idx = ar_vec_idx + self.ar_threads
+
+        # ============================================================
         # PDL: Signal dependent kernels
         # ============================================================
         if cutlass.const_expr(TRTLLM_ENABLE_PDL):
@@ -2999,10 +3161,16 @@ class FlashMoeFusedKernel:
         l: cutlass.Int64,  # number of local experts  # noqa: E741
         num_tokens: cutlass.Int64,  # total global tokens
         top_k: cutlass.Int64,  # number of experts per token
+        # AllReduce pointers (only used when enable_ar=True)
+        ar_staging_ipc_ptrs_ptr: Optional[cute.Pointer] = None,  # Int64 array
+        ar_output_ptr: Optional[cute.Pointer] = None,  # BFloat16 output
+        ar_cta_exit_counter_ptr: Optional[cute.Pointer] = None,  # Int32
+        ar_rank_ready_flags_ptr: Optional[cute.Pointer] = None,  # Int32 array
+        ar_local_rank: Optional[cutlass.Int32] = None,
         # Constexpr config
-        scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
+        scaling_vector_size: cutlass.Constexpr = None,
+        max_active_clusters: cutlass.Constexpr = None,
+        stream: cuda.CUstream = None,
     ):
         """Convert raw pointers to CuTe tensors and invoke the fused kernel."""
         num_tiles = m // self.tile_size
@@ -3145,6 +3313,31 @@ class FlashMoeFusedKernel:
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
 
+        # Build AR tensors from pointers (only when AR is enabled)
+        if cutlass.const_expr(self.enable_ar):
+            ar_staging_ipc_ptrs = cute.make_tensor(
+                ar_staging_ipc_ptrs_ptr,
+                layout=cute.make_layout((self.ar_num_ranks,)),
+            )
+            ar_output = cute.make_tensor(
+                ar_output_ptr,
+                layout=cute.make_ordered_layout((num_tokens, fc2_n, 1), order=(1, 0, 2)),
+            )
+            ar_cta_exit_counter = cute.make_tensor(
+                ar_cta_exit_counter_ptr,
+                layout=cute.make_layout((1,)),
+            )
+            ar_rank_ready_flags = cute.make_tensor(
+                ar_rank_ready_flags_ptr,
+                layout=cute.make_layout((self.ar_num_ranks,)),
+            )
+        else:
+            ar_staging_ipc_ptrs = None
+            ar_output = None
+            ar_cta_exit_counter = None
+            ar_rank_ready_flags = None
+            ar_local_rank = cutlass.Int32(0)
+
         return self(
             fc1_a,
             fc1_b,
@@ -3166,6 +3359,11 @@ class FlashMoeFusedKernel:
             fc2_alpha,
             permuted_idx_to_expanded_idx,
             token_final_scales,
+            ar_staging_ipc_ptrs=ar_staging_ipc_ptrs,
+            ar_output=ar_output,
+            ar_cta_exit_counter=ar_cta_exit_counter,
+            ar_rank_ready_flags=ar_rank_ready_flags,
+            ar_local_rank=ar_local_rank,
             max_active_clusters=max_active_clusters,
             stream=stream,
         )
