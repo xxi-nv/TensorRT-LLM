@@ -321,9 +321,11 @@ def _flashmoe_worker_impl(
     )
     assert flash_output.dtype == torch.bfloat16, f"Expected bfloat16, got {flash_output.dtype}"
 
-    # Note: with random NVFP4 weights, output may contain non-finite values.
-    # Only check that the output is not all zeros (kernel actually ran).
-    assert flash_output.abs().sum() > 0, "Output is all zeros — kernel may not have run"
+    # Note: with random NVFP4 weights, output may contain non-finite values (inf/nan).
+    # Check that the kernel produced some non-zero output (including nan/inf).
+    has_nonzero = (flash_output != 0).any().item()
+    has_nonfinite = (~torch.isfinite(flash_output)).any().item()
+    assert has_nonzero or has_nonfinite, "Output is all zeros — kernel may not have run"
 
     return None
 

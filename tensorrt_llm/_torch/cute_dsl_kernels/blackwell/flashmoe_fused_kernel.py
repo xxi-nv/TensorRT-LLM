@@ -1255,7 +1255,7 @@ class FlashMoeFusedKernel:
             tma_atom_fc1_sfb,
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 2),
+            cute.group_modes(sSFB, 0, 3),
             cute.group_modes(fc1_tCgSFB, 0, 3),
         )
 
@@ -1281,14 +1281,14 @@ class FlashMoeFusedKernel:
             tma_atom_fc2_sfa,
             block_in_cluster_coord_vmnk[2],
             a_cta_layout,
-            cute.group_modes(sSFA, 0, 2),
+            cute.group_modes(sSFA, 0, 3),
             cute.group_modes(fc2_tCgSFA, 0, 3),
         )
         fc2_tBsSFB, fc2_tBgSFB = cpasync.tma_partition(
             tma_atom_fc2_sfb,
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 2),
+            cute.group_modes(sSFB, 0, 3),
             cute.group_modes(fc2_tCgSFB, 0, 3),
         )
 
