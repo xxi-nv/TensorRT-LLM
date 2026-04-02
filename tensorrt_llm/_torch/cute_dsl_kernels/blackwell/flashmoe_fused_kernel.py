@@ -1183,11 +1183,18 @@ class FlashMoeFusedKernel:
         )
 
         # FC2 tile info pipeline
+        # In FC2, warps 4-7 (LDGSTS) are idle and do NOT consume tile info.
+        # Consumer threads = warps {0-3, 8, 9} = epilogue(128) + MMA(32) + TMA(32) = 192.
+        fc2_consumer_threads = (
+            self.threads_per_warp * len(self.epilog_warp_id)
+            + self.threads_per_warp  # MMA warp
+            + self.threads_per_warp  # TMA warp
+        )
         fc2_tile_info_pipeline = PipelineAsync.create(
             barrier_storage=storage.fc2_tile_info_mbar_ptr.data_ptr(),
             num_stages=self.num_tile_stage,
             producer_group=CooperativeGroup(Agent.Thread, self.threads_per_warp),
-            consumer_group=CooperativeGroup(Agent.Thread, self.threads_wo_sched),
+            consumer_group=CooperativeGroup(Agent.Thread, fc2_consumer_threads),
         )
 
         # ============================================================
