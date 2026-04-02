@@ -337,7 +337,11 @@ class FlashMoE(torch.nn.Module):
         """
         import cutlass
         import cutlass.cute as cute
-        from cuda import cuda
+
+        try:
+            from cuda.bindings import driver as cuda
+        except ImportError:
+            from cuda import cuda
 
         from tensorrt_llm._torch.cute_dsl_kernels.blackwell.flashmoe_fused_kernel import (
             FlashMoeFusedKernel,
