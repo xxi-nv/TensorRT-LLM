@@ -446,8 +446,8 @@ class TestFlashMoEKernelConfig:
             all_warp_ids.add(wid)
         assert kernel.mma_warp_id not in all_warp_ids
         all_warp_ids.add(kernel.mma_warp_id)
-        assert kernel.tma_warp_id not in all_warp_ids
-        all_warp_ids.add(kernel.tma_warp_id)
+        assert kernel.tma_b_warp_id not in all_warp_ids
+        all_warp_ids.add(kernel.tma_b_warp_id)
         assert kernel.sched_warp_id not in all_warp_ids
         all_warp_ids.add(kernel.sched_warp_id)
 

@@ -138,8 +138,10 @@ class FlashMoE(torch.nn.Module):
         """Quantize BF16 input to NVFP4 + scale factors.
 
         Returns:
-            (x_nvfp4, x_sf): Quantized tensor and scale factors.
+            (x_nvfp4, x_sf): Quantized tensor [num_tokens, K/2] and
+                scale factors [num_tokens, K/sf_vec_size] (both uint8).
         """
+        num_tokens = x.shape[0]
         x_nvfp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x,
             self.fc31_input_scale,
@@ -147,6 +149,9 @@ class FlashMoE(torch.nn.Module):
             False,  # sf_use_ue8m0
             False,  # is_sf_swizzled_layout
         )
+        # fp4_quantize returns x_sf as a flat 1D tensor; reshape to 2D
+        # so it can be correctly sliced per-token in write_input().
+        x_sf = x_sf.view(num_tokens, -1)
         return x_nvfp4, x_sf
 
     def forward(
