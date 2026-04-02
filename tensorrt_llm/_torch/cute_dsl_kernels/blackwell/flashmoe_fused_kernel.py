@@ -2975,8 +2975,8 @@ class FlashMoeFusedKernel:
         fc1_c_ptr: cute.Pointer,
         fc1_sfa_ptr: cute.Pointer,
         fc1_sfb_ptr: cute.Pointer,
-        fc1_sfc_ptr: Optional[cute.Pointer],
-        fc1_norm_const_ptr: Optional[cute.Pointer],
+        fc1_sfc_ptr: cute.Pointer,
+        fc1_norm_const_ptr: cute.Pointer,
         fc1_alpha_ptr: cute.Pointer,
         # FC2 pointers
         fc2_a_ptr: cute.Pointer,
@@ -3049,29 +3049,27 @@ class FlashMoeFusedKernel:
             ),
         )
         # FC1 SFC: MMA-friendly layout (output scale factors)
-        fc1_sfc = None
-        if fc1_sfc_ptr is not None:
-            fc1_sfc = cute.make_tensor(
-                fc1_sfc_ptr,
-                layout=cute.make_ordered_layout(
-                    (
-                        32,
-                        4,
-                        m // 128,
-                        4,
-                        fc1_intermediate_sz // (scaling_vector_size * 4),
-                        l,
-                    ),
-                    order=(2, 1, 4, 0, 3, 5),
+        # Always provided (not optional) — caller must allocate fc1_c_sf
+        fc1_sfc = cute.make_tensor(
+            fc1_sfc_ptr,
+            layout=cute.make_ordered_layout(
+                (
+                    32,
+                    4,
+                    m // 128,
+                    4,
+                    fc1_intermediate_sz // (scaling_vector_size * 4),
+                    l,
                 ),
-            )
-        # FC1 norm const
-        fc1_norm_const = None
-        if fc1_norm_const_ptr is not None:
-            fc1_norm_const = cute.make_tensor(
-                fc1_norm_const_ptr,
-                layout=cute.make_layout((1,)),
-            )
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+        # FC1 norm const (global scale for FC2 input quantization)
+        # Always provided — caller must pass fc2_input_scale
+        fc1_norm_const = cute.make_tensor(
+            fc1_norm_const_ptr,
+            layout=cute.make_layout((1,)),
+        )
         # FC1 alpha: [L]
         fc1_alpha = cute.make_tensor(fc1_alpha_ptr, layout=cute.make_layout((l,)))
 
