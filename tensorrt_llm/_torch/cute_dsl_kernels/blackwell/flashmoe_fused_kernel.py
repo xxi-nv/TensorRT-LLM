@@ -24,7 +24,9 @@ Architecture (per CTA, 11 warps = 352 threads):
     MMA warp (8) computes GEMM, epilogue warps (0-3) apply SwiGLU + NVFP4 quant,
     scheduler warp (10) dispatches FC1 tiles.
 
-  Phase transition: CTA-wide named barrier (all warps sync).
+  Phase transition: Cross-CTA GMEM barrier (atomicAdd + spin on fc1_done_counter)
+    ensures ALL CTAs finish FC1 before any CTA starts FC2, since FC2 TMA reads
+    fc1_c rows written by arbitrary CTAs.
 
   Phase 2 -- FC2:
     TMA warp (9) loads A (FC1 output) + B (w2) + SFA + SFB,
