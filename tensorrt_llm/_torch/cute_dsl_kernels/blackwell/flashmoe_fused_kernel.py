@@ -2440,7 +2440,7 @@ class FlashMoeFusedKernel:
         # the final CTA sync barrier after FC2 completes.
 
         # --- FC2 TMA warp (warp 9): Load A+B+SFA+SFB ---
-        if warp_idx == self.tma_warp_id:
+        if warp_idx == self.tma_b_warp_id:
             fc2_ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.num_ab_stage,
@@ -3073,10 +3073,11 @@ class FlashMoeFusedKernel:
         # FC1 alpha: [L]
         fc1_alpha = cute.make_tensor(fc1_alpha_ptr, layout=cute.make_layout((l,)))
 
-        # FC2 A: [M, K2, L] row-major
+        # FC2 A: [M, K2, 1] row-major (contiguous buffer, L=1, expert
+        # selection is handled by tile_idx_to_expert_idx mapping B weights)
         fc2_a = cute.make_tensor(
             fc2_a_ptr,
-            layout=cute.make_ordered_layout((m, k2, l), order=(1, 0, 2)),
+            layout=cute.make_ordered_layout((m, k2, 1), order=(1, 0, 2)),
         )
         # FC2 B: [N2, K2, L] row-major
         fc2_b = cute.make_tensor(
@@ -3088,7 +3089,7 @@ class FlashMoeFusedKernel:
             fc2_out_ptr,
             layout=cute.make_ordered_layout((num_tokens, fc2_n, 1), order=(1, 0, 2)),
         )
-        # FC2 SFA: MMA-friendly layout
+        # FC2 SFA: MMA-friendly layout (L=1, same as FC2 A)
         fc2_sfa = cute.make_tensor(
             fc2_sfa_ptr,
             layout=cute.make_ordered_layout(
@@ -3098,7 +3099,7 @@ class FlashMoeFusedKernel:
                     m // 128,
                     4,
                     scale_k2 // 4,
-                    l,
+                    1,
                 ),
                 order=(2, 1, 4, 0, 3, 5),
             ),
