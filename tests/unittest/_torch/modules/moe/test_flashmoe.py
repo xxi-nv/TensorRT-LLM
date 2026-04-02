@@ -231,6 +231,9 @@ def _flashmoe_worker_impl(
     """
     import torch.distributed
 
+    # Use torch.distributed instead of MPI for communication
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+
     # Initialize process group
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
