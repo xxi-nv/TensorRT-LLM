@@ -248,13 +248,12 @@ def _flashmoe_worker_impl(
     # may block at griddepcontrol.wait forever.
     os.environ["TRTLLM_ENABLE_PDL"] = "0"
 
-    # Shorten NCCL timeout for faster failure detection (2 min vs 10 min)
-    os.environ["NCCL_TIMEOUT"] = "120"
-
     # Use torch.distributed instead of MPI for communication
     os.environ["TLLM_DISABLE_MPI"] = "1"
 
-    # Initialize process group
+    # Initialize process group with short timeout for faster failure detection
+    import datetime
+
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     if "MASTER_ADDR" not in os.environ:
@@ -262,7 +261,10 @@ def _flashmoe_worker_impl(
     if "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = "29500"
     if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="nccl")
+        torch.distributed.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(seconds=120),
+        )
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
