@@ -320,6 +320,11 @@ def _flashmoe_worker_impl(
     return None
 
 
+def _spawn_wrapper(rank, world_size, fn_args):
+    """Wrapper for torch.multiprocessing.spawn that unpacks arguments."""
+    _flashmoe_worker_impl(rank, world_size, *fn_args)
+
+
 @pytest.mark.skipif(
     _skip_reason() != "",
     reason=_skip_reason() or "Unknown",
@@ -345,46 +350,19 @@ class TestFlashMoEMultiGPU:
         top_k,
     ):
         """Basic functional test: FlashMoE output shape and finiteness."""
-        import sys
-
         world_size = min(torch.cuda.device_count(), 4)
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
-        from mpi4py.futures import MPIPoolExecutor
-
-        def init_worker(custom_paths):
-            import sys as _sys
-
-            for p in custom_paths:
-                if p not in _sys.path:
-                    _sys.path.append(p)
-
-        with MPIPoolExecutor(
-            initializer=init_worker,
-            initargs=(sys.path,),
-            max_workers=world_size,
-        ) as executor:
-            results = executor.map(
-                _flashmoe_worker_impl,
-                *zip(
-                    *[
-                        (
-                            rank,
-                            world_size,
-                            num_experts,
-                            hidden_size,
-                            intermediate_size,
-                            top_k,
-                            64,  # num_tokens_per_rank
-                            256,  # max_num_tokens
-                        )
-                        for rank in range(world_size)
-                    ]
-                ),
-            )
-            for r in results:
-                assert r is None
+        torch.multiprocessing.spawn(
+            _spawn_wrapper,
+            args=(
+                world_size,
+                (num_experts, hidden_size, intermediate_size, top_k, 64, 256),
+            ),
+            nprocs=world_size,
+            join=True,
+        )
 
     @pytest.mark.parametrize(
         "num_experts,hidden_size,intermediate_size,top_k",
@@ -400,47 +378,19 @@ class TestFlashMoEMultiGPU:
         top_k,
     ):
         """Fused kernel test: single persistent FC1+FC2 kernel."""
-        import sys
-
         world_size = min(torch.cuda.device_count(), 4)
         if world_size < 2:
             pytest.skip("Requires at least 2 GPUs")
 
-        from mpi4py.futures import MPIPoolExecutor
-
-        def init_worker(custom_paths):
-            import sys as _sys
-
-            for p in custom_paths:
-                if p not in _sys.path:
-                    _sys.path.append(p)
-
-        with MPIPoolExecutor(
-            initializer=init_worker,
-            initargs=(sys.path,),
-            max_workers=world_size,
-        ) as executor:
-            results = executor.map(
-                _flashmoe_worker_impl,
-                *zip(
-                    *[
-                        (
-                            rank,
-                            world_size,
-                            num_experts,
-                            hidden_size,
-                            intermediate_size,
-                            top_k,
-                            64,  # num_tokens_per_rank
-                            256,  # max_num_tokens
-                            True,  # use_fused_kernel
-                        )
-                        for rank in range(world_size)
-                    ]
-                ),
-            )
-            for r in results:
-                assert r is None
+        torch.multiprocessing.spawn(
+            _spawn_wrapper,
+            args=(
+                world_size,
+                (num_experts, hidden_size, intermediate_size, top_k, 64, 256, True),
+            ),
+            nprocs=world_size,
+            join=True,
+        )
 
 
 # ============================================================================
