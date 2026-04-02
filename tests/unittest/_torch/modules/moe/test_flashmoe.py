@@ -247,10 +247,13 @@ def _flashmoe_worker_impl(
     from tensorrt_llm._torch.modules.fused_moe.flashmoe import FlashMoE
     from tensorrt_llm.mapping import Mapping
 
+    # In pure EP mode, tp_size must equal world_size so that
+    # moe_world_size = tp_size = moe_tp_size * moe_ep_size * moe_cluster_size.
+    # This makes the TP group span all EP ranks, which is what allgather needs.
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
-        tp_size=1,
+        tp_size=world_size,
         moe_ep_size=ep_size,
         moe_tp_size=1,
     )
