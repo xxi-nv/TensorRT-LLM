@@ -201,9 +201,16 @@ class TestFlashMoECanImplement:
             FlashMoeFusedKernel,
         )
 
-        # hidden_size not divisible by 32
+        # hidden_size not divisible by 128 (MMA tile alignment)
         assert not FlashMoeFusedKernel.can_implement(
             hidden_size=7100,
+            intermediate_size=2048,
+            num_experts=256,
+            ep_size=8,
+        )
+        # hidden_size divisible by 32 but not 128
+        assert not FlashMoeFusedKernel.can_implement(
+            hidden_size=7200,
             intermediate_size=2048,
             num_experts=256,
             ep_size=8,
@@ -330,9 +337,128 @@ def _flashmoe_worker_impl(
     return None
 
 
+def _flashmoe_compare_worker_impl(
+    rank: int,
+    world_size: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_tokens_per_rank: int,
+    max_num_tokens: int,
+):
+    """Worker function for fused vs decomposed comparison test.
+
+    Runs both the fused (single FC1+FC2 persistent kernel) and decomposed
+    (separate FC1 + FC2 kernel launches) paths with the same input/weights,
+    and compares outputs element-by-element.
+    """
+    import torch.distributed
+
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    ep_size = world_size
+
+    from tensorrt_llm._torch.modules.fused_moe.flashmoe import FlashMoE
+    from tensorrt_llm._torch.modules.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm.mapping import Mapping
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=world_size,
+        moe_ep_size=ep_size,
+        moe_tp_size=1,
+    )
+
+    experts_per_rank = num_experts // ep_size
+    weights = _create_reference_weights(
+        num_experts=experts_per_rank,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    def _create_flashmoe(use_fused: bool) -> FlashMoE:
+        fm = FlashMoE(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            use_fused_kernel=use_fused,
+            use_ipc=False,
+        )
+        fm.w3w1_weight = weights["w3w1_weight"]
+        fm.w2_weight = weights["w2_weight"]
+        fm.fc1_weight_scale = weights["fc1_weight_scale"]
+        fm.fc2_weight_scale = weights["fc2_weight_scale"]
+        fm.fc1_alpha = weights["fc1_alpha"]
+        fm.fc2_alpha = weights["fc2_alpha"]
+        fm.fc31_input_scale = weights["fc31_input_scale"]
+        fm.fc2_input_scale = weights["fc2_input_scale"]
+        return fm
+
+    torch.manual_seed(42 + rank)
+    x = torch.randn(num_tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device)
+    router_logits = torch.randn(
+        num_tokens_per_rank, num_experts, dtype=torch.bfloat16, device=device
+    )
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+
+    # Run decomposed path (reference)
+    flashmoe_ref = _create_flashmoe(use_fused=False)
+    with torch.inference_mode():
+        ref_output = flashmoe_ref.forward(x, router_logits, routing_method)
+    torch.cuda.synchronize()
+
+    # Run fused path
+    flashmoe_fused = _create_flashmoe(use_fused=True)
+    with torch.inference_mode():
+        fused_output = flashmoe_fused.forward(x, router_logits, routing_method)
+    torch.cuda.synchronize()
+
+    # Compare outputs (both use NCCL AllReduce, so only kernel differs)
+    # Mask out non-finite values (random weights can cause overflow)
+    valid_mask = torch.isfinite(ref_output) & torch.isfinite(fused_output)
+    if valid_mask.any():
+        abs_diff = (fused_output[valid_mask] - ref_output[valid_mask]).abs()
+        max_diff = abs_diff.max().item()
+        mean_diff = abs_diff.mean().item()
+        print(
+            f"[Rank {rank}] Fused vs Decomposed: "
+            f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, "
+            f"valid={valid_mask.sum().item()}/{valid_mask.numel()}"
+        )
+        # NVFP4 numerics: expect very close match since both paths use
+        # the same MMA operations and data
+        assert max_diff < 0.1, f"Rank {rank}: max abs diff too large: {max_diff:.6f}"
+        assert mean_diff < 0.02, f"Rank {rank}: mean abs diff too large: {mean_diff:.6f}"
+    else:
+        print(f"[Rank {rank}] WARNING: No finite values to compare")
+
+    return None
+
+
 def _spawn_wrapper(rank, world_size, fn_args):
     """Wrapper for torch.multiprocessing.spawn that unpacks arguments."""
     _flashmoe_worker_impl(rank, world_size, *fn_args)
+
+
+def _spawn_compare_wrapper(rank, world_size, fn_args):
+    """Wrapper for torch.multiprocessing.spawn that unpacks arguments."""
+    _flashmoe_compare_worker_impl(rank, world_size, *fn_args)
 
 
 @pytest.mark.skipif(
@@ -397,6 +523,34 @@ class TestFlashMoEMultiGPU:
             args=(
                 world_size,
                 (num_experts, hidden_size, intermediate_size, top_k, 64, 256, True),
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+
+    @pytest.mark.parametrize(
+        "num_experts,hidden_size,intermediate_size,top_k",
+        [
+            (256, 7168, 2048, 8),  # DeepSeek-V3 config
+        ],
+    )
+    def test_flashmoe_fused_vs_decomposed(
+        self,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+    ):
+        """Correctness test: fused kernel matches decomposed (FC1+FC2) output."""
+        world_size = min(torch.cuda.device_count(), 4)
+        if world_size < 2:
+            pytest.skip("Requires at least 2 GPUs")
+
+        torch.multiprocessing.spawn(
+            _spawn_compare_wrapper,
+            args=(
+                world_size,
+                (num_experts, hidden_size, intermediate_size, top_k, 64, 256),
             ),
             nprocs=world_size,
             join=True,

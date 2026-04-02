@@ -374,7 +374,15 @@ class FlashMoeFusedKernel:
         ep_size: int,
         sf_vec_size: int = 16,
     ) -> bool:
-        """Check if FlashMoE fused kernel can run on this configuration."""
+        """Check if FlashMoE fused kernel can run on this configuration.
+
+        Requirements:
+        - Blackwell GPU (SM100/SM103)
+        - Expert parallelism (ep_size > 1)
+        - hidden_size divisible by 128 (MMA tile N and SFB layout alignment)
+        - intermediate_size divisible by 128 (MMA tile N and SFB layout)
+        - num_experts evenly divisible by ep_size
+        """
         from tensorrt_llm._utils import get_sm_version
 
         sm = get_sm_version()
@@ -382,7 +390,9 @@ class FlashMoeFusedKernel:
             return False
         if ep_size <= 1:
             return False
-        if hidden_size % 32 != 0:
+        # FC2 N = hidden_size and FC1 N = 2*intermediate_size both must be
+        # aligned to MMA tile (128) for SFB scale-factor layout correctness.
+        if hidden_size % 128 != 0:
             return False
         if intermediate_size % 128 != 0:
             return False
