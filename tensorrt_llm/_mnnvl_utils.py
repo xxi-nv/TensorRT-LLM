@@ -425,6 +425,215 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
         HelixCpMnnvlMemory.get_comm(mapping)
 
 
+class FlashMoeMnnvlMemory(MnnvlMemory):
+    """MNNVL memory for FlashMoE fully-fused EP execution.
+
+    Allocates IPC-accessible buffers per rank for:
+    - input_a: NVFP4-quantized activation (packed 2 values per byte)
+    - input_sfa: Scale factors for input_a (one uint8 per sf_vec_size elements)
+    - staging: BF16 staging buffer for FC2 output before AllReduce
+    - output: BF16 final output buffer after AllReduce
+    - fc1_counters: Per-expert-group atomic counters for FC1->FC2 barrier
+    - barriers: Completion barrier + CTA exit counter for AR synchronization
+
+    Input buffers are sized for max_input_tokens (per-rank local tokens).
+    Output/staging buffers are sized for max_output_tokens (global tokens across
+    all EP ranks), since FC2 scatter-adds to global token positions.
+
+    Per-class state is automatically isolated via __init_subclass__.
+    """
+
+    # Alignment for each sub-buffer within the per-rank region
+    _ALIGN = 256
+
+    def __init__(
+        self,
+        mapping: Mapping,
+        max_input_tokens: int,
+        max_output_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_expert_groups: int,
+        sf_vec_size: int = 16,
+    ):
+        self.max_input_tokens = max_input_tokens
+        self.max_output_tokens = max_output_tokens
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_expert_groups = num_expert_groups
+        self.sf_vec_size = sf_vec_size
+        self.sfa_cols = (hidden_size + sf_vec_size - 1) // sf_vec_size
+
+        align = self._ALIGN
+
+        def _align(size):
+            return (size + align - 1) & ~(align - 1)
+
+        # Input buffers: sized per-rank (max_input_tokens)
+        # input_a: NVFP4 packed, 2 values per byte
+        self._input_a_bytes = max_input_tokens * (hidden_size // 2)
+        # input_sfa: one uint8 scale per sf_vec_size elements
+        self._input_sfa_bytes = max_input_tokens * self.sfa_cols
+
+        # Output buffers: sized for global tokens (max_output_tokens)
+        # staging: bf16 for FC2 output before AllReduce (IPC-readable)
+        self._staging_bytes = max_output_tokens * hidden_size * 2
+        # output: bf16 final output after AllReduce
+        self._output_bytes = max_output_tokens * hidden_size * 2
+
+        # Per-expert-group FC1 tile counters: int32 each
+        self._counters_bytes = num_expert_groups * 4
+        # Completion barrier (int32) + CTA exit counter (int32)
+        self._barriers_bytes = 8
+
+        # Compute offsets (each sub-buffer aligned)
+        self.input_a_offset = 0
+        self.input_sfa_offset = _align(self._input_a_bytes)
+        self.staging_offset = self.input_sfa_offset + _align(self._input_sfa_bytes)
+        self.output_offset = self.staging_offset + _align(self._staging_bytes)
+        self.counters_offset = self.output_offset + _align(self._output_bytes)
+        self.barriers_offset = self.counters_offset + _align(self._counters_bytes)
+
+        total_per_rank = self.barriers_offset + _align(self._barriers_bytes)
+
+        super().__init__(mapping, total_per_rank)
+
+        self.local_rank = mapping.moe_ep_rank
+        self.num_ranks = mapping.moe_ep_size
+
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
+        """Get EP-based communicator (ranks grouped by PP+CP+TP, ordered by EP rank)."""
+        if cls.comm is not None:
+            return cls.comm
+        comm = mpi_comm().Split(
+            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.tp_size
+            + mapping.tp_rank,
+            mapping.moe_ep_rank,
+        )
+        cls.comm = comm
+        return comm
+
+    def _rank_ptr(self, rank: int, offset: int) -> int:
+        """Compute raw device pointer to rank's buffer at given offset."""
+        return self.ptr + (rank - self.local_rank) * self.rank_stride + offset
+
+    def get_input_ipc_ptrs(self) -> torch.Tensor:
+        """Return Int64 tensor of IPC pointers to each rank's input A buffer."""
+        return torch.tensor(
+            [self._rank_ptr(i, self.input_a_offset) for i in range(self.num_ranks)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+    def get_sfa_ipc_ptrs(self) -> torch.Tensor:
+        """Return Int64 tensor of IPC pointers to each rank's SFA buffer."""
+        return torch.tensor(
+            [self._rank_ptr(i, self.input_sfa_offset) for i in range(self.num_ranks)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+    def get_staging_ipc_ptrs(self) -> torch.Tensor:
+        """Return Int64 tensor of IPC pointers to each rank's staging buffer."""
+        return torch.tensor(
+            [self._rank_ptr(i, self.staging_offset) for i in range(self.num_ranks)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+    def get_local_input_a(self) -> torch.Tensor:
+        """Return local rank's input A buffer as uint8 [max_input_tokens, K/2]."""
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.input_a_offset
+        end = start + self._input_a_bytes
+        return full[self.local_rank, start:end].view(self.max_input_tokens, self.hidden_size // 2)
+
+    def get_local_input_sfa(self) -> torch.Tensor:
+        """Return local rank's SFA buffer as uint8 [max_input_tokens, sfa_cols]."""
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.input_sfa_offset
+        end = start + self._input_sfa_bytes
+        return full[self.local_rank, start:end].view(self.max_input_tokens, self.sfa_cols)
+
+    def get_local_output(self) -> torch.Tensor:
+        """Return local rank's output buffer as bf16 [max_output_tokens, hidden]."""
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.output_offset
+        end = start + self._output_bytes
+        buf = full[self.local_rank, start:end]
+        return buf.view(torch.bfloat16).view(self.max_output_tokens, self.hidden_size)
+
+    def get_local_staging(self) -> torch.Tensor:
+        """Return local rank's staging buffer as bf16 [max_output_tokens, hidden]."""
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.staging_offset
+        end = start + self._staging_bytes
+        buf = full[self.local_rank, start:end]
+        return buf.view(torch.bfloat16).view(self.max_output_tokens, self.hidden_size)
+
+    def get_counters_ptr(self) -> int:
+        """Return pointer to local rank's FC1 tile counters array."""
+        return self._rank_ptr(self.local_rank, self.counters_offset)
+
+    def get_barriers_ptr(self) -> int:
+        """Return pointer to local rank's barrier+exit_counter region."""
+        return self._rank_ptr(self.local_rank, self.barriers_offset)
+
+    def write_input(self, x_nvfp4: torch.Tensor, x_sf: torch.Tensor) -> None:
+        """Copy locally quantized NVFP4 input and SFA into IPC-accessible buffers."""
+        local_a = self.get_local_input_a()
+        local_sfa = self.get_local_input_sfa()
+        num_tokens = x_nvfp4.shape[0]
+        local_a[:num_tokens].copy_(x_nvfp4[:num_tokens].view_as(local_a[:num_tokens]))
+        local_sfa[:num_tokens].copy_(x_sf[:num_tokens].view_as(local_sfa[:num_tokens]))
+
+    def gather_all_input_a(self, tokens_per_rank: int) -> torch.Tensor:
+        """Gather NVFP4 input from all ranks via fabric memory.
+
+        Uses the strided tensor view to directly read each rank's input_a
+        buffer (IPC-accessible via NVLink fabric memory).
+
+        Args:
+            tokens_per_rank: Number of active tokens per rank to gather.
+
+        Returns:
+            Contiguous uint8 tensor [tokens_per_rank * num_ranks, hidden_size/2].
+        """
+        full = self.as_torch_strided_tensor(torch.uint8)
+        k_half = self.hidden_size // 2
+        start = self.input_a_offset
+        parts = []
+        for r in range(self.num_ranks):
+            end = start + tokens_per_rank * k_half
+            rank_data = full[r, start:end].reshape(tokens_per_rank, k_half)
+            parts.append(rank_data.clone())
+        return torch.cat(parts, dim=0)
+
+    def gather_all_input_sfa(self, tokens_per_rank: int) -> torch.Tensor:
+        """Gather SFA (scale factors for A) from all ranks via fabric memory.
+
+        Args:
+            tokens_per_rank: Number of active tokens per rank to gather.
+
+        Returns:
+            Contiguous uint8 tensor [tokens_per_rank * num_ranks, sfa_cols].
+        """
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.input_sfa_offset
+        parts = []
+        for r in range(self.num_ranks):
+            end = start + tokens_per_rank * self.sfa_cols
+            rank_data = full[r, start:end].reshape(tokens_per_rank, self.sfa_cols)
+            parts.append(rank_data.clone())
+        return torch.cat(parts, dim=0)
+
+    def barrier(self) -> None:
+        """Cross-rank barrier ensuring IPC data is visible to all ranks."""
+        torch.cuda.synchronize()
+        type(self).comm.Barrier()
+
+
 @dataclass
 class MoEAlltoallInfo:
     local_gather_indices: torch.Tensor
