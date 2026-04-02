@@ -501,14 +501,24 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         self.local_rank = mapping.moe_ep_rank
         self.num_ranks = mapping.moe_ep_size
 
+    # Separate class-level communicator so FlashMoE and base MnnvlMemory
+    # can coexist without clobbering each other's cached communicator.
+    comm = None
+
     @classmethod
     def get_comm(cls, mapping: Mapping):
-        """Get EP-based communicator (ranks grouped by PP+CP+TP, ordered by EP rank)."""
+        """Get EP-based communicator (ranks sharing the same MOE_TP position,
+        ordered by EP rank).
+
+        Color groups all EP ranks together: same PP+CP+MOE_TP position → same
+        color.  Key orders by moe_ep_rank so rank 0 in the communicator maps
+        to EP-rank 0.
+        """
         if cls.comm is not None:
             return cls.comm
         comm = mpi_comm().Split(
-            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.tp_size
-            + mapping.tp_rank,
+            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
+            + mapping.moe_tp_rank,
             mapping.moe_ep_rank,
         )
         cls.comm = comm
