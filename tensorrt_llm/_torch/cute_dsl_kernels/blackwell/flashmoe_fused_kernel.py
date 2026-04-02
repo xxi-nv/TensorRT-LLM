@@ -2872,7 +2872,7 @@ class FlashMoeFusedKernel:
 
                     # Early release accumulator if overlapping
                     if cutlass.const_expr(self.overlapping_accum):
-                        if fc2_subtile_idx == self.iter_acc_early_release_in_epilogue:
+                        if fc2_subtile_idx == self.fc2_iter_acc_early_release:
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
                                 fc2_acc_pipeline.consumer_release(fc2_epi_acc_consumer_state)
