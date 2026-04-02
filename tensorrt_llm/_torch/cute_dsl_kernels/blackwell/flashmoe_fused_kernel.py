@@ -2432,6 +2432,9 @@ class FlashMoeFusedKernel:
         fc1_all_done = cutlass.Int32(0)
         while fc1_all_done < num_ctas:
             fc1_all_done = ld_volatile_global_i32_addr(fc1_counter_addr)
+        # Acquire fence: guarantee that this CTA sees all FC1 GMEM
+        # writes from every other CTA before reading fc1_c in FC2.
+        fence_acq_rel_gpu()
 
         # ============================================================
         # ==================== FC2 PHASE =============================
