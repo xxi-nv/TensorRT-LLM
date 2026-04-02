@@ -44,13 +44,15 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
     from cuda import cuda
 from cutlass._mlir.dialects import math
-from cutlass.cute.nvgpu import blockscaled_utils, cpasync, sm100_utils, tcgen05
+from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .custom_pipeline import (
     Agent,
