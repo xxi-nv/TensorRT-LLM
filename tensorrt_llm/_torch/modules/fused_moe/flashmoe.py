@@ -37,10 +37,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import FlashMoeMnnvlMemory, MnnvlMemory
 from tensorrt_llm.mapping import Mapping
-
-from ...distributed import allgather
 
 
 class FlashMoE(torch.nn.Module):
@@ -63,6 +60,9 @@ class FlashMoE(torch.nn.Module):
         sf_vec_size: Scale-factor vector size for NVFP4 (default 16).
         use_fused_kernel: If True, use the single fused FC1+FC2 persistent kernel.
             If False, use decomposed FC1 + FC2 kernel launches (default).
+        use_ipc: If True, use MNNVL IPC memory for cross-rank data transfer.
+            If False, use torch.distributed.all_gather instead (for testing
+            without MNNVL/MPI infrastructure). Default True.
     """
 
     def __init__(
@@ -75,6 +75,7 @@ class FlashMoE(torch.nn.Module):
         max_num_tokens: int = 8192,
         sf_vec_size: int = 16,
         use_fused_kernel: bool = False,
+        use_ipc: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -85,6 +86,7 @@ class FlashMoE(torch.nn.Module):
         self.max_num_tokens = max_num_tokens
         self.sf_vec_size = sf_vec_size
         self.use_fused_kernel = use_fused_kernel
+        self.use_ipc = use_ipc
 
         self.ep_size = mapping.moe_ep_size
         self.ep_rank = mapping.moe_ep_rank
@@ -100,7 +102,7 @@ class FlashMoE(torch.nn.Module):
         self.num_expert_groups = self.experts_per_rank
 
         # Lazily initialized IPC memory
-        self._ipc_memory: Optional[FlashMoeMnnvlMemory] = None
+        self._ipc_memory = None
 
         # Weight buffers (to be loaded externally)
         # w3w1_weight: [num_local_experts, 2*intermediate_size/2, hidden_size/2] NVFP4
@@ -117,9 +119,11 @@ class FlashMoE(torch.nn.Module):
         self.fc2_input_scale: Optional[torch.Tensor] = None
 
     @property
-    def ipc_memory(self) -> FlashMoeMnnvlMemory:
+    def ipc_memory(self):
         """Lazily allocate IPC memory on first use."""
         if self._ipc_memory is None:
+            from tensorrt_llm._mnnvl_utils import FlashMoeMnnvlMemory, MnnvlMemory
+
             MnnvlMemory.initialize()
             self._ipc_memory = FlashMoeMnnvlMemory(
                 mapping=self.mapping,
@@ -154,6 +158,14 @@ class FlashMoE(torch.nn.Module):
         x_sf = x_sf.view(num_tokens, -1)
         return x_nvfp4, x_sf
 
+    def _allgather_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        """AllGather a tensor across EP ranks using torch.distributed."""
+        if self.ep_size <= 1:
+            return t
+        gathered = [torch.empty_like(t) for _ in range(self.ep_size)]
+        torch.distributed.all_gather(gathered, t)
+        return torch.cat(gathered, dim=0)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -177,8 +189,14 @@ class FlashMoE(torch.nn.Module):
 
         # --- Step 2: AllGather ONLY routing tensors (small, ~2 MB) ---
         if self.ep_size > 1:
-            token_selected_experts = allgather(token_selected_experts, self.mapping, dim=0)
-            token_final_scales = allgather(token_final_scales, self.mapping, dim=0)
+            if self.use_ipc:
+                from ...distributed import allgather
+
+                token_selected_experts = allgather(token_selected_experts, self.mapping, dim=0)
+                token_final_scales = allgather(token_final_scales, self.mapping, dim=0)
+            else:
+                token_selected_experts = self._allgather_tensor(token_selected_experts)
+                token_final_scales = self._allgather_tensor(token_final_scales)
 
         global_num_tokens = token_selected_experts.shape[0]
 
@@ -200,16 +218,26 @@ class FlashMoE(torch.nn.Module):
             tile_tokens_dim=self.tile_size,
         )
 
-        # --- Step 4: Quantize input -> write to IPC buffer ---
+        # --- Step 4: Quantize input + gather ---
         x_nvfp4, x_sf = self._quantize_input(x)
-        ipc_mem = self.ipc_memory
-        ipc_mem.write_input(x_nvfp4, x_sf)
-        ipc_mem.barrier()  # cross-rank sync
+
+        if self.use_ipc:
+            # IPC path: write to MNNVL fabric memory, gather via IPC pointers
+            ipc_mem = self.ipc_memory
+            ipc_mem.write_input(x_nvfp4, x_sf)
+            ipc_mem.barrier()  # cross-rank sync
+            gathered_a = ipc_mem.gather_all_input_a(local_num_tokens)
+            gathered_sfa = ipc_mem.gather_all_input_sfa(local_num_tokens)
+        else:
+            # Non-IPC path: use torch.distributed.all_gather for quantized data
+            gathered_a = self._allgather_tensor(x_nvfp4)
+            gathered_sfa = self._allgather_tensor(x_sf)
 
         # --- Step 5: Launch kernel ---
         launch_fn = self._launch_fused if self.use_fused_kernel else self._launch_decomposed
         output = launch_fn(
-            ipc_mem=ipc_mem,
+            gathered_a=gathered_a,
+            gathered_sfa=gathered_sfa,
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -225,7 +253,8 @@ class FlashMoE(torch.nn.Module):
 
     def _launch_decomposed(
         self,
-        ipc_mem: FlashMoeMnnvlMemory,
+        gathered_a: torch.Tensor,
+        gathered_sfa: torch.Tensor,
         tile_idx_to_expert_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -234,29 +263,16 @@ class FlashMoE(torch.nn.Module):
         global_num_tokens: int,
         local_num_tokens: int,
     ) -> torch.Tensor:
-        """Decomposed execution: IPC gather + FC1 + FC2 + NCCL AllReduce.
+        """Decomposed execution: FC1 + FC2 + AllReduce.
 
-        This calls the existing FC1 and FC2 CuTe DSL kernels separately,
-        with the key optimization being that FC1's input is gathered from
-        IPC buffers (NVFP4, ~8x smaller than bf16 AllGather).
-
-        When the fully-fused kernel is ready, this will be replaced by a
-        single kernel.launch() call.
+        Receives pre-gathered NVFP4 input (via IPC or torch.distributed) and
+        runs FC1 + FC2 CuTe DSL kernels followed by AllReduce.
 
         Returns:
             output: [global_num_tokens, hidden_size] bf16 tensor with
                     AllReduced results.
         """
         device = self.w3w1_weight.device
-
-        # ---------------------------------------------------------------
-        # IPC Gather: read NVFP4 input from all ranks' fabric memory
-        # ---------------------------------------------------------------
-        # This is the key FlashMoE optimization: instead of NCCL AllGather
-        # of bf16 hidden states (~112 MB for 8K tokens, 7K hidden), we
-        # gather only NVFP4 data (~14 MB, 8x smaller) via IPC.
-        gathered_a = ipc_mem.gather_all_input_a(local_num_tokens)
-        gathered_sfa = ipc_mem.gather_all_input_sfa(local_num_tokens)
 
         # ---------------------------------------------------------------
         # FC1: Gathered GEMM + SwiGLU + NVFP4 quant
@@ -322,7 +338,8 @@ class FlashMoE(torch.nn.Module):
 
     def _launch_fused(
         self,
-        ipc_mem: FlashMoeMnnvlMemory,
+        gathered_a: torch.Tensor,
+        gathered_sfa: torch.Tensor,
         tile_idx_to_expert_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -354,10 +371,6 @@ class FlashMoE(torch.nn.Module):
         from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 
         device = self.w3w1_weight.device
-
-        # IPC Gather: read NVFP4 input from all ranks' fabric memory
-        gathered_a = ipc_mem.gather_all_input_a(local_num_tokens)
-        gathered_sfa = ipc_mem.gather_all_input_sfa(local_num_tokens)
 
         # Total padded M dimension (from permuted_idx_to_expanded_idx)
         m = permuted_idx_to_expanded_idx.shape[0]

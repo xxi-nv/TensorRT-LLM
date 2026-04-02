@@ -272,6 +272,7 @@ def _flashmoe_worker_impl(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         use_fused_kernel=use_fused_kernel,
+        use_ipc=False,  # Use torch.distributed instead of MNNVL IPC
     )
 
     # Create weights for LOCAL experts only (not global).
