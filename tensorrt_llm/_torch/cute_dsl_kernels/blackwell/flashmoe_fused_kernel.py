@@ -3158,6 +3158,14 @@ class FlashMoeFusedKernel:
         # ============================================================
         # PDL: Signal dependent kernels
         # ============================================================
+        # When AR is enabled, warps 0-3/8-10 skip the AR body and
+        # reach here before warps 4-7 finish writing ar_output.
+        # griddepcontrol_launch_dependents() is per-CTA: the first
+        # thread to call it signals this CTA as "done", which could
+        # let a dependent kernel see partial AR writes.  A CTA-wide
+        # barrier ensures all AR stores are globally visible first.
+        if cutlass.const_expr(self.enable_ar):
+            self.cta_sync_barrier.arrive_and_wait()
         if cutlass.const_expr(TRTLLM_ENABLE_PDL):
             griddepcontrol_launch_dependents()
 
