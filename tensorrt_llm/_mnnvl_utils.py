@@ -515,8 +515,13 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         return comm
 
     def _rank_ptr(self, rank: int, offset: int) -> int:
-        """Compute raw device pointer to rank's buffer at given offset."""
-        return self.ptr + (rank - self.local_rank) * self.rank_stride + offset
+        """Compute raw device pointer to rank's buffer at given offset.
+
+        The MNNVL memory maps all ranks' buffers into the local VA space
+        starting from self.ptr (rank 0) with stride self.rank_stride.
+        Rank r's buffer is at: self.ptr + r * self.rank_stride.
+        """
+        return self.ptr + rank * self.rank_stride + offset
 
     def get_input_ipc_ptrs(self) -> torch.Tensor:
         """Return Int64 tensor of IPC pointers to each rank's input A buffer."""
