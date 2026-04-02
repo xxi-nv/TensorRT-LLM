@@ -98,6 +98,7 @@ class FlashMoeFusedKernel:
         raster_along_m: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
+        self.tile_size = mma_tiler_mn[0]
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = False  # 1CTA mode only

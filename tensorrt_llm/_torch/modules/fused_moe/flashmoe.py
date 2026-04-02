@@ -105,8 +105,9 @@ class FlashMoE(torch.nn.Module):
         self._ipc_memory = None
 
         # Weight buffers (to be loaded externally)
-        # w3w1_weight: [num_local_experts, 2*intermediate_size/2, hidden_size/2] NVFP4
-        # w2_weight: [num_local_experts, hidden_size/2, intermediate_size/2] NVFP4
+        # NVFP4: N dimension NOT packed, K dimension packed (2 FP4 per byte)
+        # w3w1_weight: [num_local_experts, 2*intermediate_size, hidden_size/2]
+        # w2_weight: [num_local_experts, hidden_size, intermediate_size/2]
         self.w3w1_weight: Optional[torch.Tensor] = None
         self.w2_weight: Optional[torch.Tensor] = None
 
