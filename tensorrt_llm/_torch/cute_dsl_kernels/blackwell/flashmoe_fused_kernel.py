@@ -75,6 +75,7 @@ from .utils import (
     add_bf16x2,
     atomic_add_func,
     atomic_add_global_i32_return,
+    fence_acq_rel_gpu,
     fence_sc_sys,
     fmin,
     griddepcontrol_launch_dependents,
@@ -3030,8 +3031,12 @@ class FlashMoeFusedKernel:
                 # Precompute base address for CTA exit counter
                 ar_counter_addr = ar_cta_exit_counter.iterator.llvm_ptr
 
-                # Step 1: CTA exit counter — signal that this CTA is done with FC2
-                # Thread 0 of warp 4 atomically increments the counter
+                # Step 1: GPU-scope fence + CTA exit counter
+                # The fence ensures all prior FC2 writes (from this CTA's
+                # epilogue) are visible to all threads on this GPU before
+                # the atomic increment. Without this, spinning threads
+                # may see the counter but miss FC2 data.
+                fence_acq_rel_gpu()
                 if warp_idx == self.ldgsts_a_warp_id[0]:
                     with cute.arch.elect_one():
                         atomic_add_global_i32_return(ar_cta_exit_counter, cutlass.Int32(1))

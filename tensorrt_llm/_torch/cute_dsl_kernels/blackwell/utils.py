@@ -438,6 +438,27 @@ def fence_sc_sys(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def fence_acq_rel_gpu(*, loc=None, ip=None):
+    """GPU-scope acquire-release memory fence.
+
+    Ensures all prior memory operations from this thread are visible to
+    all threads on this GPU before any subsequent operations. Used before
+    CTA exit counter atomic to ensure FC2 writes are visible to the
+    spinning threads that check the counter.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="fence.acq_rel.gpu;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_release_sys_i32(addr, val, *, loc=None, ip=None):
     """Store i32 with release semantics, system scope.
 
