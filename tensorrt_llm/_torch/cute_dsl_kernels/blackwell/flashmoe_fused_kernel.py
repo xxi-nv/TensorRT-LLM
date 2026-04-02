@@ -678,6 +678,8 @@ class FlashMoeFusedKernel:
         fc2_alpha: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
+        # Cross-CTA FC1→FC2 synchronization
+        fc1_done_counter: cute.Tensor = None,  # [1] Int32 GMEM counter
         # AllReduce parameters (only used when enable_ar=True)
         ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64
         ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
@@ -1001,13 +1003,15 @@ class FlashMoeFusedKernel:
             self.fc2_epi_layout,
             self.fc1_tile_sched_params,
             self.fc2_tile_sched_params,
+            # FC1→FC2 cross-CTA counter
+            fc1_done_counter,
+            grid[0],  # num_ctas (used for both FC1→FC2 sync and AR partitioning)
             # AR tensors (passed through even when disabled; kernel ignores via const_expr)
             ar_staging_ipc_ptrs,
             ar_output,
             ar_cta_exit_counter,
             ar_rank_ready_flag_ptrs,
             ar_local_rank if ar_local_rank is not None else cutlass.Int32(0),
-            grid[0],  # num_ctas for AR work partitioning
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1071,13 +1075,15 @@ class FlashMoeFusedKernel:
         fc2_epi_layout: cute.Layout,
         fc1_tile_sched_params: utils.PersistentTileSchedulerParams,
         fc2_tile_sched_params: utils.PersistentTileSchedulerParams,
+        # Cross-CTA FC1→FC2 synchronization counter
+        fc1_done_counter: cute.Tensor = None,  # [1] Int32 GMEM counter
+        num_ctas: cutlass.Int32 = None,  # total CTAs in grid
         # AllReduce parameters
         ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
         ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
         ar_cta_exit_counter: Optional[cute.Tensor] = None,  # [1] Int32
         ar_rank_ready_flag_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
         ar_local_rank: cutlass.Int32 = None,
-        ar_num_ctas: cutlass.Int32 = None,
     ):
         """Two-phase persistent GEMM kernel: FC1 -> barrier -> FC2 [-> AR]."""
         warp_idx = cute.arch.warp_idx()
@@ -2402,11 +2408,30 @@ class FlashMoeFusedKernel:
             c_pipeline.producer_tail()
 
         # ============================================================
-        # ==================== PHASE BARRIER =========================
+        # CROSS-CTA BARRIER: FC1 → FC2
         # ============================================================
-        # All warps synchronize before transitioning to FC2 phase.
-        # FC1 pipelines are fully drained at this point.
+        # FC2 reads FC1 output (fc1_c) written by ALL CTAs via TMA S2G.
+        # A CTA-local named barrier is NOT sufficient because CTA A's FC2
+        # may read rows written by CTA B's FC1.  We use a global atomic
+        # counter so every CTA waits until ALL CTAs have finished FC1.
+        #
+        # Protocol:
+        #   1. CTA-internal barrier (drain FC1 pipelines for this CTA).
+        #   2. GPU-scope release fence (make this CTA's FC1 TMA writes
+        #      visible to all SMs).
+        #   3. One thread per CTA: atomicAdd(fc1_done_counter, 1).
+        #   4. All threads spin until fc1_done_counter == num_ctas.
+        #   5. GPU-scope acquire fence (ensure all other CTAs' FC1 writes
+        #      are visible before FC2 reads them).
         self.phase_barrier.arrive_and_wait()
+        fence_acq_rel_gpu()
+        if warp_idx == self.epilog_warp_id[0]:
+            with cute.arch.elect_one():
+                atomic_add_global_i32_return(fc1_done_counter, cutlass.Int32(1))
+        fc1_counter_addr = fc1_done_counter.iterator.llvm_ptr
+        fc1_all_done = cutlass.Int32(0)
+        while fc1_all_done < num_ctas:
+            fc1_all_done = ld_volatile_global_i32_addr(fc1_counter_addr)
 
         # ============================================================
         # ==================== FC2 PHASE =============================
@@ -3052,7 +3077,7 @@ class FlashMoeFusedKernel:
 
                 # Step 2: All AR threads spin until all local CTAs are done
                 ar_all_ctas_done = cutlass.Int32(0)
-                while ar_all_ctas_done < ar_num_ctas:
+                while ar_all_ctas_done < num_ctas:
                     ar_all_ctas_done = ld_volatile_global_i32_addr(ar_counter_addr)
 
                 # Step 3: System fence + signal rank readiness to remote ranks
@@ -3089,7 +3114,7 @@ class FlashMoeFusedKernel:
 
                 # Partition: each CTA handles a contiguous chunk, threads within
                 # CTA are interleaved for coalescing
-                ar_vecs_per_cta = (ar_total_vecs + ar_num_ctas - 1) // ar_num_ctas
+                ar_vecs_per_cta = (ar_total_vecs + num_ctas - 1) // num_ctas
                 ar_cta_start = bidx * ar_vecs_per_cta
                 ar_cta_end = (bidx + 1) * ar_vecs_per_cta
                 if ar_cta_end > ar_total_vecs:
@@ -3171,6 +3196,8 @@ class FlashMoeFusedKernel:
         l: cutlass.Int64,  # number of local experts  # noqa: E741
         num_tokens: cutlass.Int64,  # total global tokens
         top_k: cutlass.Int64,  # number of experts per token
+        # Cross-CTA FC1→FC2 synchronization
+        fc1_done_counter_ptr: cute.Pointer = None,  # Int32 GMEM counter
         # AllReduce pointers (only used when enable_ar=True)
         ar_staging_ipc_ptrs_ptr: Optional[cute.Pointer] = None,  # Int64 array
         ar_output_ptr: Optional[cute.Pointer] = None,  # BFloat16 output
@@ -3323,6 +3350,12 @@ class FlashMoeFusedKernel:
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
 
+        # Cross-CTA FC1→FC2 synchronization counter
+        fc1_done_counter = cute.make_tensor(
+            fc1_done_counter_ptr,
+            layout=cute.make_layout((1,)),
+        )
+
         # Build AR tensors from pointers (only when AR is enabled)
         if cutlass.const_expr(self.enable_ar):
             ar_staging_ipc_ptrs = cute.make_tensor(
@@ -3369,6 +3402,7 @@ class FlashMoeFusedKernel:
             fc2_alpha,
             permuted_idx_to_expanded_idx,
             token_final_scales,
+            fc1_done_counter=fc1_done_counter,
             ar_staging_ipc_ptrs=ar_staging_ipc_ptrs,
             ar_output=ar_output,
             ar_cta_exit_counter=ar_cta_exit_counter,

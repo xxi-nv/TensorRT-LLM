@@ -539,6 +539,14 @@ class FlashMoE(torch.nn.Module):
             cute.AddressSpace.gmem,
         )
 
+        # Cross-CTA FC1→FC2 synchronization counter (GMEM, zeroed before each launch)
+        fc1_done_counter = torch.zeros(1, dtype=torch.int32, device=device)
+        fc1_done_counter_ptr = make_ptr(
+            cutlass.Int32,
+            fc1_done_counter.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+
         # Build AR pointers (only when AR is enabled)
         ar_staging_ipc_ptrs_ptr = None
         ar_output_ptr = None
@@ -630,6 +638,7 @@ class FlashMoE(torch.nn.Module):
                 self.experts_per_rank,
                 global_num_tokens,
                 self.top_k,
+                fc1_done_counter_ptr=fc1_done_counter_ptr,
                 ar_staging_ipc_ptrs_ptr=ar_staging_ipc_ptrs_ptr,
                 ar_output_ptr=ar_output_ptr,
                 ar_cta_exit_counter_ptr=ar_cta_exit_counter_ptr,
@@ -681,6 +690,7 @@ class FlashMoE(torch.nn.Module):
             self.experts_per_rank,
             global_num_tokens,
             self.top_k,
+            fc1_done_counter_ptr=fc1_done_counter_ptr,
             ar_staging_ipc_ptrs_ptr=ar_staging_ipc_ptrs_ptr,
             ar_output_ptr=ar_output_ptr,
             ar_cta_exit_counter_ptr=ar_cta_exit_counter_ptr,
