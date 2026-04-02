@@ -700,8 +700,8 @@ class FlashMoE(torch.nn.Module):
         )
 
         # Diagnostic: poll-wait for kernel completion with timeout.
-        # If the kernel deadlocks, read fc1_done_counter to determine
-        # which phase (FC1 or FC2) is stuck.
+        # If the kernel deadlocks, read fc1_done_counter on a SEPARATE
+        # stream (default stream is blocked behind the stuck kernel).
         import logging
         import time as _time
 
@@ -711,16 +711,21 @@ class FlashMoE(torch.nn.Module):
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
-                # Kernel timed out — read fc1_done_counter for diagnosis
+                # Kernel timed out — read fc1_done_counter on a fresh stream
+                # so the D2H copy is not blocked behind the stuck kernel.
                 try:
-                    fc1_val = fc1_done_counter.cpu().item()
+                    diag_stream = torch.cuda.Stream()
+                    with torch.cuda.stream(diag_stream):
+                        fc1_snap = fc1_done_counter.clone()
+                    diag_stream.synchronize()
+                    fc1_val = fc1_snap.item()
                     logger.error(
                         "Fused kernel DEADLOCK (60s timeout). fc1_done_counter=%d — FC1 phase %s",
                         fc1_val,
                         "likely COMPLETED (>0)" if fc1_val > 0 else "STUCK (=0)",
                     )
-                except Exception:
-                    logger.error("Fused kernel DEADLOCK and cannot read counter")
+                except Exception as e:
+                    logger.error("Fused kernel DEADLOCK, counter read failed: %s", e)
                 raise RuntimeError("FlashMoE fused kernel deadlock detected (60s timeout)")
             _time.sleep(0.1)
         fc1_val = fc1_done_counter.item()
