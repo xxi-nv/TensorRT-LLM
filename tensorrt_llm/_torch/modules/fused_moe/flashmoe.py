@@ -16,21 +16,19 @@
 
 This standalone module replaces the separate AllGather -> FC1 -> FC2 -> ReduceScatter
 pipeline with a single persistent cuteDSL kernel on Blackwell that:
-  1. Gathers hidden-state data directly from remote ranks via IPC (LDGSTS).
+  1. Gathers hidden-state data from remote ranks via MNNVL fabric memory.
   2. Computes FC1 (GEMM + SwiGLU + NVFP4 quant) per expert group.
-  3. Computes FC2 (GEMM) per expert group, gated by per-expert-group barrier.
-  4. Performs in-kernel AllReduce across EP ranks.
+  3. Computes FC2 (GEMM + scatter-add) per expert group.
+  4. Optionally performs in-kernel AllReduce across EP ranks via IPC.
 
 Pre-kernel Python orchestration:
   1. Local routing -> AllGather ONLY small routing tensors (~2 MB).
   2. moe_sort with global routing -> token_id_mapping with global token indices.
-  3. Quantize local input to NVFP4 -> write to IPC buffer + cross-rank barrier.
-  4. Launch fused kernel with IPC pointers.
+  3. Quantize local input to NVFP4 -> gather via MNNVL fabric memory.
+  4. Launch fused FC1+FC2 kernel (with optional in-kernel AllReduce).
 
-Current implementation uses a decomposed approach (separate FC1 + FC2 kernel
-launches + NCCL AllReduce) as a stepping stone. The IPC gather for FC1 input
-is the key optimization: only ~14 MB of NVFP4 data is transferred via IPC
-instead of ~112 MB of bf16 via NCCL AllGather.
+The IPC gather for FC1 input transfers only ~14 MB of NVFP4 data via NVLink
+fabric memory instead of ~112 MB of bf16 via NCCL AllGather.
 """
 
 from typing import Optional
@@ -46,9 +44,13 @@ class FlashMoE(torch.nn.Module):
     Orchestrates the pre-kernel flow (small AllGather + moe_sort + IPC write)
     and launches FC1 + FC2 with IPC-gathered input.
 
-    The decomposed mode calls existing FC1/FC2 CuTe DSL kernels with IPC-
-    gathered NVFP4 input. The future fused mode will combine both phases
-    into a single persistent kernel.
+    Two execution modes:
+    - Fused (use_fused_kernel=True): FC1+FC2 in a single persistent CuTe DSL
+      kernel (FlashMoeFusedKernel). When EP > 1 and use_ipc=True, includes
+      in-kernel AllReduce via IPC staging buffers.
+    - Decomposed (use_fused_kernel=False): Separate FC1 and FC2 kernel launches
+      using existing CuTe DSL kernels, with NCCL AllReduce. Useful as a
+      reference and fallback.
 
     Args:
         hidden_size: Model hidden dimension.

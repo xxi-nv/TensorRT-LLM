@@ -2405,9 +2405,8 @@ class FlashMoeFusedKernel:
         # blockscaled_contiguous_grouped_gemm_finalize_fusion.py.
         # TMA warp loads A (FC1 output) + B (w2) + SFA + SFB,
         # MMA warp computes GEMM, epilogue warps apply scatter-add.
-        # Warps 4-7 (LDGSTS) are idle during FC2.
-        #
-        # TODO: FC2 warp bodies will be added in subsequent edits.
+        # Warps 4-7 (LDGSTS) are idle during FC2 GEMM, then become
+        # AR warps if in-kernel AllReduce is enabled.
         # ============================================================
 
         # --- FC2 Scheduler warp (warp 10) ---

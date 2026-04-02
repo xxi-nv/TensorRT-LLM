@@ -628,7 +628,8 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         """Gather NVFP4 input from all ranks via fabric memory.
 
         Uses the strided tensor view to directly read each rank's input_a
-        buffer (IPC-accessible via NVLink fabric memory).
+        buffer (IPC-accessible via NVLink fabric memory).  Copies directly
+        into a pre-allocated output to avoid intermediate clone/cat overhead.
 
         Args:
             tokens_per_rank: Number of active tokens per rank to gather.
@@ -639,15 +640,23 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         full = self.as_torch_strided_tensor(torch.uint8)
         k_half = self.hidden_size // 2
         start = self.input_a_offset
-        parts = []
+        nbytes = tokens_per_rank * k_half
+        result = torch.empty(
+            tokens_per_rank * self.num_ranks,
+            k_half,
+            dtype=torch.uint8,
+            device="cuda",
+        )
         for r in range(self.num_ranks):
-            end = start + tokens_per_rank * k_half
-            rank_data = full[r, start:end].reshape(tokens_per_rank, k_half)
-            parts.append(rank_data.clone())
-        return torch.cat(parts, dim=0)
+            src = full[r, start : start + nbytes].reshape(tokens_per_rank, k_half)
+            result[r * tokens_per_rank : (r + 1) * tokens_per_rank].copy_(src)
+        return result
 
     def gather_all_input_sfa(self, tokens_per_rank: int) -> torch.Tensor:
         """Gather SFA (scale factors for A) from all ranks via fabric memory.
+
+        Copies directly into a pre-allocated output to avoid intermediate
+        clone/cat overhead.
 
         Args:
             tokens_per_rank: Number of active tokens per rank to gather.
@@ -657,12 +666,17 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         """
         full = self.as_torch_strided_tensor(torch.uint8)
         start = self.input_sfa_offset
-        parts = []
+        nbytes = tokens_per_rank * self.sfa_cols
+        result = torch.empty(
+            tokens_per_rank * self.num_ranks,
+            self.sfa_cols,
+            dtype=torch.uint8,
+            device="cuda",
+        )
         for r in range(self.num_ranks):
-            end = start + tokens_per_rank * self.sfa_cols
-            rank_data = full[r, start:end].reshape(tokens_per_rank, self.sfa_cols)
-            parts.append(rank_data.clone())
-        return torch.cat(parts, dim=0)
+            src = full[r, start : start + nbytes].reshape(tokens_per_rank, self.sfa_cols)
+            result[r * tokens_per_rank : (r + 1) * tokens_per_rank].copy_(src)
+        return result
 
     def barrier(self) -> None:
         """Cross-rank barrier ensuring IPC data is visible to all ranks."""
