@@ -349,10 +349,12 @@ class FlashMoE(torch.nn.Module):
         global_num_tokens: int,
         local_num_tokens: int,
     ) -> torch.Tensor:
-        """Fused execution: single kernel for FC1 + FC2 + NCCL AllReduce.
+        """Fused execution: single kernel for FC1 + FC2 [+ in-kernel AllReduce].
 
         Uses FlashMoeFusedKernel to execute both FC1 (GEMM+SwiGLU+quant) and
         FC2 (GEMM+scatter-add) in a single persistent kernel launch.
+        When EP > 1 and IPC is available, the kernel also performs in-kernel
+        AllReduce via IPC staging buffers, eliminating the need for NCCL.
 
         Returns:
             output: [global_num_tokens, hidden_size] bf16 tensor with
@@ -372,6 +374,7 @@ class FlashMoE(torch.nn.Module):
         from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 
         device = self.w3w1_weight.device
+        enable_ar = self.ep_size > 1 and self.use_ipc
 
         # Total padded M dimension (from permuted_idx_to_expanded_idx)
         m = permuted_idx_to_expanded_idx.shape[0]
@@ -394,13 +397,29 @@ class FlashMoE(torch.nn.Module):
             device=device,
         )
 
-        # Allocate FC2 output buffer (bf16)
-        output = torch.zeros(
-            global_num_tokens,
-            self.hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        # FC2 output buffer: when AR is enabled, FC2 writes to IPC staging
+        # (so other ranks can read via IPC), and AR writes to a separate output.
+        # When AR is disabled, FC2 writes directly to the output buffer.
+        if enable_ar:
+            ipc_mem = self.ipc_memory
+            # Reset AR synchronization state and staging buffer
+            ipc_mem.reset_ar_state()
+            staging = ipc_mem.get_local_staging()
+            staging[:global_num_tokens].zero_()  # FC2 scatter-adds to this
+            # AR output buffer (not necessarily IPC, just local GMEM)
+            output = torch.empty(
+                global_num_tokens,
+                self.hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        else:
+            output = torch.zeros(
+                global_num_tokens,
+                self.hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
 
         # Build CuTe pointers
         fc1_a_ptr = make_ptr(
@@ -462,9 +481,11 @@ class FlashMoE(torch.nn.Module):
             cute.AddressSpace.gmem,
             assumed_align=32,
         )
+        # FC2 writes to staging (IPC) when AR is enabled, else to output
+        fc2_out_data_ptr = staging.data_ptr() if enable_ar else output.data_ptr()
         fc2_out_ptr = make_ptr(
             cutlass.BFloat16,
-            output.data_ptr(),
+            fc2_out_data_ptr,
             cute.AddressSpace.gmem,
             assumed_align=32,
         )
@@ -516,11 +537,49 @@ class FlashMoE(torch.nn.Module):
             cute.AddressSpace.gmem,
         )
 
+        # Build AR pointers (only when AR is enabled)
+        ar_staging_ipc_ptrs_ptr = None
+        ar_output_ptr = None
+        ar_cta_exit_counter_ptr = None
+        ar_rank_ready_flag_ptrs_ptr = None
+        ar_local_rank = None
+
+        if enable_ar:
+            # IPC pointers to all ranks' staging buffers
+            staging_ipc_ptrs = ipc_mem.get_staging_ipc_ptrs()
+            ar_staging_ipc_ptrs_ptr = make_ptr(
+                cutlass.Int64,
+                staging_ipc_ptrs.data_ptr(),
+                cute.AddressSpace.gmem,
+            )
+            # AR output buffer
+            ar_output_ptr = make_ptr(
+                cutlass.BFloat16,
+                output.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+            # CTA exit counter (1-element Int32 in MNNVL memory)
+            cta_exit_counter = ipc_mem.get_cta_exit_counter()
+            ar_cta_exit_counter_ptr = make_ptr(
+                cutlass.Int32,
+                cta_exit_counter.data_ptr(),
+                cute.AddressSpace.gmem,
+            )
+            # IPC pointers to each rank's ready flag
+            rank_ready_flag_ptrs = ipc_mem.get_rank_ready_flag_ipc_ptrs()
+            ar_rank_ready_flag_ptrs_ptr = make_ptr(
+                cutlass.Int64,
+                rank_ready_flag_ptrs.data_ptr(),
+                cute.AddressSpace.gmem,
+            )
+            ar_local_rank = self.ep_rank
+
         # Create or retrieve cached kernel
         if not hasattr(self, "_fused_kernel_cache"):
             self._fused_kernel_cache = {}
 
-        cache_key = (self.sf_vec_size, self.tile_size, self.top_k)
+        cache_key = (self.sf_vec_size, self.tile_size, self.top_k, enable_ar)
         if cache_key not in self._fused_kernel_cache:
             kernel = FlashMoeFusedKernel(
                 sf_vec_size=self.sf_vec_size,
@@ -529,6 +588,8 @@ class FlashMoE(torch.nn.Module):
                 vectorized_f32=True,
                 topk=self.top_k,
                 raster_along_m=False,
+                enable_ar=enable_ar,
+                ar_num_ranks=self.ep_size if enable_ar else 1,
             )
             hardware_info = cutlass.utils.HardwareInfo()
             max_active_clusters = hardware_info.get_max_active_clusters(1)
@@ -567,6 +628,11 @@ class FlashMoE(torch.nn.Module):
                 self.experts_per_rank,
                 global_num_tokens,
                 self.top_k,
+                ar_staging_ipc_ptrs_ptr=ar_staging_ipc_ptrs_ptr,
+                ar_output_ptr=ar_output_ptr,
+                ar_cta_exit_counter_ptr=ar_cta_exit_counter_ptr,
+                ar_rank_ready_flag_ptrs_ptr=ar_rank_ready_flag_ptrs_ptr,
+                ar_local_rank=ar_local_rank,
                 scaling_vector_size=self.sf_vec_size,
                 max_active_clusters=max_active_clusters,
                 stream=stream,
@@ -574,6 +640,11 @@ class FlashMoE(torch.nn.Module):
             self._fused_kernel_cache[cache_key] = compiled
         else:
             compiled = self._fused_kernel_cache[cache_key]
+
+        # Cross-rank barrier to ensure AR state reset and staging zeroing
+        # are visible before kernel launch
+        if enable_ar:
+            ipc_mem.barrier()
 
         torch_stream = torch.cuda.current_stream()
         stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -608,11 +679,17 @@ class FlashMoE(torch.nn.Module):
             self.experts_per_rank,
             global_num_tokens,
             self.top_k,
+            ar_staging_ipc_ptrs_ptr=ar_staging_ipc_ptrs_ptr,
+            ar_output_ptr=ar_output_ptr,
+            ar_cta_exit_counter_ptr=ar_cta_exit_counter_ptr,
+            ar_rank_ready_flag_ptrs_ptr=ar_rank_ready_flag_ptrs_ptr,
+            ar_local_rank=ar_local_rank,
             stream=stream,
         )
 
-        # AllReduce across EP ranks
-        if self.ep_size > 1:
+        # AllReduce: when AR is enabled, the kernel already reduced the output.
+        # When AR is disabled, fall back to NCCL AllReduce.
+        if not enable_ar and self.ep_size > 1:
             torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
 
         return output

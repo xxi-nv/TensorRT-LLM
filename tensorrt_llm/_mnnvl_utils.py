@@ -580,6 +580,42 @@ class FlashMoeMnnvlMemory(MnnvlMemory):
         """Return pointer to local rank's barrier+exit_counter region."""
         return self._rank_ptr(self.local_rank, self.barriers_offset)
 
+    def get_cta_exit_counter(self) -> torch.Tensor:
+        """Return local rank's CTA exit counter as a 1-element Int32 tensor.
+
+        The CTA exit counter is at offset 0 within the barriers region.
+        """
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.barriers_offset
+        buf = full[self.local_rank, start : start + 4]
+        return buf.view(torch.int32)
+
+    def get_rank_ready_flag_ipc_ptrs(self) -> torch.Tensor:
+        """Return Int64 tensor of IPC pointers to each rank's ready flag.
+
+        Each rank's ready flag is a single Int32 at offset 4 within its
+        barriers region (right after the cta_exit_counter). The flag is
+        written by the owning rank and read by all ranks via IPC.
+        """
+        flag_offset = self.barriers_offset + 4
+        return torch.tensor(
+            [self._rank_ptr(i, flag_offset) for i in range(self.num_ranks)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+    def reset_ar_state(self) -> None:
+        """Reset AllReduce synchronization state before kernel launch.
+
+        Zeros the local rank's CTA exit counter and rank ready flag.
+        Must be followed by a cross-rank barrier() to ensure all ranks
+        have reset before the kernel starts.
+        """
+        full = self.as_torch_strided_tensor(torch.uint8)
+        start = self.barriers_offset
+        end = start + self._barriers_bytes
+        full[self.local_rank, start:end].zero_()
+
     def write_input(self, x_nvfp4: torch.Tensor, x_sf: torch.Tensor) -> None:
         """Copy locally quantized NVFP4 input and SFA into IPC-accessible buffers."""
         local_a = self.get_local_input_a()

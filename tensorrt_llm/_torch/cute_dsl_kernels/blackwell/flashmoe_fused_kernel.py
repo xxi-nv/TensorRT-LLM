@@ -671,7 +671,7 @@ class FlashMoeFusedKernel:
         ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64
         ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
         ar_cta_exit_counter: Optional[cute.Tensor] = None,  # [1] Int32
-        ar_rank_ready_flags: Optional[cute.Tensor] = None,  # [num_ranks] Int32
+        ar_rank_ready_flag_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
         ar_local_rank: Optional[cutlass.Int32] = None,
         # Config
         max_active_clusters: cutlass.Constexpr = None,
@@ -994,7 +994,7 @@ class FlashMoeFusedKernel:
             ar_staging_ipc_ptrs,
             ar_output,
             ar_cta_exit_counter,
-            ar_rank_ready_flags,
+            ar_rank_ready_flag_ptrs,
             ar_local_rank if ar_local_rank is not None else cutlass.Int32(0),
             grid[0],  # num_ctas for AR work partitioning
         ).launch(
@@ -1064,7 +1064,7 @@ class FlashMoeFusedKernel:
         ar_staging_ipc_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
         ar_output: Optional[cute.Tensor] = None,  # [M', N2] BFloat16 final output
         ar_cta_exit_counter: Optional[cute.Tensor] = None,  # [1] Int32
-        ar_rank_ready_flags: Optional[cute.Tensor] = None,  # [num_ranks] Int32 (IPC)
+        ar_rank_ready_flag_ptrs: Optional[cute.Tensor] = None,  # [num_ranks] Int64 IPC ptrs
         ar_local_rank: cutlass.Int32 = None,
         ar_num_ctas: cutlass.Int32 = None,
     ):
@@ -3027,9 +3027,8 @@ class FlashMoeFusedKernel:
                 tidx, _, _ = cute.arch.thread_idx()
                 ar_thread_idx = tidx - self.ldgsts_a_warp_id[0] * self.threads_per_warp
 
-                # Precompute base addresses for CTA exit counter and flags
+                # Precompute base address for CTA exit counter
                 ar_counter_addr = ar_cta_exit_counter.iterator.llvm_ptr
-                ar_flags_base_addr = ar_rank_ready_flags.iterator.llvm_ptr
 
                 # Step 1: CTA exit counter — signal that this CTA is done with FC2
                 # Thread 0 of warp 4 atomically increments the counter
@@ -3049,24 +3048,21 @@ class FlashMoeFusedKernel:
                     fence_sc_sys()
                     if warp_idx == self.ldgsts_a_warp_id[0]:
                         with cute.arch.elect_one():
-                            # Compute address: flags_base + local_rank * 4 (sizeof Int32)
-                            ar_local_rank_i64 = i32_to_i64(ar_local_rank)
-                            ar_local_flag_addr = ptr_add_i64(
-                                ar_flags_base_addr,
-                                i64_mul(ar_local_rank_i64, cutlass.Int64(4)),
-                            )
-                            st_release_sys_i32_addr(ar_local_flag_addr, cutlass.Int32(1))
+                            # Write to local rank's ready flag via IPC pointer.
+                            # Use compile-time unrolled loop to find the local
+                            # rank's IPC pointer (runtime comparison with
+                            # compile-time index).
+                            for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
+                                if cutlass.Int32(ar_r) == ar_local_rank:
+                                    ar_local_flag_ipc = ar_rank_ready_flag_ptrs[ar_r]
+                                    st_release_sys_i32_addr(ar_local_flag_ipc, cutlass.Int32(1))
 
-                # Step 4: Wait for all ranks to be ready
+                # Step 4: Wait for all ranks to be ready (IPC read)
                 for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
-                    ar_r_i64 = i32_to_i64(cutlass.Int32(ar_r))
-                    ar_r_flag_addr = ptr_add_i64(
-                        ar_flags_base_addr,
-                        i64_mul(ar_r_i64, cutlass.Int64(4)),
-                    )
+                    ar_r_flag_ipc = ar_rank_ready_flag_ptrs[ar_r]
                     ar_flag = cutlass.Int32(0)
                     while ar_flag == 0:
-                        ar_flag = ld_acquire_sys_i32_addr(ar_r_flag_addr)
+                        ar_flag = ld_acquire_sys_i32_addr(ar_r_flag_ipc)
 
                 # Step 5: AllReduce — partition output across CTAs and AR threads
                 # Total bf16 elements = num_tokens * hidden_size (from fc2_out shape)
@@ -3165,7 +3161,7 @@ class FlashMoeFusedKernel:
         ar_staging_ipc_ptrs_ptr: Optional[cute.Pointer] = None,  # Int64 array
         ar_output_ptr: Optional[cute.Pointer] = None,  # BFloat16 output
         ar_cta_exit_counter_ptr: Optional[cute.Pointer] = None,  # Int32
-        ar_rank_ready_flags_ptr: Optional[cute.Pointer] = None,  # Int32 array
+        ar_rank_ready_flag_ptrs_ptr: Optional[cute.Pointer] = None,  # Int64 array (IPC)
         ar_local_rank: Optional[cutlass.Int32] = None,
         # Constexpr config
         scaling_vector_size: cutlass.Constexpr = None,
@@ -3327,15 +3323,15 @@ class FlashMoeFusedKernel:
                 ar_cta_exit_counter_ptr,
                 layout=cute.make_layout((1,)),
             )
-            ar_rank_ready_flags = cute.make_tensor(
-                ar_rank_ready_flags_ptr,
+            ar_rank_ready_flag_ptrs = cute.make_tensor(
+                ar_rank_ready_flag_ptrs_ptr,
                 layout=cute.make_layout((self.ar_num_ranks,)),
             )
         else:
             ar_staging_ipc_ptrs = None
             ar_output = None
             ar_cta_exit_counter = None
-            ar_rank_ready_flags = None
+            ar_rank_ready_flag_ptrs = None
             ar_local_rank = cutlass.Int32(0)
 
         return self(
@@ -3362,7 +3358,7 @@ class FlashMoeFusedKernel:
             ar_staging_ipc_ptrs=ar_staging_ipc_ptrs,
             ar_output=ar_output,
             ar_cta_exit_counter=ar_cta_exit_counter,
-            ar_rank_ready_flags=ar_rank_ready_flags,
+            ar_rank_ready_flag_ptrs=ar_rank_ready_flag_ptrs,
             ar_local_rank=ar_local_rank,
             max_active_clusters=max_active_clusters,
             stream=stream,
