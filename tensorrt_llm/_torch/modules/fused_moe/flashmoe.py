@@ -61,6 +61,8 @@ class FlashMoE(torch.nn.Module):
         mapping: Parallelism mapping (EP rank/size, TP, etc.).
         max_num_tokens: Maximum tokens per rank for IPC buffer sizing.
         sf_vec_size: Scale-factor vector size for NVFP4 (default 16).
+        use_fused_kernel: If True, use the single fused FC1+FC2 persistent kernel.
+            If False, use decomposed FC1 + FC2 kernel launches (default).
     """
 
     def __init__(
@@ -72,6 +74,7 @@ class FlashMoE(torch.nn.Module):
         mapping: Mapping,
         max_num_tokens: int = 8192,
         sf_vec_size: int = 16,
+        use_fused_kernel: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -81,6 +84,7 @@ class FlashMoE(torch.nn.Module):
         self.mapping = mapping
         self.max_num_tokens = max_num_tokens
         self.sf_vec_size = sf_vec_size
+        self.use_fused_kernel = use_fused_kernel
 
         self.ep_size = mapping.moe_ep_size
         self.ep_rank = mapping.moe_ep_rank
@@ -197,8 +201,9 @@ class FlashMoE(torch.nn.Module):
         ipc_mem.write_input(x_nvfp4, x_sf)
         ipc_mem.barrier()  # cross-rank sync
 
-        # --- Step 5: Launch decomposed FC1 + FC2 with IPC-gathered input ---
-        output = self._launch_decomposed(
+        # --- Step 5: Launch kernel ---
+        launch_fn = self._launch_fused if self.use_fused_kernel else self._launch_decomposed
+        output = launch_fn(
             ipc_mem=ipc_mem,
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,

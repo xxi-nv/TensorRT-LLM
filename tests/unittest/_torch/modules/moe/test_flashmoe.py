@@ -219,6 +219,7 @@ def _flashmoe_worker_impl(
     top_k: int,
     num_tokens_per_rank: int,
     max_num_tokens: int,
+    use_fused_kernel: bool = False,
 ):
     """Worker function for multi-GPU FlashMoE test.
 
@@ -261,6 +262,7 @@ def _flashmoe_worker_impl(
         top_k=top_k,
         mapping=mapping,
         max_num_tokens=max_num_tokens,
+        use_fused_kernel=use_fused_kernel,
     )
 
     # Create weights
@@ -355,6 +357,49 @@ class TestFlashMoEMultiGPU:
                             top_k,
                             64,  # num_tokens_per_rank
                             256,  # max_num_tokens
+                        )
+                        for rank in range(world_size)
+                    ]
+                ),
+            )
+            for r in results:
+                assert r is None
+
+    @pytest.mark.parametrize(
+        "num_experts,hidden_size,intermediate_size,top_k",
+        [
+            (256, 7168, 2048, 8),  # DeepSeek-V3 config
+        ],
+    )
+    def test_flashmoe_fused_kernel(
+        self,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+    ):
+        """Fused kernel test: single persistent FC1+FC2 kernel."""
+        world_size = min(torch.cuda.device_count(), 4)
+        if world_size < 2:
+            pytest.skip("Requires at least 2 GPUs")
+
+        from mpi4py.futures import MPIPoolExecutor
+
+        with MPIPoolExecutor(max_workers=world_size) as executor:
+            results = executor.map(
+                _flashmoe_worker_impl,
+                *zip(
+                    *[
+                        (
+                            rank,
+                            world_size,
+                            num_experts,
+                            hidden_size,
+                            intermediate_size,
+                            top_k,
+                            64,  # num_tokens_per_rank
+                            256,  # max_num_tokens
+                            True,  # use_fused_kernel
                         )
                         for rank in range(world_size)
                     ]
