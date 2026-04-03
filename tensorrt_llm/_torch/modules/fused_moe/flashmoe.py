@@ -539,8 +539,10 @@ class FlashMoE(torch.nn.Module):
             cute.AddressSpace.gmem,
         )
 
-        # Cross-CTA FC1→FC2 synchronization counter (GMEM, zeroed before each launch)
-        fc1_done_counter = torch.zeros(1, dtype=torch.int32, device=device)
+        # Cross-CTA FC1→FC2 synchronization counter (GMEM, zeroed before each launch).
+        # 8 elements: [0]=cross-CTA barrier, [1]=sched_done, [2]=ldgsts_done,
+        # [3]=tma_done, [4]=mma_done, [5]=epi_done, [6]=return_done, [7]=reserved
+        fc1_done_counter = torch.zeros(8, dtype=torch.int32, device=device)
         fc1_done_counter_ptr = make_ptr(
             cutlass.Int32,
             fc1_done_counter.data_ptr(),
@@ -724,10 +726,18 @@ class FlashMoE(torch.nn.Module):
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
+                # Try to read diagnostic counters (may hang if SMs are all stuck)
+                try:
+                    diag = fc1_done_counter.cpu().tolist()
+                    diag_str = (
+                        f"barrier={diag[0]} sched={diag[1]} ldgsts={diag[2]} "
+                        f"tma={diag[3]} mma={diag[4]} epi={diag[5]} return={diag[6]}"
+                    )
+                except Exception:
+                    diag_str = "(unable to read)"
                 sys.stderr.write(
-                    "[FlashMoE] DEADLOCK: fused kernel did not complete "
-                    "within 60s. Cannot read fc1_done_counter because "
-                    "all SMs are occupied by the stuck persistent kernel.\n"
+                    f"[FlashMoE] DEADLOCK: fused kernel did not complete "
+                    f"within 60s. Diag: {diag_str}\n"
                 )
                 sys.stderr.flush()
                 # os._exit bypasses NCCL cleanup (which also hangs)
@@ -735,8 +745,12 @@ class FlashMoE(torch.nn.Module):
 
                 os._exit(42)
             _time.sleep(0.1)
-        fc1_val = fc1_done_counter.item()
-        sys.stderr.write(f"[FlashMoE] Kernel sync OK: fc1_done_counter={fc1_val}\n")
+        diag = fc1_done_counter.cpu().tolist()
+        sys.stderr.write(
+            f"[FlashMoE] Kernel sync OK: diag counters: "
+            f"barrier={diag[0]} sched={diag[1]} ldgsts={diag[2]} "
+            f"tma={diag[3]} mma={diag[4]} epi={diag[5]} return={diag[6]}\n"
+        )
         sys.stderr.flush()
 
         # AllReduce: when AR is enabled, the kernel already reduced the output.

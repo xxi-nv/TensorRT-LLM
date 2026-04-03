@@ -1522,6 +1522,10 @@ class FlashMoeFusedKernel:
             fc1_tile_info_pipeline.producer_commit(tile_info_producer_state)
             tile_info_producer_state.advance()
             fc1_tile_info_pipeline.producer_tail(tile_info_producer_state)
+            # Diagnostic: scheduler warp completed FC1 tile dispatch
+            with cute.arch.elect_one():
+                diag_sched = cute.make_tensor(fc1_done_counter.iterator + 1, cute.make_layout((1,)))
+                atomic_add_global_i32_return(diag_sched, cutlass.Int32(1))
 
         # --- FC1 LDGSTS warps (warps 4-7): Gather A+SFA ---
         if warp_idx >= self.ldgsts_a_warp_id[0] and warp_idx <= self.ldgsts_a_warp_id[-1]:
@@ -1734,6 +1738,13 @@ class FlashMoeFusedKernel:
                 tile_info_consumer_state.advance()
 
             fc1_a_pipeline.producer_tail(a_producer_state)
+            # Diagnostic: LDGSTS warp completed FC1 A gather (only from first warp)
+            if warp_idx == self.ldgsts_a_warp_id[0]:
+                with cute.arch.elect_one():
+                    diag_ldgsts = cute.make_tensor(
+                        fc1_done_counter.iterator + 2, cute.make_layout((1,))
+                    )
+                    atomic_add_global_i32_return(diag_ldgsts, cutlass.Int32(1))
 
         # --- FC1 TMA warp (warp 9): Load B+SFB ---
         if warp_idx == self.tma_b_warp_id:
@@ -1824,6 +1835,10 @@ class FlashMoeFusedKernel:
                 tile_info_consumer_state.advance()
 
             fc1_b_pipeline.producer_tail(b_producer_state)
+            # Diagnostic: TMA warp completed FC1 B load
+            with cute.arch.elect_one():
+                diag_tma = cute.make_tensor(fc1_done_counter.iterator + 3, cute.make_layout((1,)))
+                atomic_add_global_i32_return(diag_tma, cutlass.Int32(1))
 
         # --- FC1 MMA warp (warp 8) ---
         if warp_idx == self.mma_warp_id:
@@ -2023,6 +2038,10 @@ class FlashMoeFusedKernel:
                 tile_info_consumer_state.advance()
 
             fc1_acc_pipeline.producer_tail(acc_producer_state)
+            # Diagnostic: MMA warp completed FC1 GEMM
+            with cute.arch.elect_one():
+                diag_mma = cute.make_tensor(fc1_done_counter.iterator + 4, cute.make_layout((1,)))
+                atomic_add_global_i32_return(diag_mma, cutlass.Int32(1))
 
         # --- FC1 Epilogue warps (warps 0-3): SwiGLU + NVFP4 quant + TMA store ---
         if warp_idx <= self.epilog_warp_id[-1]:
@@ -2455,11 +2474,25 @@ class FlashMoeFusedKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             c_pipeline.producer_tail()
+            # Diagnostic: epilogue warp completed FC1 store (only from first warp)
+            if warp_idx == self.epilog_warp_id[0]:
+                with cute.arch.elect_one():
+                    diag_epi = cute.make_tensor(
+                        fc1_done_counter.iterator + 5, cute.make_layout((1,))
+                    )
+                    atomic_add_global_i32_return(diag_epi, cutlass.Int32(1))
 
         # ============================================================
         # PHASE MODE 1: FC1-only, skip barrier and FC2
         # ============================================================
         if cutlass.const_expr(self.phase_mode == 1):
+            # Diagnostic: CTA reached phase_mode==1 return (warp 0 only)
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    diag_ret = cute.make_tensor(
+                        fc1_done_counter.iterator + 6, cute.make_layout((1,))
+                    )
+                    atomic_add_global_i32_return(diag_ret, cutlass.Int32(1))
             if cutlass.const_expr(TRTLLM_ENABLE_PDL):
                 griddepcontrol_launch_dependents()
             return
@@ -3427,10 +3460,12 @@ class FlashMoeFusedKernel:
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
 
-        # Cross-CTA FC1→FC2 synchronization counter
+        # Cross-CTA FC1→FC2 synchronization counter + diagnostic counters.
+        # Layout [8]: [0]=barrier, [1]=sched, [2]=ldgsts, [3]=tma,
+        #             [4]=mma, [5]=epi, [6]=return, [7]=reserved
         fc1_done_counter = cute.make_tensor(
             fc1_done_counter_ptr,
-            layout=cute.make_layout((1,)),
+            layout=cute.make_layout((8,)),
         )
 
         # Build AR tensors from pointers (only when AR is enabled)
