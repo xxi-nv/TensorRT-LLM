@@ -148,7 +148,7 @@ def encode_source_info(
     Works regardless of dtype because we operate on the raw byte view.
     """
     hs = hidden_states.clone()
-    flat_bytes = hs.view(torch.uint8)
+    flat_bytes = hs.view(torch.uint8).reshape(-1)
     row_bytes = hidden_states.shape[1] * hidden_states.element_size()
     num_tokens = hidden_states.shape[0]
 
@@ -169,7 +169,7 @@ def decode_source_info(
     """Decode (rank_id, token_idx) from the last 4 bytes of each row."""
     element_size = torch.tensor([], dtype=dtype).element_size()
     row_bytes = hidden_size * element_size
-    flat_bytes = hidden_states.contiguous().view(torch.uint8)
+    flat_bytes = hidden_states.contiguous().view(torch.uint8).reshape(-1)
     num_rows = flat_bytes.numel() // row_bytes
     results = []
 
