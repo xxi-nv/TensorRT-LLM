@@ -710,8 +710,37 @@ class FlashMoE(torch.nn.Module):
         # On timeout, we print to stderr (bypassing log buffering) and
         # call os._exit() to terminate immediately (raise RuntimeError
         # triggers NCCL cleanup which blocks on the stuck GPU).
+        import ctypes
         import sys
         import time as _time
+
+        def _read_diag_counters_direct(gpu_tensor):
+            """Read GPU diagnostic counters using CUDA driver API directly.
+
+            When the persistent kernel occupies all SMs, PyTorch's .cpu()
+            hangs because it enqueues work on the CUDA stream. The CUDA
+            driver API cuMemcpyDtoH bypasses the stream and uses the DMA
+            engine, which can succeed even with all SMs occupied.
+            """
+            try:
+                n = 8
+                host_buf = (ctypes.c_int32 * n)()
+                libcuda = ctypes.CDLL("libcuda.so.1")
+                # cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount)
+                ret = libcuda.cuMemcpyDtoH(
+                    ctypes.byref(host_buf),
+                    ctypes.c_uint64(gpu_tensor.data_ptr()),
+                    ctypes.c_size_t(n * 4),
+                )
+                if ret != 0:
+                    return f"(cuMemcpyDtoH failed: {ret})"
+                vals = list(host_buf)
+                return (
+                    f"barrier={vals[0]} sched={vals[1]} ldgsts={vals[2]} "
+                    f"tma={vals[3]} mma={vals[4]} epi={vals[5]} return={vals[6]}"
+                )
+            except Exception as e:
+                return f"(direct read failed: {e})"
 
         sys.stderr.write(
             f"[FlashMoE] Kernel launched: m={m}, fc1_n={fc1_n}, "
@@ -726,15 +755,8 @@ class FlashMoE(torch.nn.Module):
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
-                # Try to read diagnostic counters (may hang if SMs are all stuck)
-                try:
-                    diag = fc1_done_counter.cpu().tolist()
-                    diag_str = (
-                        f"barrier={diag[0]} sched={diag[1]} ldgsts={diag[2]} "
-                        f"tma={diag[3]} mma={diag[4]} epi={diag[5]} return={diag[6]}"
-                    )
-                except Exception:
-                    diag_str = "(unable to read)"
+                # Print DEADLOCK message FIRST (before any CUDA call that may hang)
+                diag_str = _read_diag_counters_direct(fc1_done_counter)
                 sys.stderr.write(
                     f"[FlashMoE] DEADLOCK: fused kernel did not complete "
                     f"within 60s. Diag: {diag_str}\n"
@@ -745,12 +767,8 @@ class FlashMoE(torch.nn.Module):
 
                 os._exit(42)
             _time.sleep(0.1)
-        diag = fc1_done_counter.cpu().tolist()
-        sys.stderr.write(
-            f"[FlashMoE] Kernel sync OK: diag counters: "
-            f"barrier={diag[0]} sched={diag[1]} ldgsts={diag[2]} "
-            f"tma={diag[3]} mma={diag[4]} epi={diag[5]} return={diag[6]}\n"
-        )
+        diag_str = _read_diag_counters_direct(fc1_done_counter)
+        sys.stderr.write(f"[FlashMoE] Kernel sync OK: diag counters: {diag_str}\n")
         sys.stderr.flush()
 
         # AllReduce: when AR is enabled, the kernel already reduced the output.
