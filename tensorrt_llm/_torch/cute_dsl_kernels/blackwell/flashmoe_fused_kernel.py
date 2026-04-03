@@ -2606,8 +2606,15 @@ class FlashMoeFusedKernel:
                 fc1_tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            # Keep TMEM allocated — it will be reused by FC2.
-            # relinquish_alloc_permit + free are deferred to FC2 epilogue end.
+            if cutlass.const_expr(self.phase_mode == 0):
+                # Keep TMEM allocated — it will be reused by FC2.
+                # relinquish_alloc_permit + free are deferred to FC2 epilogue end.
+                pass
+            else:
+                # Free TMEM for phase modes that return before FC2 (1 and 2).
+                tmem.relinquish_alloc_permit()
+                self.epilog_sync_barrier.arrive_and_wait()
+                tmem.free(tmem_ptr)
             c_pipeline.producer_tail()
             # Diagnostic: epilogue warp completed FC1 store (only from first warp)
             if warp_idx == self.epilog_warp_id[0]:
