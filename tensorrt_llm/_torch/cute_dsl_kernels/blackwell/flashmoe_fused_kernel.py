@@ -3285,7 +3285,12 @@ class FlashMoeFusedKernel:
                 fc2_tile_info_pipeline.consumer_release(fc2_epi_tile_info_consumer_state)
                 fc2_epi_tile_info_consumer_state.advance()
 
-            # Dealloc TMEM
+            # Dealloc TMEM.
+            # The compile-time _num_allocated_columns counter was lost when
+            # the FC1 epilogue's runtime warp-conditional block merged with
+            # its else-branch (where no tmem.allocate happened). Restore it
+            # so tmem.free() knows how many columns to deallocate.
+            tmem._num_allocated_columns = self.num_tmem_alloc_cols
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(fc2_epi_tmem_ptr)
