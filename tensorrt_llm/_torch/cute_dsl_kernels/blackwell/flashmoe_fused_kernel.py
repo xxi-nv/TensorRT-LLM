@@ -2460,6 +2460,8 @@ class FlashMoeFusedKernel:
         # PHASE MODE 1: FC1-only, skip barrier and FC2
         # ============================================================
         if cutlass.const_expr(self.phase_mode == 1):
+            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+                griddepcontrol_launch_dependents()
             return
 
         # ============================================================
@@ -2495,6 +2497,8 @@ class FlashMoeFusedKernel:
         # PHASE MODE 2: FC1+barrier only, skip FC2
         # ============================================================
         if cutlass.const_expr(self.phase_mode == 2):
+            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+                griddepcontrol_launch_dependents()
             return
 
         # ============================================================
