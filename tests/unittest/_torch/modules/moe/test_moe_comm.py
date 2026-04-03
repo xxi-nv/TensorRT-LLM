@@ -327,6 +327,7 @@ def create_comm_object(
             num_experts=num_experts,
             num_slots=num_slots,
             top_k=config.top_k,
+            alltoall_result_do_sum=True,
         )
 
     else:
