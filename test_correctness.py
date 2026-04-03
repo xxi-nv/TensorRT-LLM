@@ -262,6 +262,7 @@ def compute_reference_fc2(
     output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
 
     # Process tiles (matching the kernel's tile-based execution)
+    debug_count = 0
     for tile_i in range(num_tiles):
         expert_local = tile_idx_to_expert_idx[tile_i].item()
         mn_limit = tile_idx_to_mn_limit[tile_i].item()
@@ -296,6 +297,18 @@ def compute_reference_fc2(
             # Apply alpha and token_final_scales
             scale = alpha * token_final_scales[token_idx, expert_slot].item()
             fc2_out = fc2_out * scale
+
+            if debug_count < 3:
+                sys.stderr.write(
+                    f"[RefDebug] tile={tile_i} perm={perm_idx} "
+                    f"token={token_idx} slot={expert_slot} expert={expert_local} "
+                    f"fc1_row_absmax={fc1_row.abs().max().item():.6f} "
+                    f"w2_absmax={w2_t.abs().max().item():.6f} "
+                    f"fc2_absmax={fc2_out.abs().max().item():.6f} "
+                    f"scale={scale:.6f}\n"
+                )
+                sys.stderr.flush()
+                debug_count += 1
 
             # Scatter-add
             output[token_idx] += fc2_out.to(torch.bfloat16)
@@ -620,6 +633,63 @@ def run_correctness_test():
     sys.stderr.write("[Correctness] Kernel completed successfully\n")
     sys.stderr.flush()
 
+    # --- Debug: inspect intermediate buffers ---
+    # FC1 output: fc1_c is the NVFP4 packed FC1->FC2 intermediate data
+    fc1_c_nonzero = (fc1_c != 0).sum().item()
+    fc1_c_sample = fc1_c[0, :8].tolist()  # first row, first 8 bytes
+    sys.stderr.write(
+        f"[Debug] fc1_c: shape={fc1_c.shape}, nonzero_bytes={fc1_c_nonzero}/{fc1_c.numel()}, "
+        f"sample_row0={fc1_c_sample}\n"
+    )
+    sys.stderr.flush()
+
+    # FC1 output scale factors
+    fc1_sf_float = fc1_c_sf.to(torch.float32)
+    fc1_sf_nonzero = (fc1_sf_float.abs() > 1e-10).sum().item()
+    fc1_sf_sample = fc1_sf_float[:8].tolist()
+    sys.stderr.write(
+        f"[Debug] fc1_c_sf: shape={fc1_c_sf.shape}, nonzero={fc1_sf_nonzero}/{fc1_c_sf.numel()}, "
+        f"sample={fc1_sf_sample}\n"
+    )
+    sys.stderr.flush()
+
+    # Dequantize a small piece of fc1_c to check
+    try:
+        fc1_dq_row0 = dequantize_nvfp4(
+            packed=fc1_c[:1],
+            scale_factors=fc1_c_sf[: intermediate_size // sf_vec_size],
+            sf_vec_size=sf_vec_size,
+            num_rows=1,
+            num_cols=intermediate_size,
+        )
+        sys.stderr.write(
+            f"[Debug] fc1_dq_row0: abs_max={fc1_dq_row0.abs().max().item():.6f}, "
+            f"mean={fc1_dq_row0.float().mean().item():.6f}, "
+            f"sample={fc1_dq_row0[0, :8].tolist()}\n"
+        )
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[Debug] fc1 dequant failed: {e}\n")
+        sys.stderr.flush()
+
+    # Dequantize a small piece of w2_weight to verify
+    try:
+        w2_dq_expert0 = dequantize_nvfp4(
+            packed=w2_weight[0, :1],  # expert 0, first row
+            scale_factors=fc2_weight_scale[0, :1].reshape(-1),
+            sf_vec_size=sf_vec_size,
+            num_rows=1,
+            num_cols=intermediate_size,
+        )
+        sys.stderr.write(
+            f"[Debug] w2_dq_expert0_row0: abs_max={w2_dq_expert0.abs().max().item():.6f}, "
+            f"sample={w2_dq_expert0[0, :8].tolist()}\n"
+        )
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[Debug] w2 dequant failed: {e}\n")
+        sys.stderr.flush()
+
     # --- Check kernel output ---
     kernel_output = output.clone()
     abs_max = kernel_output.abs().max().item()
@@ -632,6 +702,10 @@ def run_correctness_test():
         f"abs_max={abs_max:.6f}, nonzero={nonzero_count}/{kernel_output.numel()}, "
         f"nan={has_nan}, inf={has_inf}\n"
     )
+    sys.stderr.flush()
+
+    # Sample the kernel output
+    sys.stderr.write(f"[Debug] kernel output row0 sample: {kernel_output[0, :8].tolist()}\n")
     sys.stderr.flush()
 
     if has_nan or has_inf:
