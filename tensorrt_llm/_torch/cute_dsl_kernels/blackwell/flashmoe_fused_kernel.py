@@ -1364,6 +1364,10 @@ class FlashMoeFusedKernel:
             cute.group_modes(sSFB, 0, 3),
             cute.group_modes(fc1_tCgSFB, 0, 3),
         )
+        # Remove zero-stride modes from SFB partition tensors (required for
+        # correct TMA load indexing — standalone FC1 kernel does the same).
+        fc1_tBsSFB = cute.filter_zeros(fc1_tBsSFB)
+        fc1_tBgSFB = cute.filter_zeros(fc1_tBgSFB)
 
         # FC2 tensor partitioning and TMA partitions (skip in FC1-only mode)
         if cutlass.const_expr(self.phase_mode != 1):
@@ -1418,6 +1422,9 @@ class FlashMoeFusedKernel:
                 cute.group_modes(sSFA, 0, 3),
                 cute.group_modes(fc2_tCgSFA, 0, 3),
             )
+            # Remove zero-stride modes from SFA partition (matches base GEMM kernel)
+            fc2_tAsSFA = cute.filter_zeros(fc2_tAsSFA)
+            fc2_tAgSFA = cute.filter_zeros(fc2_tAgSFA)
             fc2_tBsSFB, fc2_tBgSFB = cpasync.tma_partition(
                 tma_atom_fc2_sfb,
                 block_in_cluster_coord_sfb_vmnk[1],
@@ -1425,6 +1432,9 @@ class FlashMoeFusedKernel:
                 cute.group_modes(sSFB, 0, 3),
                 cute.group_modes(fc2_tCgSFB, 0, 3),
             )
+            # Remove zero-stride modes from SFB partition (matches standalone FC1 kernel)
+            fc2_tBsSFB = cute.filter_zeros(fc2_tBsSFB)
+            fc2_tBgSFB = cute.filter_zeros(fc2_tBgSFB)
 
         # ============================================================
         # PDL: Wait for previous kernel to finish
