@@ -1458,7 +1458,11 @@ class FlashMoeFusedKernel:
             fc2_tCgC = thr_mma.partition_C(fc2_gC_mnl)
 
         # CTA sync before warp specialization
+        if tidx % 32 == 0:
+            cute.printf("[GPU] warp {} arriving at cta_sync (bidx={})\n", warp_idx, bidx)
         self.cta_sync_barrier.arrive_and_wait()
+        if tidx % 32 == 0:
+            cute.printf("[GPU] warp {} past cta_sync\n", warp_idx)
 
         # ============================================================
         # ==================== FC1 PHASE =============================
@@ -1466,6 +1470,8 @@ class FlashMoeFusedKernel:
 
         # --- FC1 Scheduler warp (warp 10) ---
         if warp_idx == self.sched_warp_id:
+            with cute.arch.elect_one():
+                cute.printf("[GPU] sched warp {} starting\n", warp_idx)
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 fc1_tile_sched_params,
                 cute.arch.block_idx(),
@@ -1525,6 +1531,8 @@ class FlashMoeFusedKernel:
 
         # --- FC1 LDGSTS warps (warps 4-7): Gather A+SFA ---
         if warp_idx >= self.ldgsts_a_warp_id[0] and warp_idx <= self.ldgsts_a_warp_id[-1]:
+            if tidx % 32 == 0:
+                cute.printf("[GPU] LDGSTS warp {} starting\n", warp_idx)
             a_atom_copy = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
                 fc1_mA_mkl.element_type,
@@ -1591,7 +1599,11 @@ class FlashMoeFusedKernel:
             )
 
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            if tidx % 32 == 0:
+                cute.printf("[GPU] LDGSTS warp {} waiting for first tile_info\n", warp_idx)
             fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            if tidx % 32 == 0:
+                cute.printf("[GPU] LDGSTS warp {} got first tile_info\n", warp_idx)
             for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
@@ -1737,6 +1749,8 @@ class FlashMoeFusedKernel:
 
         # --- FC1 TMA warp (warp 9): Load B+SFB ---
         if warp_idx == self.tma_b_warp_id:
+            with cute.arch.elect_one():
+                cute.printf("[GPU] TMA warp {} starting\n", warp_idx)
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 fc1_tile_sched_params,
                 cute.arch.block_idx(),
@@ -1751,6 +1765,8 @@ class FlashMoeFusedKernel:
             )
 
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            with cute.arch.elect_one():
+                cute.printf("[GPU] TMA waiting for first tile_info\n")
             fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
                 tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
@@ -1827,6 +1843,8 @@ class FlashMoeFusedKernel:
 
         # --- FC1 MMA warp (warp 8) ---
         if warp_idx == self.mma_warp_id:
+            with cute.arch.elect_one():
+                cute.printf("[GPU] MMA warp {} starting\n", warp_idx)
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
@@ -1884,7 +1902,11 @@ class FlashMoeFusedKernel:
             )
 
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            with cute.arch.elect_one():
+                cute.printf("[GPU] MMA warp waiting for first tile_info\n")
             fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            with cute.arch.elect_one():
+                cute.printf("[GPU] MMA warp got first tile_info\n")
             for idx in cutlass.range(4, unroll_full=True):
                 tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
@@ -2027,6 +2049,8 @@ class FlashMoeFusedKernel:
 
         # --- FC1 Epilogue warps (warps 0-3): SwiGLU + NVFP4 quant + TMA store ---
         if warp_idx <= self.epilog_warp_id[-1]:
+            if tidx % 32 == 0:
+                cute.printf("[GPU] epilogue warp {} starting\n", warp_idx)
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -2098,7 +2122,11 @@ class FlashMoeFusedKernel:
             )
 
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            if tidx % 32 == 0:
+                cute.printf("[GPU] epilogue warp {} waiting for first tile_info\n", warp_idx)
             fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            if tidx % 32 == 0:
+                cute.printf("[GPU] epilogue warp {} got first tile_info\n", warp_idx)
             for idx in cutlass.range(4, unroll_full=True):
                 tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
