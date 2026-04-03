@@ -306,6 +306,9 @@ class FlashMoeFusedKernel:
         self.fc2_epi_tile_n = cute.size(self.fc2_epi_tile[1])
 
         # Pipeline stages (computed from FC1 SMEM needs which include sC)
+        # FC1-only mode uses 1024B mbar reserve (same as standalone FC1)
+        # Full mode uses 2048B to account for FC2 pipeline barriers
+        _mbar_reserve = 1024 if self.phase_mode == 1 else 2048
         (
             self.num_acc_stage,
             self.num_ab_stage,
@@ -323,6 +326,7 @@ class FlashMoeFusedKernel:
             self.sf_vec_size,
             self.num_smem_capacity,
             self.occupancy,
+            mbar_helpers_bytes=_mbar_reserve,
         )
 
         # Mainloop SMEM layouts (shared between FC1 and FC2)
@@ -418,11 +422,12 @@ class FlashMoeFusedKernel:
         sf_vec_size: int,
         num_smem_capacity: int,
         occupancy: int,
+        mbar_helpers_bytes: int = 2048,
     ) -> Tuple[int, int, int, int]:
         """Compute pipeline stage counts for SMEM allocation.
 
-        Extra 2048B reserved for dual-phase pipeline barrier storage
-        (FC1 + FC2 mbar storage) vs 1024B in the single-phase kernels.
+        mbar_helpers_bytes: reserved space for pipeline barrier storage.
+        Default 2048B for dual-phase (FC1+FC2). Use 1024B for FC1-only.
         """
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
         num_c_stage = 2
@@ -444,8 +449,6 @@ class FlashMoeFusedKernel:
             + cute.size_in_bytes(sf_dtype, sfa_smem_1)
             + cute.size_in_bytes(sf_dtype, sfb_smem_1)
         )
-        # Extra space for dual-phase pipeline mbar storage
-        mbar_helpers_bytes = 2048
         c_per_stage = cute.size_in_bytes(c_dtype, c_smem_1)
         c_total = c_per_stage * num_c_stage
 
@@ -888,76 +891,152 @@ class FlashMoeFusedKernel:
             self.raster_along_m,
         )
         # Use max grid to ensure enough CTAs for both phases
-        grid = (max(fc1_grid[0], fc2_grid[0]), 1, 1)
+        # In FC1-only mode, use only FC1 grid (no FC2 work)
+        if self.phase_mode == 1:
+            grid = fc1_grid
+        else:
+            grid = (max(fc1_grid[0], fc2_grid[0]), 1, 1)
 
         # ============================================================
-        # SharedStorage definition (dual-phase pipeline barriers)
+        # SharedStorage definition
         # ============================================================
         self.buffer_align_bytes = 1024
 
-        @cute.struct
-        class SharedStorage:
-            # FC1 tile info (bidx, bidy, expert_idx, valid, mn_limit)
-            fc1_sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
-                1,
-            ]
-            # FC2 tile info
-            fc2_sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
-                1,
-            ]
-            # FC1 pipeline barriers
-            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-            # FC2 pipeline barriers
-            fc2_ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            fc2_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            fc2_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-            # Shared TMEM management
-            tmem_dealloc_mbar_ptr: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-            # FC1 epilogue staging (TMA store for NVFP4 output)
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.fc1_c_dtype,
-                    cute.cosize(self.fc1_c_smem_layout_staged.outer),
-                ],
-                self.buffer_align_bytes,
-            ]
-            # Mainloop data buffers (shared between FC1 and FC2)
-            sA: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.a_dtype,
-                    cute.cosize(self.a_smem_layout_staged.outer),
-                ],
-                self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.b_dtype,
-                    cute.cosize(self.b_smem_layout_staged.outer),
-                ],
-                self.buffer_align_bytes,
-            ]
-            sSFA: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype,
-                    cute.cosize(self.sfa_smem_layout_staged),
-                ],
-                self.buffer_align_bytes,
-            ]
-            sSFB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype,
-                    cute.cosize(self.sfb_smem_layout_staged),
-                ],
-                self.buffer_align_bytes,
-            ]
+        if self.phase_mode == 1:
+            # FC1-only SharedStorage: matches standalone FC1 kernel layout
+            @cute.struct
+            class SharedStorage:
+                fc1_sInfo: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                    1,
+                ]
+                # FC1 pipeline barriers only
+                fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+                fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+                fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+                fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+                # TMEM management
+                tmem_dealloc_mbar_ptr: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                # FC1 epilogue staging
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.fc1_c_dtype,
+                        cute.cosize(self.fc1_c_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.a_dtype,
+                        cute.cosize(self.a_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.b_dtype,
+                        cute.cosize(self.b_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sSFA: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.sf_dtype,
+                        cute.cosize(self.sfa_smem_layout_staged),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sSFB: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.sf_dtype,
+                        cute.cosize(self.sfb_smem_layout_staged),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+        else:
+            # Full dual-phase SharedStorage (FC1 + FC2 pipeline barriers)
+            @cute.struct
+            class SharedStorage:
+                fc1_sInfo: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                    1,
+                ]
+                fc2_sInfo: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                    1,
+                ]
+                # FC1 pipeline barriers
+                fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+                fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+                fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+                fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+                # FC2 pipeline barriers
+                fc2_ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+                fc2_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+                fc2_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+                # TMEM management
+                tmem_dealloc_mbar_ptr: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                # FC1 epilogue staging
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.fc1_c_dtype,
+                        cute.cosize(self.fc1_c_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.a_dtype,
+                        cute.cosize(self.a_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.b_dtype,
+                        cute.cosize(self.b_smem_layout_staged.outer),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sSFA: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.sf_dtype,
+                        cute.cosize(self.sfa_smem_layout_staged),
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sSFB: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.sf_dtype,
+                        cute.cosize(self.sfb_smem_layout_staged),
+                    ],
+                    self.buffer_align_bytes,
+                ]
 
         self.shared_storage = SharedStorage
+
+        # Compile-time diagnostic (printed during JIT, not on GPU)
+        import sys as _sys
+
+        _sys.stderr.write(
+            f"[FlashMoE-DSL] SMEM: storage={SharedStorage.size_in_bytes()}B, "
+            f"capacity={self.num_smem_capacity}B, "
+            f"num_ab_stage={self.num_ab_stage}, "
+            f"num_acc_stage={self.num_acc_stage}, "
+            f"num_c_stage={self.fc1_num_c_stage}, "
+            f"num_tile_stage={self.num_tile_stage}, "
+            f"fc1_grid={fc1_grid}, fc2_grid={fc2_grid}, "
+            f"grid={grid}, threads={self.threads_per_cta}, "
+            f"phase_mode={self.phase_mode}\n"
+        )
+        _sys.stderr.flush()
+        if SharedStorage.size_in_bytes() > self.num_smem_capacity:
+            raise RuntimeError(
+                f"FlashMoE SharedStorage ({SharedStorage.size_in_bytes()}B) "
+                f"exceeds SM100 SMEM capacity ({self.num_smem_capacity}B)!"
+            )
 
         # ============================================================
         # Launch the fused kernel
@@ -1094,17 +1173,18 @@ class FlashMoeFusedKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-        # Prefetch TMA descriptors for both phases
+        # Prefetch TMA descriptors
         if warp_idx == self.tma_b_warp_id:
             # FC1 TMA descriptors
             cpasync.prefetch_descriptor(tma_atom_fc1_b)
             cpasync.prefetch_descriptor(tma_atom_fc1_sfb)
             cpasync.prefetch_descriptor(tma_atom_fc1_c)
-            # FC2 TMA descriptors
-            cpasync.prefetch_descriptor(tma_atom_fc2_a)
-            cpasync.prefetch_descriptor(tma_atom_fc2_b)
-            cpasync.prefetch_descriptor(tma_atom_fc2_sfa)
-            cpasync.prefetch_descriptor(tma_atom_fc2_sfb)
+            # FC2 TMA descriptors (skip in FC1-only mode)
+            if cutlass.const_expr(self.phase_mode != 1):
+                cpasync.prefetch_descriptor(tma_atom_fc2_a)
+                cpasync.prefetch_descriptor(tma_atom_fc2_b)
+                cpasync.prefetch_descriptor(tma_atom_fc2_sfa)
+                cpasync.prefetch_descriptor(tma_atom_fc2_sfb)
 
         # CTA/thread coordinate setup
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1164,41 +1244,42 @@ class FlashMoeFusedKernel:
         )
 
         # ============================================================
-        # FC2 pipeline creation
+        # FC2 pipeline creation (skip in FC1-only mode)
         # ============================================================
-        # FC2 AB pipeline: PipelineTmaUmma (TMA warp loads A+B+SFA+SFB)
-        fc2_ab_pipeline = PipelineTmaUmma.create(
-            barrier_storage=storage.fc2_ab_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
-            producer_group=CooperativeGroup(Agent.Thread),
-            consumer_group=CooperativeGroup(Agent.Thread, 1),
-            tx_count=self.fc2_num_tma_load_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-        )
+        if cutlass.const_expr(self.phase_mode != 1):
+            # FC2 AB pipeline: PipelineTmaUmma (TMA warp loads A+B+SFA+SFB)
+            fc2_ab_pipeline = PipelineTmaUmma.create(
+                barrier_storage=storage.fc2_ab_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=CooperativeGroup(Agent.Thread),
+                consumer_group=CooperativeGroup(Agent.Thread, 1),
+                tx_count=self.fc2_num_tma_load_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
 
-        # FC2 accumulator pipeline
-        fc2_acc_pipeline = PipelineUmmaAsync.create(
-            barrier_storage=storage.fc2_acc_mbar_ptr.data_ptr(),
-            num_stages=self.num_acc_stage,
-            producer_group=CooperativeGroup(Agent.Thread),
-            consumer_group=CooperativeGroup(Agent.Thread, len(self.epilog_warp_id)),
-            cta_layout_vmnk=cluster_layout_vmnk,
-        )
+            # FC2 accumulator pipeline
+            fc2_acc_pipeline = PipelineUmmaAsync.create(
+                barrier_storage=storage.fc2_acc_mbar_ptr.data_ptr(),
+                num_stages=self.num_acc_stage,
+                producer_group=CooperativeGroup(Agent.Thread),
+                consumer_group=CooperativeGroup(Agent.Thread, len(self.epilog_warp_id)),
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
 
-        # FC2 tile info pipeline
-        # In FC2, warps 4-7 (LDGSTS) are idle and do NOT consume tile info.
-        # Consumer threads = warps {0-3, 8, 9} = epilogue(128) + MMA(32) + TMA(32) = 192.
-        fc2_consumer_threads = (
-            self.threads_per_warp * len(self.epilog_warp_id)
-            + self.threads_per_warp  # MMA warp
-            + self.threads_per_warp  # TMA warp
-        )
-        fc2_tile_info_pipeline = PipelineAsync.create(
-            barrier_storage=storage.fc2_tile_info_mbar_ptr.data_ptr(),
-            num_stages=self.num_tile_stage,
-            producer_group=CooperativeGroup(Agent.Thread, self.threads_per_warp),
-            consumer_group=CooperativeGroup(Agent.Thread, fc2_consumer_threads),
-        )
+            # FC2 tile info pipeline
+            # In FC2, warps 4-7 (LDGSTS) are idle and do NOT consume tile info.
+            # Consumer threads = warps {0-3, 8, 9} = epilogue(128) + MMA(32) + TMA(32) = 192.
+            fc2_consumer_threads = (
+                self.threads_per_warp * len(self.epilog_warp_id)
+                + self.threads_per_warp  # MMA warp
+                + self.threads_per_warp  # TMA warp
+            )
+            fc2_tile_info_pipeline = PipelineAsync.create(
+                barrier_storage=storage.fc2_tile_info_mbar_ptr.data_ptr(),
+                num_stages=self.num_tile_stage,
+                producer_group=CooperativeGroup(Agent.Thread, self.threads_per_warp),
+                consumer_group=CooperativeGroup(Agent.Thread, fc2_consumer_threads),
+            )
 
         # ============================================================
         # TMEM allocation (shared between phases)
@@ -1236,7 +1317,8 @@ class FlashMoeFusedKernel:
 
         fc1_info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         fc1_sInfo = storage.fc1_sInfo.get_tensor(fc1_info_layout)
-        fc2_sInfo = storage.fc2_sInfo.get_tensor(fc1_info_layout)
+        if cutlass.const_expr(self.phase_mode != 1):
+            fc2_sInfo = storage.fc2_sInfo.get_tensor(fc1_info_layout)
 
         # Multicast masks (trivial for cluster (1,1))
         b_full_mcast_mask = None
@@ -1280,31 +1362,6 @@ class FlashMoeFusedKernel:
         fc1_k_tile_cnt = cutlass.Int32(cute.size(fc1_gA_mkl, mode=[3]))
 
         # ============================================================
-        # FC2 global tensor partitioning
-        # ============================================================
-        fc2_gA_mkl = cute.local_tile(
-            fc2_mA_mkl,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
-            (None, None, None),
-        )
-        fc2_gB_nkl = cute.local_tile(
-            fc2_mB_nkl,
-            cute.slice_(self.mma_tiler, (0, None, None)),
-            (None, None, None),
-        )
-        fc2_gSFA_mkl = cute.local_tile(
-            fc2_mSFA_mkl,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
-            (None, None, None),
-        )
-        fc2_gSFB_nkl = cute.local_tile(
-            fc2_mSFB_nkl,
-            cute.slice_(self.mma_tiler_sfb, (0, None, None)),
-            (None, None, None),
-        )
-        fc2_k_tile_cnt = cutlass.Int32(cute.size(fc2_gA_mkl, mode=[3]))
-
-        # ============================================================
         # MMA partitions (shared tiled_mma, different global tensors)
         # ============================================================
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
@@ -1315,12 +1372,6 @@ class FlashMoeFusedKernel:
         fc1_tCgB = thr_mma.partition_B(fc1_gB_nkl)
         fc1_tCgSFA = thr_mma.partition_A(fc1_gSFA_mkl)  # noqa: F841
         fc1_tCgSFB = thr_mma_sfb.partition_B(fc1_gSFB_nkl)
-
-        # FC2 MMA partitions
-        fc2_tCgA = thr_mma.partition_A(fc2_gA_mkl)
-        fc2_tCgB = thr_mma.partition_B(fc2_gB_nkl)
-        fc2_tCgSFA = thr_mma.partition_A(fc2_gSFA_mkl)
-        fc2_tCgSFB = thr_mma_sfb.partition_B(fc2_gSFB_nkl)
 
         # ============================================================
         # TMA partitions for FC1 B/SFB (same pattern as FC1 reference)
@@ -1345,38 +1396,66 @@ class FlashMoeFusedKernel:
             cute.group_modes(fc1_tCgSFB, 0, 3),
         )
 
-        # ============================================================
-        # TMA partitions for FC2 A/B/SFA/SFB
-        # ============================================================
-        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
-        fc2_tAsA, fc2_tAgA = cpasync.tma_partition(
-            tma_atom_fc2_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(fc2_tCgA, 0, 3),
-        )
-        fc2_tBsB, fc2_tBgB = cpasync.tma_partition(
-            tma_atom_fc2_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(fc2_tCgB, 0, 3),
-        )
-        fc2_tAsSFA, fc2_tAgSFA = cpasync.tma_partition(
-            tma_atom_fc2_sfa,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sSFA, 0, 3),
-            cute.group_modes(fc2_tCgSFA, 0, 3),
-        )
-        fc2_tBsSFB, fc2_tBgSFB = cpasync.tma_partition(
-            tma_atom_fc2_sfb,
-            block_in_cluster_coord_sfb_vmnk[1],
-            sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 3),
-            cute.group_modes(fc2_tCgSFB, 0, 3),
-        )
+        # FC2 tensor partitioning and TMA partitions (skip in FC1-only mode)
+        if cutlass.const_expr(self.phase_mode != 1):
+            fc2_gA_mkl = cute.local_tile(
+                fc2_mA_mkl,
+                cute.slice_(self.mma_tiler, (None, 0, None)),
+                (None, None, None),
+            )
+            fc2_gB_nkl = cute.local_tile(
+                fc2_mB_nkl,
+                cute.slice_(self.mma_tiler, (0, None, None)),
+                (None, None, None),
+            )
+            fc2_gSFA_mkl = cute.local_tile(
+                fc2_mSFA_mkl,
+                cute.slice_(self.mma_tiler, (None, 0, None)),
+                (None, None, None),
+            )
+            fc2_gSFB_nkl = cute.local_tile(
+                fc2_mSFB_nkl,
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
+            fc2_k_tile_cnt = cutlass.Int32(cute.size(fc2_gA_mkl, mode=[3]))
+
+            # FC2 MMA partitions
+            fc2_tCgA = thr_mma.partition_A(fc2_gA_mkl)
+            fc2_tCgB = thr_mma.partition_B(fc2_gB_nkl)
+            fc2_tCgSFA = thr_mma.partition_A(fc2_gSFA_mkl)
+            fc2_tCgSFB = thr_mma_sfb.partition_B(fc2_gSFB_nkl)
+
+            # FC2 TMA partitions
+            a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            fc2_tAsA, fc2_tAgA = cpasync.tma_partition(
+                tma_atom_fc2_a,
+                block_in_cluster_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(fc2_tCgA, 0, 3),
+            )
+            fc2_tBsB, fc2_tBgB = cpasync.tma_partition(
+                tma_atom_fc2_b,
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(fc2_tCgB, 0, 3),
+            )
+            fc2_tAsSFA, fc2_tAgSFA = cpasync.tma_partition(
+                tma_atom_fc2_sfa,
+                block_in_cluster_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(sSFA, 0, 3),
+                cute.group_modes(fc2_tCgSFA, 0, 3),
+            )
+            fc2_tBsSFB, fc2_tBgSFB = cpasync.tma_partition(
+                tma_atom_fc2_sfb,
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                cute.group_modes(sSFB, 0, 3),
+                cute.group_modes(fc2_tCgSFB, 0, 3),
+            )
 
         # ============================================================
         # PDL: Wait for previous kernel to finish
@@ -1412,12 +1491,13 @@ class FlashMoeFusedKernel:
 
         # FC1/FC2 output partitions for epilogue
         fc1_tCgC = thr_mma.partition_C(fc1_gC_mnl)
-        fc2_gC_mnl = cute.local_tile(
-            fc2_out,
-            cute.slice_(self.mma_tiler, (None, None, 0)),
-            (None, None, None),
-        )
-        fc2_tCgC = thr_mma.partition_C(fc2_gC_mnl)
+        if cutlass.const_expr(self.phase_mode != 1):
+            fc2_gC_mnl = cute.local_tile(
+                fc2_out,
+                cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            fc2_tCgC = thr_mma.partition_C(fc2_gC_mnl)
 
         # CTA sync before warp specialization
         self.cta_sync_barrier.arrive_and_wait()
