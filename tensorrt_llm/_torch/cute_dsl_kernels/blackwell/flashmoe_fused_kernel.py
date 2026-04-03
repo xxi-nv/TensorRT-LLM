@@ -142,16 +142,23 @@ class FlashMoeFusedKernel:
         self.enable_ar = enable_ar
         self.ar_num_ranks = ar_num_ranks
 
-        # Warp ID assignment (11 warps, 352 threads)
+        # Warp ID assignment (12 warps, 384 threads)
+        # Warp 11 is idle (matches standalone FC1 kernel which has an idle
+        # sync_transform warp at index 11 in 1CTA mode).  Keeping 12 warps
+        # ensures identical CTA geometry to the standalone FC1 kernel.
         self.epilog_warp_id = (0, 1, 2, 3)
         self.ldgsts_a_warp_id = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.tma_b_warp_id = 9
         self.sched_warp_id = 10
+        # Warp 11 is idle — only hits cta_sync_barrier then falls through.
 
         self.threads_per_warp = 32
-        self.num_warps = 11
-        self.threads_per_cta = self.threads_per_warp * self.num_warps  # 352
+        self.num_warps = 12
+        self.threads_per_cta = self.threads_per_warp * self.num_warps  # 384
+        # warps_wo_sched: warps 0-9 participate in tile_info pipeline as
+        # consumers.  Warp 10 (scheduler) is the producer.  Warp 11 (idle)
+        # does NOT participate in the pipeline — same as standalone FC1.
         self.warps_wo_sched = len(
             (
                 *self.epilog_warp_id,
