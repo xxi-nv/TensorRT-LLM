@@ -1469,6 +1469,112 @@ class FlashMoeFusedKernel:
             return
 
         # ============================================================
+        # PHASE MODE 4: tile_info pipeline isolation test
+        # ============================================================
+        # All pipelines are initialized normally, but only the scheduler
+        # and tile_info consumer loops run. No A/B/acc pipeline traffic.
+        # This tests whether tile_info_pipeline alone deadlocks.
+        if cutlass.const_expr(self.phase_mode == 4):
+            if warp_idx == self.sched_warp_id:
+                # Scheduler runs normally
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    fc1_tile_sched_params,
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                tile_info_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_tile_stage
+                )
+                num_non_exiting_tiles_value = num_non_exiting_tiles[0]
+                is_continue = cutlass.Boolean(1)
+                while work_tile.is_valid_tile and is_continue:
+                    cur_tile_coord = work_tile.tile_idx
+                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    if mma_tile_coord_m < num_non_exiting_tiles_value:
+                        fc1_tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        cur_tile_coord = work_tile.tile_idx
+                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        with cute.arch.elect_one():
+                            fc1_sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
+                            fc1_sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                            fc1_sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                            fc1_sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                                work_tile.is_valid_tile
+                            )
+                            fc1_sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        self.sched_sync_barrier.arrive_and_wait()
+                        fc1_tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
+                    else:
+                        is_continue = cutlass.Boolean(0)
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+                # Sentinel tile
+                fc1_tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                with cute.arch.elect_one():
+                    fc1_sInfo[(0, tile_info_producer_state.index)] = work_tile.tile_idx[0]
+                    fc1_sInfo[(1, tile_info_producer_state.index)] = work_tile.tile_idx[1]
+                    fc1_sInfo[(2, tile_info_producer_state.index)] = -1
+                    fc1_sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
+                    fc1_sInfo[(4, tile_info_producer_state.index)] = -1
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                self.sched_sync_barrier.arrive_and_wait()
+                fc1_tile_info_pipeline.producer_commit(tile_info_producer_state)
+                tile_info_producer_state.advance()
+                fc1_tile_info_pipeline.producer_tail(tile_info_producer_state)
+                with cute.arch.elect_one():
+                    diag_sched = cute.make_tensor(
+                        fc1_done_counter.iterator + 1, cute.make_layout((1,))
+                    )
+                    atomic_add_global_i32_return(diag_sched, cutlass.Int32(1))
+            else:
+                # All non-scheduler warps: minimal tile_info consumer loop
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+                tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+                fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for idx in cutlass.range(4, unroll_full=True):
+                    tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                fc1_tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+                while is_valid_tile:
+                    fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for idx in cutlass.range(4, unroll_full=True):
+                        tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    fc1_tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+                # Diagnostic: non-scheduler warp completed tile_info loop
+                if warp_idx == self.epilog_warp_id[0]:
+                    with cute.arch.elect_one():
+                        diag_cons = cute.make_tensor(
+                            fc1_done_counter.iterator + 5, cute.make_layout((1,))
+                        )
+                        atomic_add_global_i32_return(diag_cons, cutlass.Int32(1))
+            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+                griddepcontrol_launch_dependents()
+            return
+
+        # ============================================================
         # ==================== FC1 PHASE =============================
         # ============================================================
 
