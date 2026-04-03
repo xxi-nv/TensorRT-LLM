@@ -589,7 +589,9 @@ class FlashMoE(torch.nn.Module):
         if not hasattr(self, "_fused_kernel_cache"):
             self._fused_kernel_cache = {}
 
-        cache_key = (self.sf_vec_size, self.tile_size, self.top_k, enable_ar)
+        # phase_mode: 0=full, 1=FC1 only, 2=FC1+barrier only (debug)
+        phase_mode = getattr(self, "phase_mode", 0)
+        cache_key = (self.sf_vec_size, self.tile_size, self.top_k, enable_ar, phase_mode)
         if cache_key not in self._fused_kernel_cache:
             kernel = FlashMoeFusedKernel(
                 sf_vec_size=self.sf_vec_size,
@@ -600,6 +602,7 @@ class FlashMoE(torch.nn.Module):
                 raster_along_m=False,
                 enable_ar=enable_ar,
                 ar_num_ranks=self.ep_size if enable_ar else 1,
+                phase_mode=phase_mode,
             )
             hardware_info = cutlass.utils.HardwareInfo()
             max_active_clusters = hardware_info.get_max_active_clusters(1)
@@ -712,7 +715,8 @@ class FlashMoE(torch.nn.Module):
             f"[FlashMoE] Kernel launched: m={m}, fc1_n={fc1_n}, "
             f"fc2_n={fc2_n}, k1={k1}, k2={k2}, "
             f"experts={self.experts_per_rank}, "
-            f"max_active_clusters={max_active_clusters}\n"
+            f"max_active_clusters={max_active_clusters}, "
+            f"phase_mode={phase_mode}\n"
         )
         sys.stderr.flush()
         sync_event = torch.cuda.Event()
@@ -737,7 +741,8 @@ class FlashMoE(torch.nn.Module):
 
         # AllReduce: when AR is enabled, the kernel already reduced the output.
         # When AR is disabled, fall back to NCCL AllReduce.
-        if not enable_ar and self.ep_size > 1:
+        # Skip AllReduce in phase_mode != 0 since FC2 output is undefined.
+        if not enable_ar and self.ep_size > 1 and phase_mode == 0:
             torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
 
         return output

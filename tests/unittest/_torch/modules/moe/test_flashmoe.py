@@ -231,6 +231,7 @@ def _flashmoe_worker_impl(
     num_tokens_per_rank: int,
     max_num_tokens: int,
     use_fused_kernel: bool = False,
+    phase_mode: int = 0,
 ):
     """Worker function for multi-GPU FlashMoE test.
 
@@ -296,6 +297,8 @@ def _flashmoe_worker_impl(
         use_fused_kernel=use_fused_kernel,
         use_ipc=False,  # Use torch.distributed instead of MNNVL IPC
     )
+    # Set phase_mode for deadlock isolation (0=full, 1=FC1 only, 2=FC1+barrier)
+    flashmoe.phase_mode = phase_mode
 
     # Create weights for LOCAL experts only (not global).
     # Each rank holds weights for its own expert partition.
@@ -345,11 +348,15 @@ def _flashmoe_worker_impl(
     )
     assert flash_output.dtype == torch.bfloat16, f"Expected bfloat16, got {flash_output.dtype}"
 
-    # Note: with random NVFP4 weights, output may contain non-finite values (inf/nan).
-    # Check that the kernel produced some non-zero output (including nan/inf).
-    has_nonzero = (flash_output != 0).any().item()
-    has_nonfinite = (~torch.isfinite(flash_output)).any().item()
-    assert has_nonzero or has_nonfinite, "Output is all zeros — kernel may not have run"
+    # For phase_mode != 0, FC2 output may be uninitialized; skip content check.
+    if phase_mode == 0:
+        # Note: with random NVFP4 weights, output may contain non-finite values (inf/nan).
+        # Check that the kernel produced some non-zero output (including nan/inf).
+        has_nonzero = (flash_output != 0).any().item()
+        has_nonfinite = (~torch.isfinite(flash_output)).any().item()
+        assert has_nonzero or has_nonfinite, "Output is all zeros — kernel may not have run"
+    else:
+        print(f"[Rank {rank}] phase_mode={phase_mode}: kernel completed OK (output not checked)")
 
     return None
 
@@ -558,6 +565,36 @@ class TestFlashMoEMultiGPU:
             args=(
                 world_size,
                 (num_experts, hidden_size, intermediate_size, top_k, 64, 256, True),
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+
+    @pytest.mark.parametrize(
+        "phase_mode",
+        [1, 2, 0],
+        ids=["fc1_only", "fc1_barrier", "full"],
+    )
+    @pytest.mark.timeout(600)
+    def test_flashmoe_fused_phase_isolation(self, phase_mode):
+        """Deadlock isolation: run FC1 only (mode 1), FC1+barrier (mode 2), full (mode 0).
+
+        If mode 1 passes but mode 2 hangs -> deadlock is in the cross-CTA barrier.
+        If mode 2 passes but mode 0 hangs -> deadlock is in FC2.
+        If mode 1 hangs -> deadlock is in FC1 itself.
+        """
+        num_experts, hidden_size, intermediate_size, top_k = 256, 7168, 2048, 8
+        world_size = min(torch.cuda.device_count(), 4)
+        if world_size < 2:
+            pytest.skip("Requires at least 2 GPUs")
+
+        os.environ["MASTER_PORT"] = str(_find_free_port())
+        # phase_mode is the last positional arg after use_fused_kernel=True
+        torch.multiprocessing.spawn(
+            _spawn_wrapper,
+            args=(
+                world_size,
+                (num_experts, hidden_size, intermediate_size, top_k, 64, 256, True, phase_mode),
             ),
             nprocs=world_size,
             join=True,

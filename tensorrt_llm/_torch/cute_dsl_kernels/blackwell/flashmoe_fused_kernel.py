@@ -123,7 +123,10 @@ class FlashMoeFusedKernel:
         raster_along_m: bool = False,
         enable_ar: bool = False,
         ar_num_ranks: int = 1,
+        phase_mode: int = 0,
     ):
+        # phase_mode: 0=full (FC1+barrier+FC2), 1=FC1 only, 2=FC1+barrier only
+        self.phase_mode = phase_mode
         self.sf_vec_size = sf_vec_size
         self.tile_size = mma_tiler_mn[0]
         self.topk = topk
@@ -2417,6 +2420,12 @@ class FlashMoeFusedKernel:
             c_pipeline.producer_tail()
 
         # ============================================================
+        # PHASE MODE 1: FC1-only, skip barrier and FC2
+        # ============================================================
+        if cutlass.const_expr(self.phase_mode == 1):
+            return
+
+        # ============================================================
         # CROSS-CTA BARRIER: FC1 → FC2
         # ============================================================
         # FC2 reads FC1 output (fc1_c) written by ALL CTAs via TMA S2G.
@@ -2444,6 +2453,12 @@ class FlashMoeFusedKernel:
         # Acquire fence: guarantee that this CTA sees all FC1 GMEM
         # writes from every other CTA before reading fc1_c in FC2.
         fence_acq_rel_gpu()
+
+        # ============================================================
+        # PHASE MODE 2: FC1+barrier only, skip FC2
+        # ============================================================
+        if cutlass.const_expr(self.phase_mode == 2):
+            return
 
         # ============================================================
         # ==================== FC2 PHASE =============================
