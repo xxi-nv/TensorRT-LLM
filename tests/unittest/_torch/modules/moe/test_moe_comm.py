@@ -51,6 +51,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
+from unittest.mock import MagicMock
 
 import cloudpickle
 import pytest
@@ -119,13 +120,17 @@ class CommTestConfig:
     top_k: int
     hidden_size: int
     all_num_tokens: List[int]
+    quant_mode: str = "none"  # "none" | "fp8" | "nvfp4" | "w4afp8"
 
     def __str__(self) -> str:
         tokens_str = "x".join(str(t) for t in self.all_num_tokens)
-        return (
+        s = (
             f"{self.comm_type}_ep{self.ep_size}_e{self.num_experts}"
             f"_k{self.top_k}_h{self.hidden_size}_t{tokens_str}"
         )
+        if self.quant_mode != "none":
+            s += f"_q{self.quant_mode}"
+        return s
 
 
 # ============================================================================
@@ -249,6 +254,15 @@ def create_comm_object(
     num_slots = num_experts
     max_num_tokens = max(config.all_num_tokens)
 
+    # DeepEP / DeepEP LL need a mock quant_config for post-quant dispatch.
+    # enable_postquant_alltoall is read from env var (default "1" = True),
+    # NOT a constructor parameter -- do not pass it.
+    qc = (
+        _make_mock_quant_config(config.quant_mode)
+        if config.quant_mode != "none" and comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL)
+        else None
+    )
+
     if comm_type == COMM_ALLGATHER_RS:
         from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
             AllGatherReduceScatter,
@@ -264,7 +278,7 @@ def create_comm_object(
             num_slots=num_slots,
             hidden_size=config.hidden_size,
             weight_dtype=torch.bfloat16,
-            quant_config=None,
+            quant_config=qc,
             expert_size_per_partition=num_experts // config.ep_size,
         )
 
@@ -278,7 +292,7 @@ def create_comm_object(
             num_slots=num_slots,
             hidden_size=config.hidden_size,
             weight_dtype=torch.bfloat16,
-            quant_config=None,
+            quant_config=qc,
             expert_size_per_partition=num_experts // config.ep_size,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=max_num_tokens,
@@ -374,8 +388,22 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             DeepEPLowLatency,
         )
 
-        if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES:
-            return f"DeepEPLL does not support hidden_size={config.hidden_size}"
+        qm = config.quant_mode
+        if qm == "none":
+            if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES:
+                return f"DeepEPLL does not support hidden_size={config.hidden_size}"
+        elif qm == "nvfp4":
+            if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES_EXTENSION:
+                return (
+                    f"DeepEPLL nvfp4 requires hidden_size in "
+                    f"SUPPORTED_HIDDEN_SIZES_EXTENSION, got {config.hidden_size}"
+                )
+        elif qm in ("fp8", "w4afp8"):
+            if (config.hidden_size // 2) not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES:
+                return (
+                    f"DeepEPLL {qm} requires hidden_size//2 in "
+                    f"SUPPORTED_HIDDEN_SIZES, got {config.hidden_size}"
+                )
 
     if comm_type == COMM_NVLINK_ONE_SIDED:
         from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
@@ -384,6 +412,13 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
 
         if config.top_k > NVLinkOneSided.MAX_TOP_K:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
+
+    # W4AFP8: encode_source_info writes token_idx into fp8 low byte.
+    # token_idx >= 127 can create fp8 NaN which may not survive bf16 roundtrip.
+    if config.quant_mode == "w4afp8":
+        max_tokens = max(config.all_num_tokens)
+        if max_tokens >= 127:
+            return f"W4AFP8 requires max_tokens < 127, got {max_tokens}"
 
     return None
 
@@ -421,11 +456,108 @@ def _generate_test_data(
     return hidden_states, token_selected_slots, token_final_scales
 
 
+# ============================================================================
+# Post-Quant Helpers
+# ============================================================================
+
+
+def _make_mock_quant_config(quant_mode: str) -> MagicMock:
+    """Build a mock QuantConfig with the correct nested attribute paths.
+
+    DeepEP checks:  quant_config.layer_quant_mode.has_nvfp4()
+    DeepEP LL:      quant_config.layer_quant_mode.has_fp8_qdq()
+                    quant_config.layer_quant_mode.has_nvfp4()
+                    quant_config.quant_mode.is_int4_weight_only_per_group()
+    """
+    mock = MagicMock()
+    mock.layer_quant_mode.has_fp8_qdq.return_value = quant_mode == "fp8"
+    mock.layer_quant_mode.has_nvfp4.return_value = quant_mode == "nvfp4"
+    mock.quant_mode.is_int4_weight_only_per_group.return_value = quant_mode == "w4afp8"
+    return mock
+
+
+def _generate_postquant_data(
+    rank: int,
+    config: CommTestConfig,
+    seed: int = 42,
+) -> Tuple[
+    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor
+]:
+    """Generate quantized test data using real quant ops.
+
+    Returns (hidden_states, hidden_states_sf, global_scale,
+             token_selected_slots, token_final_scales).
+    Source info is NOT encoded here -- the caller encodes after this returns.
+    """
+    num_tokens = config.all_num_tokens[rank]
+    H = config.hidden_size
+
+    torch.manual_seed(seed + rank)
+    bf16_hs = torch.randn(num_tokens, H, dtype=torch.bfloat16, device="cuda")
+
+    if config.quant_mode == "fp8":
+        hs = bf16_hs.to(torch.float8_e4m3fn)
+        sf = None
+        global_scale = None
+
+    elif config.quant_mode == "nvfp4":
+        from tensorrt_llm.deep_ep.buffer import Buffer
+
+        global_scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        hs, sf = Buffer.quantize_bf16_to_nvfp4(bf16_hs, global_scale)
+
+    elif config.quant_mode == "w4afp8":
+        hs = bf16_hs.to(torch.float8_e4m3fn)
+        sf = None
+        global_scale = None
+
+    else:
+        raise ValueError(f"Unknown quant_mode: {config.quant_mode}")
+
+    token_selected_slots = torch.randint(
+        0,
+        config.num_experts,
+        (num_tokens, config.top_k),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    token_final_scales = torch.rand(
+        num_tokens,
+        config.top_k,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).clamp(min=0.1)
+
+    return hs, sf, global_scale, token_selected_slots, token_final_scales
+
+
+def _to_bf16(
+    hs: torch.Tensor,
+    sf: Optional[torch.Tensor],
+    global_scale: Optional[torch.Tensor],
+    quant_mode: str,
+) -> torch.Tensor:
+    """Dequantize to bf16 using real dequant ops.  Must run on CUDA."""
+    if quant_mode in ("fp8", "w4afp8"):
+        return hs.to(torch.bfloat16)
+    elif quant_mode == "nvfp4":
+        from tensorrt_llm.deep_ep.buffer import Buffer
+
+        return Buffer.dequantize_nvfp4_to_bf16(hs, global_scale, sf)
+    raise ValueError(f"Unknown quant_mode: {quant_mode}")
+
+
 def _worker_full_pipeline(config: CommTestConfig) -> dict:
     """Run dispatch -> simple_moe -> combine on a single MPI rank.
 
     Returns both dispatch intermediate results (for dispatch verification)
     and final combine output (for combine verification).
+
+    Post-quant flow (quant_mode != "none"):
+      generate quantized data -> encode source info in quantized domain
+      -> dispatch -> dequant -> simple_moe -> combine.
+    W4AFP8 special: encode on fp8, convert to bf16 for dispatch with
+      pre_quant_scale=ones, preflight-check roundtrip fidelity.
     """
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -440,22 +572,61 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         )
 
         comm = create_comm_object(config.comm_type, mapping, config)
-        hs, slots, scales = _generate_test_data(rank, config)
 
+        # ----- data generation + encode -----
+        original_fp8 = None
+        w4afp8_roundtrip_ok = None
+
+        if config.quant_mode == "none":
+            hs, slots, scales = _generate_test_data(rank, config)
+            hidden_states_sf = None
+            global_scale = None
+            dispatch_kwargs = {}
+        else:
+            hs, hidden_states_sf, global_scale, slots, scales = _generate_postquant_data(
+                rank, config
+            )
+
+            if config.quant_mode == "w4afp8":
+                hs = encode_source_info(hs, rank)
+                original_fp8 = hs.clone()
+                roundtrip_fp8 = hs.to(torch.bfloat16).to(torch.float8_e4m3fn)
+                w4afp8_roundtrip_ok = torch.equal(hs, roundtrip_fp8)
+                hs = hs.to(torch.bfloat16)
+                pre_quant_scale = torch.ones(
+                    1,
+                    config.hidden_size,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                dispatch_kwargs = {"pre_quant_scale": pre_quant_scale}
+            else:
+                hs = encode_source_info(hs, rank)
+                dispatch_kwargs = {}
+
+        # ----- prepare + dispatch -----
         if config.comm_type == COMM_NVLINK_TWO_SIDED:
             comm.prepare_dispatch(slots, config.all_num_tokens)
 
         recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
             hs,
-            None,
+            hidden_states_sf,
             slots,
             scales,
             config.all_num_tokens,
+            enable_sanitize_expert_ids=True,
+            **dispatch_kwargs,
         )
+
+        # ----- dequant + MoE + combine -----
+        if config.quant_mode != "none":
+            recv_hs_bf16 = _to_bf16(recv_hs, recv_sf, global_scale, config.quant_mode)
+        else:
+            recv_hs_bf16 = recv_hs
 
         experts_per_rank = config.num_experts // config.ep_size
         moe_output = simple_moe(
-            recv_hs,
+            recv_hs_bf16,
             recv_slots,
             recv_scales,
             config.num_experts,
@@ -468,16 +639,36 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             all_rank_max_num_tokens=max(config.all_num_tokens),
         )
 
-        return {
+        # ----- build result dict -----
+        result = {
             "rank": rank,
             "original_hs": hs.cpu(),
+            "original_hs_sf": hidden_states_sf.cpu() if hidden_states_sf is not None else None,
             "original_slots": slots.cpu(),
             "original_scales": scales.cpu(),
             "recv_hs": recv_hs.cpu(),
+            "recv_sf": recv_sf.cpu() if recv_sf is not None else None,
             "recv_slots": recv_slots.cpu(),
             "recv_scales": recv_scales.cpu() if recv_scales is not None else None,
             "combined": combined.cpu(),
         }
+
+        if config.quant_mode == "w4afp8":
+            result["original_fp8"] = original_fp8.cpu()
+            result["w4afp8_roundtrip_ok"] = w4afp8_roundtrip_ok
+
+        # Pre-compute dequanted bf16 for combine reference ON GPU.
+        # Buffer.dequantize_nvfp4_to_bf16 is a CUDA C++ kernel and cannot
+        # run on CPU tensors; verify_combine_results runs outside the MPI
+        # worker with CPU data.
+        if config.quant_mode == "nvfp4":
+            result["ref_hs_bf16"] = _to_bf16(hs, hidden_states_sf, global_scale, "nvfp4").cpu()
+        elif config.quant_mode == "fp8":
+            result["ref_hs_bf16"] = hs.to(torch.bfloat16).cpu()
+        elif config.quant_mode == "w4afp8":
+            result["ref_hs_bf16"] = original_fp8.to(torch.bfloat16).cpu()
+
+        return result
     except Exception:
         traceback.print_exc()
         raise
@@ -495,7 +686,10 @@ def verify_dispatch_allgather_rs(
     all_results: List[dict],
     config: CommTestConfig,
 ):
-    """Verify AllGatherRS: allgathered data is bitwise-exact concatenation."""
+    """Verify AllGatherRS: allgathered data is bitwise-exact concatenation.
+
+    For nvfp4 mode, also verifies hidden_states_sf is allgathered correctly.
+    """
     total_tokens = sum(config.all_num_tokens)
 
     for result in all_results:
@@ -512,6 +706,20 @@ def verify_dispatch_allgather_rs(
                 f"Rank {result['rank']}: chunk for source rank {src_rank} mismatch"
             )
             offset += n
+
+        # For nvfp4, verify hidden_states_sf (scale factors) are gathered too.
+        if config.quant_mode == "nvfp4":
+            recv_sf = result.get("recv_sf")
+            if recv_sf is not None:
+                sf_offset = 0
+                for src_rank in range(config.ep_size):
+                    src_sf = all_results[src_rank].get("original_hs_sf")
+                    n = config.all_num_tokens[src_rank]
+                    if src_sf is not None:
+                        assert torch.equal(recv_sf[sf_offset : sf_offset + n], src_sf), (
+                            f"Rank {result['rank']}: sf chunk for source rank {src_rank} mismatch"
+                        )
+                    sf_offset += n
 
 
 def _compute_expected_tokens_per_rank(
@@ -545,22 +753,58 @@ def verify_dispatch_alltoall(
 ):
     """Verify AllToAll dispatch: slot validity, content integrity, completeness.
 
-    1. All received slots are local experts or invalid (-1 / >= num_experts)
-    2. Encoded (rank_id, token_idx) in received data matches original content
-    3. All tokens that should be routed to this rank are present (completeness)
+    Slot semantics differ by communication backend:
+      - NVLinkOneSided / NVLinkTwoSided: valid tokens keep global expert IDs
+        [0, num_experts), padding tokens are set to -1 by sanitize kernel.
+      - DeepEP: valid tokens keep global expert IDs [0, num_experts), empty-
+        tensor padding uses num_experts as invalid marker.
+      - DeepEPLowLatency: _modify_output_to_adapt_fused_moe creates local
+        expert IDs [slot_start, slot_end), padding uses num_experts.
+
+    Checks:
+    1. Per-comm-type slot range validation (see above)
+    2. Non-padding tokens must have at least one LOCAL slot
+    3. Encoded (rank_id, token_idx) in received data matches original content
+    4. All tokens that should be routed to this rank are present (completeness)
     """
     num_experts = config.num_experts
     experts_per_rank = num_experts // config.ep_size
 
-    # Global lookup: (src_rank, token_idx) -> original hidden_states row
+    # Determine decode dtype and hidden_size based on quant_mode.
+    # For fp8/w4afp8, data is transported as fp8 viewed as bf16 (half width).
+    # For nvfp4, data is packed uint8 (half width).
+    qm = config.quant_mode
+    if qm == "fp8":
+        decode_dtype = torch.float8_e4m3fn
+        decode_hidden = config.hidden_size
+    elif qm == "nvfp4":
+        decode_dtype = torch.uint8
+        decode_hidden = config.hidden_size // 2
+    elif qm == "w4afp8":
+        decode_dtype = torch.float8_e4m3fn
+        decode_hidden = config.hidden_size
+    else:
+        decode_dtype = torch.bfloat16
+        decode_hidden = config.hidden_size
+
+    # Global lookup: (src_rank, token_idx) -> original hidden_states row.
+    # For w4afp8, use original_fp8 (fp8 domain) for content comparison.
     original_data: Dict[Tuple[int, int], torch.Tensor] = {}
     for result in all_results:
         src_rank = result["rank"]
-        orig_hs = result["original_hs"]
-        for i in range(orig_hs.shape[0]):
-            original_data[(src_rank, i)] = orig_hs[i]
+        if qm == "w4afp8":
+            orig = result["original_fp8"]
+        else:
+            orig = result["original_hs"]
+        for i in range(orig.shape[0]):
+            original_data[(src_rank, i)] = orig[i]
 
     expected_per_rank = _compute_expected_tokens_per_rank(all_results, config)
+
+    # For w4afp8: if any rank's preflight roundtrip failed, skip content check
+    w4afp8_skip_content = False
+    if qm == "w4afp8":
+        w4afp8_skip_content = not all(r.get("w4afp8_roundtrip_ok", True) for r in all_results)
 
     for result in all_results:
         recv_rank = result["rank"]
@@ -570,7 +814,7 @@ def verify_dispatch_alltoall(
         slot_start = recv_rank * experts_per_rank
         slot_end = slot_start + experts_per_rank
 
-        decoded = decode_source_info(recv_hs, torch.bfloat16, config.hidden_size)
+        decoded = decode_source_info(recv_hs, decode_dtype, decode_hidden)
         top_k = recv_slots.shape[1]
 
         actually_received: Set[Tuple[int, int]] = set()
@@ -578,27 +822,31 @@ def verify_dispatch_alltoall(
         for i in range(recv_hs.shape[0]):
             for k in range(top_k):
                 slot = recv_slots[i, k].item()
-                is_local = slot_start <= slot < slot_end
-                is_invalid = slot < 0 or slot >= num_experts
-                assert is_local or is_invalid, (
-                    f"Rank {recv_rank}, token {i}, k={k}: slot={slot} "
-                    f"not local [{slot_start},{slot_end}) and not invalid"
-                )
+                if config.comm_type == COMM_DEEP_EP_LL:
+                    is_local = slot_start <= slot < slot_end
+                    is_invalid = slot == num_experts
+                    assert is_local or is_invalid, (
+                        f"Rank {recv_rank}, token {i}, k={k}: slot={slot} "
+                        f"not local [{slot_start},{slot_end}) and "
+                        f"not invalid marker ({num_experts})"
+                    )
+                else:
+                    assert -1 <= slot < num_experts, (
+                        f"Rank {recv_rank}, token {i}, k={k}: slot={slot} "
+                        f"out of valid range [-1, {num_experts})"
+                    )
 
             has_valid = any(slot_start <= recv_slots[i, k].item() < slot_end for k in range(top_k))
             if has_valid:
                 src_rank, src_idx = decoded[i]
                 key = (src_rank, src_idx)
                 actually_received.add(key)
-                if key in original_data:
+                if key in original_data and not w4afp8_skip_content:
                     assert torch.equal(recv_hs[i], original_data[key]), (
                         f"Rank {recv_rank}, token {i}: content mismatch. "
                         f"Source: rank={src_rank}, idx={src_idx}"
                     )
 
-        # Completeness check.
-        # Skip for DeepEPLL: tokens are duplicated per expert and top_k is
-        # collapsed to 1, so source encoding cannot distinguish duplicates.
         if config.comm_type != COMM_DEEP_EP_LL:
             expected_tokens = expected_per_rank[recv_rank]
             missing = expected_tokens - actually_received
@@ -630,20 +878,28 @@ def verify_combine_results(
 
     Computes simple_moe_reference (all experts, no EP) and compares
     with the distributed dispatch+simple_moe+combine pipeline output.
+
+    For post-quant modes, uses pre-computed ref_hs_bf16 (dequantized on GPU
+    by the worker) as the reference input instead of the raw original_hs.
     """
     for result in all_results:
         rank = result["rank"]
-        original_hs = result["original_hs"]
         original_slots = result["original_slots"]
         original_scales = result["original_scales"]
         combined = result["combined"]
 
-        num_tokens = original_hs.shape[0]
+        # Use pre-computed dequanted bf16 for post-quant modes.
+        if config.quant_mode != "none" and "ref_hs_bf16" in result:
+            ref_input = result["ref_hs_bf16"]
+        else:
+            ref_input = result["original_hs"]
+
+        num_tokens = ref_input.shape[0]
         if num_tokens == 0:
             continue
 
         ref = simple_moe_reference(
-            original_hs,
+            ref_input,
             original_slots,
             original_scales,
             config.num_experts,
@@ -680,6 +936,26 @@ def verify_combine_results(
 # ============================================================================
 # Test Parameter Generation
 # ============================================================================
+
+
+POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
+    "fp8": [COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED, COMM_DEEP_EP_LL, COMM_ALLGATHER_RS],
+    "nvfp4": [
+        COMM_NVLINK_ONE_SIDED,
+        COMM_NVLINK_TWO_SIDED,
+        COMM_DEEP_EP,
+        COMM_DEEP_EP_LL,
+        COMM_ALLGATHER_RS,
+    ],
+    "w4afp8": [COMM_DEEP_EP_LL],
+}
+"""Only valid (quant_mode, comm_type) combinations for post-quant tests.
+
+- fp8: NVLink (payload-agnostic) + DeepEP LL (fp8 branch) + AllGatherRS.
+  DeepEP normal only supports nvfp4 post-quant, NOT fp8.
+- nvfp4: All 5 COMM types support nvfp4 post-quant.
+- w4afp8: Only DeepEP LL has the w4afp8 dispatch branch.
+"""
 
 
 def _make_workloads(ep_size: int) -> List[List[int]]:
@@ -787,6 +1063,29 @@ def _make_boundary_test_params():
     return params
 
 
+def _make_postquant_test_params():
+    """Generate post-quant test parameters using POSTQUANT_COMM_MAP.
+
+    Uses simplified workloads (ep_size=2, top_k=2, small tokens) to keep
+    the matrix manageable while covering all valid (comm_type, quant_mode)
+    combinations.
+    """
+    params = []
+    for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
+        for comm_type in comm_types:
+            config = CommTestConfig(
+                comm_type=comm_type,
+                ep_size=2,
+                num_experts=FIXED_NUM_EXPERTS,
+                top_k=2,
+                hidden_size=DEFAULT_HIDDEN_SIZE,
+                all_num_tokens=[16, 16],
+                quant_mode=quant_mode,
+            )
+            params.append(pytest.param(2, config, id=str(config)))
+    return params
+
+
 # ============================================================================
 # Pytest Fixtures & Test Runner
 # ============================================================================
@@ -858,4 +1157,14 @@ class TestMoEComm:
     )
     def test_moe_comm_boundary(self, mpi_pool_executor, config: CommTestConfig):
         """Test full pipeline with boundary / edge-case parameters."""
+        _run_full_test(mpi_pool_executor, config)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,config",
+        _make_postquant_test_params(),
+        indirect=["mpi_pool_executor"],
+    )
+    def test_moe_comm_postquant(self, mpi_pool_executor, config: CommTestConfig):
+        """Verify post-quant dispatch -> dequant -> MoE -> combine pipeline."""
         _run_full_test(mpi_pool_executor, config)
