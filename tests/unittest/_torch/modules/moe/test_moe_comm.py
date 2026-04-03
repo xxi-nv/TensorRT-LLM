@@ -566,6 +566,10 @@ def _to_bf16(
     elif quant_mode == "nvfp4":
         from tensorrt_llm.deep_ep.buffer import Buffer
 
+        # global_scale must be (N, 1) where N == hs.size(0).  After dispatch
+        # the received token count differs from the original, so recreate.
+        if global_scale.size(0) != hs.size(0):
+            global_scale = torch.ones(hs.size(0), 1, device=hs.device, dtype=torch.float32)
         return Buffer.dequantize_nvfp4_to_bf16(hs, global_scale, sf)
     raise ValueError(f"Unknown quant_mode: {quant_mode}")
 
