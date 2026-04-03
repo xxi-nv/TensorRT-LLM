@@ -700,63 +700,40 @@ class FlashMoE(torch.nn.Module):
         )
 
         # Diagnostic: poll-wait for kernel completion with timeout.
-        # When the persistent kernel occupies ALL SMs, no other CUDA
-        # operations can execute (even on separate streams).  We use the
-        # CUDA driver API (cuMemcpyDtoH_v2) to read fc1_done_counter
-        # because it uses the DMA engine and does NOT need an SM.
-        import ctypes
-        import logging
+        # IMPORTANT: When the persistent kernel occupies ALL SMs, no
+        # other CUDA work can execute — not even cuMemcpyDtoH_v2.
+        # On timeout, we print to stderr (bypassing log buffering) and
+        # call os._exit() to terminate immediately (raise RuntimeError
+        # triggers NCCL cleanup which blocks on the stuck GPU).
+        import sys
         import time as _time
 
-        logger = logging.getLogger(__name__)
-        logger.info(
-            "Fused kernel launched: m=%d, fc1_n=%d, fc2_n=%d, k1=%d, k2=%d, "
-            "experts=%d, max_active_clusters=%s",
-            m,
-            fc1_n,
-            fc2_n,
-            k1,
-            k2,
-            self.experts_per_rank,
-            max_active_clusters,
+        sys.stderr.write(
+            f"[FlashMoE] Kernel launched: m={m}, fc1_n={fc1_n}, "
+            f"fc2_n={fc2_n}, k1={k1}, k2={k2}, "
+            f"experts={self.experts_per_rank}, "
+            f"max_active_clusters={max_active_clusters}\n"
         )
+        sys.stderr.flush()
         sync_event = torch.cuda.Event()
         sync_event.record()
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
-                # Kernel timed out — use CUDA driver API to read counter
-                # without needing an SM (DMA engine copy).
-                fc1_val = -1
-                try:
-                    _libcuda = ctypes.CDLL("libcuda.so.1")
-                    _result = ctypes.c_int32()
-                    _ret = _libcuda.cuMemcpyDtoH_v2(
-                        ctypes.byref(_result),
-                        ctypes.c_uint64(fc1_done_counter.data_ptr()),
-                        ctypes.c_size_t(4),
-                    )
-                    fc1_val = _result.value
-                    logger.error(
-                        "Fused kernel DEADLOCK (60s timeout). "
-                        "fc1_done_counter=%d, cuMemcpy ret=%d. "
-                        "FC1 phase %s",
-                        fc1_val,
-                        _ret,
-                        "COMPLETED" if fc1_val > 0 else "STUCK (=0)",
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Fused kernel DEADLOCK (60s timeout), counter read failed: %s",
-                        e,
-                    )
-                raise RuntimeError(
-                    f"FlashMoE fused kernel deadlock detected (60s timeout). "
-                    f"fc1_done_counter={fc1_val}"
+                sys.stderr.write(
+                    "[FlashMoE] DEADLOCK: fused kernel did not complete "
+                    "within 60s. Cannot read fc1_done_counter because "
+                    "all SMs are occupied by the stuck persistent kernel.\n"
                 )
+                sys.stderr.flush()
+                # os._exit bypasses NCCL cleanup (which also hangs)
+                import os
+
+                os._exit(42)
             _time.sleep(0.1)
         fc1_val = fc1_done_counter.item()
-        logger.info("Fused kernel sync OK: fc1_done_counter=%d", fc1_val)
+        sys.stderr.write(f"[FlashMoE] Kernel sync OK: fc1_done_counter={fc1_val}\n")
+        sys.stderr.flush()
 
         # AllReduce: when AR is enabled, the kernel already reduced the output.
         # When AR is disabled, fall back to NCCL AllReduce.
