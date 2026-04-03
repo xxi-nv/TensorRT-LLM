@@ -700,33 +700,60 @@ class FlashMoE(torch.nn.Module):
         )
 
         # Diagnostic: poll-wait for kernel completion with timeout.
-        # If the kernel deadlocks, read fc1_done_counter on a SEPARATE
-        # stream (default stream is blocked behind the stuck kernel).
+        # When the persistent kernel occupies ALL SMs, no other CUDA
+        # operations can execute (even on separate streams).  We use the
+        # CUDA driver API (cuMemcpyDtoH_v2) to read fc1_done_counter
+        # because it uses the DMA engine and does NOT need an SM.
+        import ctypes
         import logging
         import time as _time
 
         logger = logging.getLogger(__name__)
+        logger.info(
+            "Fused kernel launched: m=%d, fc1_n=%d, fc2_n=%d, k1=%d, k2=%d, "
+            "experts=%d, max_active_clusters=%s",
+            m,
+            fc1_n,
+            fc2_n,
+            k1,
+            k2,
+            self.experts_per_rank,
+            max_active_clusters,
+        )
         sync_event = torch.cuda.Event()
         sync_event.record()
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
-                # Kernel timed out — read fc1_done_counter on a fresh stream
-                # so the D2H copy is not blocked behind the stuck kernel.
+                # Kernel timed out — use CUDA driver API to read counter
+                # without needing an SM (DMA engine copy).
+                fc1_val = -1
                 try:
-                    diag_stream = torch.cuda.Stream()
-                    with torch.cuda.stream(diag_stream):
-                        fc1_snap = fc1_done_counter.clone()
-                    diag_stream.synchronize()
-                    fc1_val = fc1_snap.item()
+                    _libcuda = ctypes.CDLL("libcuda.so.1")
+                    _result = ctypes.c_int32()
+                    _ret = _libcuda.cuMemcpyDtoH_v2(
+                        ctypes.byref(_result),
+                        ctypes.c_uint64(fc1_done_counter.data_ptr()),
+                        ctypes.c_size_t(4),
+                    )
+                    fc1_val = _result.value
                     logger.error(
-                        "Fused kernel DEADLOCK (60s timeout). fc1_done_counter=%d — FC1 phase %s",
+                        "Fused kernel DEADLOCK (60s timeout). "
+                        "fc1_done_counter=%d, cuMemcpy ret=%d. "
+                        "FC1 phase %s",
                         fc1_val,
-                        "likely COMPLETED (>0)" if fc1_val > 0 else "STUCK (=0)",
+                        _ret,
+                        "COMPLETED" if fc1_val > 0 else "STUCK (=0)",
                     )
                 except Exception as e:
-                    logger.error("Fused kernel DEADLOCK, counter read failed: %s", e)
-                raise RuntimeError("FlashMoE fused kernel deadlock detected (60s timeout)")
+                    logger.error(
+                        "Fused kernel DEADLOCK (60s timeout), counter read failed: %s",
+                        e,
+                    )
+                raise RuntimeError(
+                    f"FlashMoE fused kernel deadlock detected (60s timeout). "
+                    f"fc1_done_counter={fc1_val}"
+                )
             _time.sleep(0.1)
         fc1_val = fc1_done_counter.item()
         logger.info("Fused kernel sync OK: fc1_done_counter=%d", fc1_val)
