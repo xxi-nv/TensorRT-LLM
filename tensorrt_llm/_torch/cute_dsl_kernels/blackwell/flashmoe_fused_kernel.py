@@ -326,9 +326,11 @@ class FlashMoeFusedKernel:
             self.sf_vec_size,
             self.num_smem_capacity,
             self.occupancy,
-            # FC1-only mode matches standalone kernel (1024B for barriers).
-            # Full dual-phase needs 2048B for both FC1 and FC2 barriers.
-            mbar_helpers_bytes=1024 if self.phase_mode == 1 else 2048,
+            # Reserve 2048B for pipeline barrier storage (FC1+FC2).
+            # Even in FC1-only mode we use the full layout to keep the
+            # SharedStorage struct unconditional (CuTe DSL JIT requires
+            # struct definitions outside dynamic control flow).
+            mbar_helpers_bytes=2048,
         )
 
         # Mainloop SMEM layouts (shared between FC1 and FC2)
@@ -905,124 +907,73 @@ class FlashMoeFusedKernel:
         # ============================================================
         # SharedStorage definition
         # ============================================================
-        # For FC1-only mode (phase_mode==1), define a minimal struct
-        # without FC2 barrier fields — matching the standalone FC1
-        # kernel layout exactly.  This also avoids potential SMEM
-        # overflow caused by the extra FC2 barrier slots.
+        # Always use the full dual-phase layout with FC2 barrier fields.
+        # CuTe DSL JIT does not support struct definitions inside dynamic
+        # control flow (if/else), so we define a single unconditional
+        # struct.  In FC1-only mode the FC2 fields are allocated but
+        # unused — this costs a small amount of extra SMEM but avoids
+        # the "NameError: SharedStorage not defined" JIT compilation
+        # failure.
         self.buffer_align_bytes = 1024
 
-        if self.phase_mode == 1:
-            # FC1-only layout (matches standalone FC1 kernel).
-            @cute.struct
-            class SharedStorage:
-                fc1_sInfo: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
-                    1,
-                ]
-                # FC1 pipeline barriers
-                fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-                fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-                fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-                fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-                # TMEM management
-                tmem_dealloc_mbar_ptr: cutlass.Int64
-                tmem_holding_buf: cutlass.Int32
-                # FC1 epilogue staging
-                sC: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.fc1_c_dtype,
-                        cute.cosize(self.fc1_c_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.a_dtype,
-                        cute.cosize(self.a_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.b_dtype,
-                        cute.cosize(self.b_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sSFA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.sf_dtype,
-                        cute.cosize(self.sfa_smem_layout_staged),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sSFB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.sf_dtype,
-                        cute.cosize(self.sfb_smem_layout_staged),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-        else:
-            # Full dual-phase layout (FC1 + FC2).
-            @cute.struct
-            class SharedStorage:
-                fc1_sInfo: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
-                    1,
-                ]
-                fc2_sInfo: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
-                    1,
-                ]
-                # FC1 pipeline barriers
-                fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-                fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-                fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-                fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-                # FC2 pipeline barriers
-                fc2_ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-                fc2_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-                fc2_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-                # TMEM management
-                tmem_dealloc_mbar_ptr: cutlass.Int64
-                tmem_holding_buf: cutlass.Int32
-                # FC1 epilogue staging
-                sC: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.fc1_c_dtype,
-                        cute.cosize(self.fc1_c_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.a_dtype,
-                        cute.cosize(self.a_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.b_dtype,
-                        cute.cosize(self.b_smem_layout_staged.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sSFA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.sf_dtype,
-                        cute.cosize(self.sfa_smem_layout_staged),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                sSFB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.sf_dtype,
-                        cute.cosize(self.sfb_smem_layout_staged),
-                    ],
-                    self.buffer_align_bytes,
-                ]
+        @cute.struct
+        class SharedStorage:
+            fc1_sInfo: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                1,
+            ]
+            fc2_sInfo: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                1,
+            ]
+            # FC1 pipeline barriers
+            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            fc1_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            fc1_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            # FC2 pipeline barriers (unused in FC1-only mode)
+            fc2_ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            fc2_acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            fc2_tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            # TMEM management
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+            # FC1 epilogue staging
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.fc1_c_dtype,
+                    cute.cosize(self.fc1_c_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.a_dtype,
+                    cute.cosize(self.a_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.b_dtype,
+                    cute.cosize(self.b_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype,
+                    cute.cosize(self.sfa_smem_layout_staged),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype,
+                    cute.cosize(self.sfb_smem_layout_staged),
+                ],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
