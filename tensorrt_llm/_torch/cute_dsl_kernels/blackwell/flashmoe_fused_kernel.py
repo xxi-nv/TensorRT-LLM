@@ -894,9 +894,10 @@ class FlashMoeFusedKernel:
         # behaviour.  With max(fc1, fc2), CTAs beyond the FC1 tile count
         # receive zero tiles which is handled correctly by the persistent
         # scheduler, but we eliminate this variable for debugging.
-        if self.phase_mode == 1:
-            grid = fc1_grid
-        else:
+        # NOTE: must assign initial value before branches — CuTe DSL does
+        # not support variables first defined inside dynamic control flow.
+        grid = fc1_grid
+        if self.phase_mode != 1:
             grid = (max(fc1_grid[0], fc2_grid[0]), 1, 1)
 
         # ============================================================
