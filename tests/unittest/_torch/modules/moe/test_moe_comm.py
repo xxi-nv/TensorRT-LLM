@@ -134,6 +134,28 @@ class CommTestConfig:
 
 
 # ============================================================================
+# MPI Serialization Helpers
+# ============================================================================
+
+_FLOAT8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _safe_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Move tensor to CPU, converting float8 to uint8 for MPI serialization.
+
+    PyTorch float8 tensors cannot be pickled reliably across all builds.
+    Since float8 and uint8 have the same element size, view(uint8) preserves
+    shape and content.  Downstream verification already works on the byte
+    view, so this is a transparent change.
+    """
+    if t is None:
+        return None
+    if t.dtype in _FLOAT8_DTYPES:
+        return t.view(torch.uint8).cpu()
+    return t.cpu()
+
+
+# ============================================================================
 # Source Encoding Utilities
 # ============================================================================
 
@@ -504,7 +526,7 @@ def _generate_postquant_data(
     elif config.quant_mode == "nvfp4":
         from tensorrt_llm.deep_ep.buffer import Buffer
 
-        global_scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        global_scale = torch.ones(num_tokens, 1, device="cuda", dtype=torch.float32)
         hs, sf = Buffer.quantize_bf16_to_nvfp4(bf16_hs, global_scale)
 
     elif config.quant_mode == "w4afp8":
@@ -641,21 +663,22 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         )
 
         # ----- build result dict -----
+        # Use _safe_cpu for tensors that may be float8 (MPI serialization).
         result = {
             "rank": rank,
-            "original_hs": hs.cpu(),
-            "original_hs_sf": hidden_states_sf.cpu() if hidden_states_sf is not None else None,
+            "original_hs": _safe_cpu(hs),
+            "original_hs_sf": _safe_cpu(hidden_states_sf),
             "original_slots": slots.cpu(),
             "original_scales": scales.cpu(),
-            "recv_hs": recv_hs.cpu(),
-            "recv_sf": recv_sf.cpu() if recv_sf is not None else None,
+            "recv_hs": _safe_cpu(recv_hs),
+            "recv_sf": _safe_cpu(recv_sf),
             "recv_slots": recv_slots.cpu(),
             "recv_scales": recv_scales.cpu() if recv_scales is not None else None,
             "combined": combined.cpu(),
         }
 
         if config.quant_mode == "w4afp8":
-            result["original_fp8"] = original_fp8.cpu()
+            result["original_fp8"] = _safe_cpu(original_fp8)
             result["w4afp8_roundtrip_ok"] = w4afp8_roundtrip_ok
 
         # Pre-compute dequanted bf16 for combine reference ON GPU.
