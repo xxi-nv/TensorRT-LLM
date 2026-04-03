@@ -755,12 +755,14 @@ class FlashMoE(torch.nn.Module):
         _deadline = _time.monotonic() + 60  # 60s timeout
         while not sync_event.query():
             if _time.monotonic() > _deadline:
-                # Print DEADLOCK message FIRST (before any CUDA call that may hang)
+                # Print DEADLOCK message FIRST — before ANY CUDA call.
+                # When the persistent kernel occupies all SMs, even
+                # cuMemcpyDtoH blocks (CUDA driver serializes context).
+                sys.stderr.write("[FlashMoE] DEADLOCK: fused kernel did not complete within 60s.\n")
+                sys.stderr.flush()
+                # Try to read diagnostic counters (best-effort, may hang)
                 diag_str = _read_diag_counters_direct(fc1_done_counter)
-                sys.stderr.write(
-                    f"[FlashMoE] DEADLOCK: fused kernel did not complete "
-                    f"within 60s. Diag: {diag_str}\n"
-                )
+                sys.stderr.write(f"[FlashMoE] DEADLOCK diag: {diag_str}\n")
                 sys.stderr.flush()
                 # os._exit bypasses NCCL cleanup (which also hangs)
                 import os
