@@ -142,23 +142,16 @@ class FlashMoeFusedKernel:
         self.enable_ar = enable_ar
         self.ar_num_ranks = ar_num_ranks
 
-        # Warp ID assignment (12 warps, 384 threads)
-        # Warp 11 is idle (matches standalone FC1 kernel which has an idle
-        # sync_transform warp at index 11 in 1CTA mode).  Keeping 12 warps
-        # ensures identical CTA geometry to the standalone FC1 kernel.
+        # Warp ID assignment (11 warps, 352 threads)
         self.epilog_warp_id = (0, 1, 2, 3)
         self.ldgsts_a_warp_id = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.tma_b_warp_id = 9
         self.sched_warp_id = 10
-        # Warp 11 is idle — only hits cta_sync_barrier then falls through.
 
         self.threads_per_warp = 32
-        self.num_warps = 12
-        self.threads_per_cta = self.threads_per_warp * self.num_warps  # 384
-        # warps_wo_sched: warps 0-9 participate in tile_info pipeline as
-        # consumers.  Warp 10 (scheduler) is the producer.  Warp 11 (idle)
-        # does NOT participate in the pipeline — same as standalone FC1.
+        self.num_warps = 11
+        self.threads_per_cta = self.threads_per_warp * self.num_warps  # 352
         self.warps_wo_sched = len(
             (
                 *self.epilog_warp_id,
@@ -897,8 +890,14 @@ class FlashMoeFusedKernel:
             max_active_clusters,
             self.raster_along_m,
         )
-        # Use max grid to ensure enough CTAs for both phases
-        grid = (max(fc1_grid[0], fc2_grid[0]), 1, 1)
+        # In FC1-only mode, use exact FC1 grid to match standalone kernel
+        # behaviour.  With max(fc1, fc2), CTAs beyond the FC1 tile count
+        # receive zero tiles which is handled correctly by the persistent
+        # scheduler, but we eliminate this variable for debugging.
+        if self.phase_mode == 1:
+            grid = fc1_grid
+        else:
+            grid = (max(fc1_grid[0], fc2_grid[0]), 1, 1)
 
         # ============================================================
         # SharedStorage definition (always dual-phase layout)
@@ -1417,8 +1416,9 @@ class FlashMoeFusedKernel:
         # ============================================================
         # PDL: Wait for previous kernel to finish
         # ============================================================
-        if cutlass.const_expr(TRTLLM_ENABLE_PDL):
-            griddepcontrol_wait()
+        # Called unconditionally to match the standalone FC1 kernel.
+        # When PDL is disabled, griddepcontrol.wait is a no-op.
+        griddepcontrol_wait()
 
         # ============================================================
         # Common setup: MMA fragments & TMEM accumulator layout
