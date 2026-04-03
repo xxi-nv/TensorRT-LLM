@@ -2671,6 +2671,33 @@ class FlashMoeFusedKernel:
             return
 
         # ============================================================
+        # PHASE MODE 5: FC1+barrier + TMEM re-alloc test (debug)
+        # Tests that TMEM can be re-allocated after FC1 freed it.
+        # ============================================================
+        if cutlass.const_expr(self.phase_mode == 5):
+            if warp_idx <= self.epilog_warp_id[-1]:
+                # Epilogue warps: re-allocate TMEM
+                tmem.allocate(self.num_tmem_alloc_cols)
+                tmem.wait_for_alloc()
+                fc2_test_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                tmem.relinquish_alloc_permit()
+                self.epilog_sync_barrier.arrive_and_wait()
+                tmem.free(fc2_test_ptr)
+            if warp_idx == self.mma_warp_id:
+                # MMA warp: wait for TMEM alloc
+                tmem.wait_for_alloc()
+                tmem.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+                griddepcontrol_launch_dependents()
+            return
+
+        # ============================================================
+        # PHASE MODE 6: FC1+barrier + FC2 sched+TMA+MMA only (debug)
+        # Runs FC2 GEMM but epilogue only consumes accumulators
+        # without scatter-add — tests TMA descriptors and MMA.
+        # ============================================================
+
+        # ============================================================
         # ==================== FC2 PHASE =============================
         # ============================================================
         # FC2 warp-specialized execution follows the same pattern as
