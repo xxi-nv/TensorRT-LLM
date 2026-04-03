@@ -1895,15 +1895,7 @@ class FlashMoeFusedKernel:
             fc1_tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
-            mma_tile_counter = cutlass.Int32(0)
             while is_valid_tile:
-                with cute.arch.elect_one():
-                    if bidx == 0:
-                        cute.printf(
-                            "[GPU] MMA tile %d: entering k-loop, k_cnt=%d\n",
-                            mma_tile_counter,
-                            fc1_k_tile_cnt,
-                        )
                 a_consumer_state.reset_count()
                 peek_a_full_status = cutlass.Boolean(1)
                 if a_consumer_state.count < fc1_k_tile_cnt:
@@ -1955,13 +1947,7 @@ class FlashMoeFusedKernel:
 
                 for k_tile in cutlass.range(fc1_k_tile_cnt):
                     if is_leader_cta:
-                        with cute.arch.elect_one():
-                            if bidx == 0:
-                                cute.printf("[GPU] MMA k=%d: wait A\n", a_consumer_state.count)
                         fc1_a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
-                        with cute.arch.elect_one():
-                            if bidx == 0:
-                                cute.printf("[GPU] MMA k=%d: wait B\n", b_consumer_state.count)
                         fc1_b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
                         s2t_stage_coord = (
                             None,
@@ -2025,13 +2011,6 @@ class FlashMoeFusedKernel:
                 if is_leader_cta:
                     fc1_acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
-                with cute.arch.elect_one():
-                    if bidx == 0:
-                        cute.printf(
-                            "[GPU] MMA tile %d done, wait next tile_info\n", mma_tile_counter
-                        )
-                mma_tile_counter = mma_tile_counter + 1
-
                 fc1_tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = fc1_sInfo[(idx, tile_info_consumer_state.index)]
