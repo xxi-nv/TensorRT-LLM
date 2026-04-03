@@ -1461,6 +1461,14 @@ class FlashMoeFusedKernel:
         self.cta_sync_barrier.arrive_and_wait()
 
         # ============================================================
+        # PHASE MODE 3: trivial return after init (debug isolation)
+        # ============================================================
+        if cutlass.const_expr(self.phase_mode == 3):
+            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
+                griddepcontrol_launch_dependents()
+            return
+
+        # ============================================================
         # ==================== FC1 PHASE =============================
         # ============================================================
 
