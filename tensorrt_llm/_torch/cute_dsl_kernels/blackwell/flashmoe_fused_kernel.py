@@ -2606,9 +2606,8 @@ class FlashMoeFusedKernel:
                 fc1_tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            tmem.relinquish_alloc_permit()
-            self.epilog_sync_barrier.arrive_and_wait()
-            tmem.free(tmem_ptr)
+            # Keep TMEM allocated — it will be reused by FC2.
+            # relinquish_alloc_permit + free are deferred to FC2 epilogue end.
             c_pipeline.producer_tail()
             # Diagnostic: epilogue warp completed FC1 store (only from first warp)
             if warp_idx == self.epilog_warp_id[0]:
@@ -2669,33 +2668,6 @@ class FlashMoeFusedKernel:
             if cutlass.const_expr(TRTLLM_ENABLE_PDL):
                 griddepcontrol_launch_dependents()
             return
-
-        # ============================================================
-        # PHASE MODE 5: FC1+barrier + TMEM re-alloc test (debug)
-        # Tests that TMEM can be re-allocated after FC1 freed it.
-        # ============================================================
-        if cutlass.const_expr(self.phase_mode == 5):
-            if warp_idx <= self.epilog_warp_id[-1]:
-                # Epilogue warps: re-allocate TMEM
-                tmem.allocate(self.num_tmem_alloc_cols)
-                tmem.wait_for_alloc()
-                fc2_test_ptr = tmem.retrieve_ptr(self.acc_dtype)
-                tmem.relinquish_alloc_permit()
-                self.epilog_sync_barrier.arrive_and_wait()
-                tmem.free(fc2_test_ptr)
-            if warp_idx == self.mma_warp_id:
-                # MMA warp: wait for TMEM alloc
-                tmem.wait_for_alloc()
-                tmem.retrieve_ptr(self.acc_dtype)
-            if cutlass.const_expr(TRTLLM_ENABLE_PDL):
-                griddepcontrol_launch_dependents()
-            return
-
-        # ============================================================
-        # PHASE MODE 6: FC1+barrier + FC2 sched+TMA+MMA only (debug)
-        # Runs FC2 GEMM but epilogue only consumes accumulators
-        # without scatter-add — tests TMA descriptors and MMA.
-        # ============================================================
 
         # ============================================================
         # ==================== FC2 PHASE =============================
@@ -2911,8 +2883,9 @@ class FlashMoeFusedKernel:
 
         # --- FC2 MMA warp (warp 8): GEMM mainloop ---
         if warp_idx == self.mma_warp_id:
-            # Wait for FC2 epilogue warps (0-3) to re-allocate TMEM
-            tmem.wait_for_alloc()
+            # TMEM is still allocated from FC1. Sync with epilogue warps
+            # via tmem_alloc_barrier, then re-read pointer from SMEM.
+            self.tmem_alloc_barrier.arrive_and_wait()
             fc2_acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             fc2_tCtAcc_base = cute.make_tensor(fc2_acc_tmem_ptr, tCtAcc_fake.layout)
 
@@ -3113,9 +3086,10 @@ class FlashMoeFusedKernel:
 
         # --- FC2 Epilogue warps (warps 0-3): scatter-add ---
         if warp_idx <= self.epilog_warp_id[-1]:
-            # Re-allocate TMEM (after FC1 freed it)
-            tmem.allocate(self.num_tmem_alloc_cols)
-            tmem.wait_for_alloc()
+            # TMEM is still allocated from FC1 (not freed between phases).
+            # Sync with MMA warp via tmem_alloc_barrier, then re-read
+            # the same pointer from SMEM (retrieve_ptr is a pure SMEM read).
+            self.tmem_alloc_barrier.arrive_and_wait()
             fc2_epi_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             fc2_epi_tCtAcc_base = cute.make_tensor(fc2_epi_tmem_ptr, tCtAcc_fake.layout)
 
