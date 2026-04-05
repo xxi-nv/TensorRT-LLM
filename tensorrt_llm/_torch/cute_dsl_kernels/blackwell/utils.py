@@ -574,16 +574,18 @@ def add_bf16x2(a_packed, b_packed, *, loc=None, ip=None):
     element-wise, and returns one i32 (packed bf16x2 result).
     Uses native bf16x2 add instruction available on Blackwell (SM100).
     """
+    a_val = a_packed.ir_value() if hasattr(a_packed, "ir_value") else a_packed
+    b_val = b_packed.ir_value() if hasattr(b_packed, "ir_value") else b_packed
     result = llvm.inline_asm(
         T.i32(),
-        [a_packed, b_packed],
+        [a_val, b_val],
         "add.rn.bf16x2 $0, $1, $2;",
         "=r,r,r",
         has_side_effects=False,
         loc=loc,
         ip=ip,
     )
-    return result
+    return cutlass.Int32(result)
 
 
 @dsl_user_op
@@ -648,25 +650,27 @@ def ld_global_i32_from_i64_addr(addr_i64, *, loc=None, ip=None):
     llvm.inline_asm and fails inside scf.while bodies), this returns a
     single i32 and is safe to call in any loop context.
     """
+    a_val = addr_i64.ir_value() if hasattr(addr_i64, "ir_value") else addr_i64
     result = llvm.inline_asm(
         T.i32(),
-        [addr_i64],
+        [a_val],
         "ld.global.b32 $0, [$1];",
         "=r,l",
         has_side_effects=True,
         loc=loc,
         ip=ip,
     )
-    return result
+    return cutlass.Int32(result)
 
 
 @dsl_user_op
 def st_global_i32_to_i64_addr(addr_i64, val, *, loc=None, ip=None):
     """Store a single i32 to a raw i64 address."""
-    val_v = val.ir_value() if hasattr(val, "ir_value") else val
+    a_val = addr_i64.ir_value() if hasattr(addr_i64, "ir_value") else addr_i64
+    v_val = val.ir_value() if hasattr(val, "ir_value") else val
     llvm.inline_asm(
         None,
-        [addr_i64, val_v],
+        [a_val, v_val],
         "st.global.b32 [$0], $1;",
         "l,r",
         has_side_effects=True,
