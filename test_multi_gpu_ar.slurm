@@ -65,7 +65,13 @@ for i in range(n):
         RC4=$?
         echo "=== 4-GPU test: exit code ${RC4} ==="
 
-        if [ ${RC2} -ne 0 ] || [ ${RC4} -ne 0 ]; then
+        echo ""
+        echo "=== Test 3: 2-process IPC AR (real multi-process) ==="
+        python test_multiproc_ar.py --num-gpus 2
+        RC_MP2=$?
+        echo "=== 2-proc IPC test: exit code ${RC_MP2} ==="
+
+        if [ ${RC2} -ne 0 ] || [ ${RC4} -ne 0 ] || [ ${RC_MP2} -ne 0 ]; then
             echo "=== SOME TESTS FAILED ==="
             exit 1
         fi
