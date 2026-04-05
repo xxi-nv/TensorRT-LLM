@@ -21,6 +21,7 @@ Usage: python test_multiproc_ar.py [--num-gpus N]
 """
 
 import argparse
+import ctypes
 import math
 import os
 import sys
@@ -196,13 +197,6 @@ def _worker(
         )
         from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 
-        # Initialize CUDA contexts on ALL devices (required for cross-device
-        # IPC: when this process receives a CUDA tensor from another process
-        # via Queue, PyTorch's cudaIpcOpenMemHandle needs a CUDA context on
-        # the originating device).
-        for i in range(world_size):
-            torch.cuda.set_device(i)
-            _ = torch.zeros(1, device=f"cuda:{i}")  # Force context creation
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
 
@@ -210,7 +204,7 @@ def _worker(
             sys.stderr.write(f"[Rank {rank}] {msg}\n")
             sys.stderr.flush()
 
-        log(f"Worker started on GPU {rank} (initialized {world_size} CUDA contexts)")
+        log(f"Worker started on GPU {rank}")
 
         # ---- Model config (identical across ranks) ----
         hidden_size = 7168
@@ -315,29 +309,71 @@ def _worker(
         # FC1 done counter
         fc1_done_counter = torch.zeros(8, dtype=torch.int32, device=device)
 
-        # ---- Exchange staging + flag tensors via CUDA IPC ----
-        # Put this rank's tensors into all queues
+        # ---- Exchange staging + flag buffers via raw CUDA IPC handles ----
+        # We use ctypes to call cudaIpcGetMemHandle / cudaIpcOpenMemHandle
+        # directly, bypassing PyTorch's tensor serialization which requires
+        # multi-device CUDA context initialization and fails in spawn'd
+        # child processes.
+
+        class _CudaIpcMemHandle(ctypes.Structure):
+            _fields_ = [("reserved", ctypes.c_char * 64)]
+
+        _libcudart = ctypes.CDLL("libcudart.so")
+
+        def _ipc_get_handle(data_ptr: int) -> bytes:
+            handle = _CudaIpcMemHandle()
+            err = _libcudart.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(data_ptr))
+            assert err == 0, f"cudaIpcGetMemHandle failed: error={err}"
+            return bytes(handle.reserved)
+
+        def _ipc_open_handle(handle_bytes: bytes) -> int:
+            handle = _CudaIpcMemHandle()
+            handle.reserved = handle_bytes
+            dev_ptr = ctypes.c_void_p()
+            # Flag 1 = cudaIpcMemLazyEnablePeerAccess
+            err = _libcudart.cudaIpcOpenMemHandle(ctypes.byref(dev_ptr), handle, ctypes.c_uint(1))
+            assert err == 0, f"cudaIpcOpenMemHandle failed: error={err}"
+            return dev_ptr.value
+
+        # Get IPC handles for local staging and flag
+        staging_handle = _ipc_get_handle(staging.data_ptr())
+        flag_handle = _ipc_get_handle(ready_flag.data_ptr())
+
+        # Share handles (bytes, not CUDA tensors) with all ranks
         for r in range(world_size):
-            staging_queues[r].put((rank, staging))
-            flag_queues[r].put((rank, ready_flag))
+            staging_queues[r].put((rank, staging_handle))
+            flag_queues[r].put((rank, flag_handle))
 
-        barrier.wait()  # Ensure all ranks have published
+        barrier.wait()  # Ensure all handles published
 
-        # Collect from own queue
-        remote_staging = {}
-        remote_flags = {}
+        # Collect handles from own queue
+        remote_staging_handles = {}
+        remote_flag_handles = {}
         for _ in range(world_size):
-            r, s = staging_queues[rank].get()
-            remote_staging[r] = s
+            r, h = staging_queues[rank].get()
+            remote_staging_handles[r] = h
         for _ in range(world_size):
-            r, f = flag_queues[rank].get()
-            remote_flags[r] = f
+            r, h = flag_queues[rank].get()
+            remote_flag_handles[r] = h
 
-        barrier.wait()  # Ensure all receives done before kernel launch
+        barrier.wait()
 
-        # Build IPC pointer arrays (on local device)
-        staging_ptrs = [remote_staging[r].data_ptr() for r in range(world_size)]
-        flag_ptrs = [remote_flags[r].data_ptr() for r in range(world_size)]
+        # Open IPC handles to get mapped pointers
+        staging_ptrs = []
+        flag_ptrs = []
+        _ipc_opened_ptrs = []  # Keep references to prevent GC
+        for r in range(world_size):
+            if r == rank:
+                # Local rank: use own data_ptr directly
+                staging_ptrs.append(staging.data_ptr())
+                flag_ptrs.append(ready_flag.data_ptr())
+            else:
+                # Remote rank: open IPC handle → get mapped pointer
+                s_ptr = _ipc_open_handle(remote_staging_handles[r])
+                f_ptr = _ipc_open_handle(remote_flag_handles[r])
+                staging_ptrs.append(s_ptr)
+                flag_ptrs.append(f_ptr)
+                _ipc_opened_ptrs.extend([s_ptr, f_ptr])
 
         staging_ipc_ptrs = torch.tensor(staging_ptrs, dtype=torch.int64, device=device)
         flag_ipc_ptrs = torch.tensor(flag_ptrs, dtype=torch.int64, device=device)
