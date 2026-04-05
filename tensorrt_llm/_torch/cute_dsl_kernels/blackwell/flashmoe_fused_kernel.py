@@ -90,7 +90,7 @@ from .utils import (
     ptr_add_i64,
     silu_f32,
     st_global_128b_to_i64_addr,
-    st_release_sys_i32_addr,
+    st_release_sys_i32_one_addr,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
 )
@@ -3344,7 +3344,7 @@ class FlashMoeFusedKernel:
                             for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
                                 if cutlass.Int32(ar_r) == ar_local_rank:
                                     ar_local_flag_ipc = ar_rank_ready_flag_ptrs[ar_r]
-                                    st_release_sys_i32_addr(ar_local_flag_ipc, cutlass.Int32(1))
+                                    st_release_sys_i32_one_addr(ar_local_flag_ipc)
 
                 # Step 4: Wait for all ranks to be ready (IPC read)
                 for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):

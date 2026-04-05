@@ -638,17 +638,18 @@ def st_global_128b_to_i64_addr(addr_i64, r0, r1, r2, r3, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def st_release_sys_i32_addr(addr_i64, val, *, loc=None, ip=None):
-    """Store i32 with release semantics at a raw i64 address.
+def st_release_sys_i32_one_addr(addr_i64, *, loc=None, ip=None):
+    """Store i32 value 1 with release semantics at a raw i64 address.
 
-    Like st_release_sys_i32 but takes a raw i64 address value instead
-    of a cute tensor pointer.
+    Stores the constant 1 to signal readiness. The constant is created
+    in a PTX register to avoid MLIR operand type issues with DSL constants.
     """
     llvm.inline_asm(
         None,
-        [addr_i64, val],
-        "st.release.sys.global.b32 [$0], $1;",
-        "l,r",
+        [addr_i64],
+        "{ .reg .b32 _one; mov.b32 _one, 1;"
+        " st.release.sys.global.b32 [$0], _one; }",
+        "l",
         has_side_effects=True,
         loc=loc,
         ip=ip,
