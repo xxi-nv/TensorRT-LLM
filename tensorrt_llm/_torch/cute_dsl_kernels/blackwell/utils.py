@@ -589,9 +589,12 @@ def add_bf16x2(a_packed, b_packed, *, loc=None, ip=None):
 @dsl_user_op
 def ptr_add_i64(base, byte_offset, *, loc=None, ip=None):
     """Add byte offset to a 64-bit pointer/address. Returns i64."""
+    base_val = base.ir_value() if hasattr(base, "ir_value") else base
+    off_val = byte_offset.ir_value() if hasattr(byte_offset,
+                                                "ir_value") else byte_offset
     result = llvm.inline_asm(
         T.i64(),
-        [base, byte_offset],
+        [base_val, off_val],
         "add.u64 $0, $1, $2;",
         "=l,l,l",
         has_side_effects=False,
@@ -722,9 +725,11 @@ def i32_to_i64(val, *, loc=None, ip=None):
 @dsl_user_op
 def i64_mul(a, b, *, loc=None, ip=None):
     """Multiply two i64 values."""
+    a_val = a.ir_value() if hasattr(a, "ir_value") else a
+    b_val = b.ir_value() if hasattr(b, "ir_value") else b
     result = llvm.inline_asm(
         T.i64(),
-        [a, b],
+        [a_val, b_val],
         "mul.lo.u64 $0, $1, $2;",
         "=l,l,l",
         has_side_effects=False,
