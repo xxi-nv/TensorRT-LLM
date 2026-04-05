@@ -638,6 +638,21 @@ def st_global_128b_to_i64_addr(addr_i64, r0, r1, r2, r3, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_global_i64_from_addr(addr_i64, *, loc=None, ip=None):
+    """Load i64 from a raw i64 address. Used for reading IPC pointer arrays."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [addr_i64],
+        "ld.global.b64 $0, [$1];",
+        "=l,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
 def st_release_sys_i32_one_addr(addr_i64, *, loc=None, ip=None):
     """Store i32 value 1 with release semantics at a raw i64 address.
 

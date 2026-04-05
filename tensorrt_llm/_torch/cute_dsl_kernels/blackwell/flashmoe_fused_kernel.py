@@ -86,6 +86,7 @@ from .utils import (
     i64_mul,
     ld_acquire_sys_i32_addr,
     ld_global_128b_from_i64_addr,
+    ld_global_i64_from_addr,
     ld_volatile_global_i32_addr,
     ptr_add_i64,
     silu_f32,
@@ -3338,17 +3339,24 @@ class FlashMoeFusedKernel:
                     if warp_idx == self.ldgsts_a_warp_id[0]:
                         with cute.arch.elect_one():
                             # Write to local rank's ready flag via IPC pointer.
-                            # Use compile-time unrolled loop to find the local
-                            # rank's IPC pointer (runtime comparison with
-                            # compile-time index).
-                            for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
-                                if cutlass.Int32(ar_r) == ar_local_rank:
-                                    ar_local_flag_ipc = ar_rank_ready_flag_ptrs[ar_r]
-                                    st_release_sys_i32_one_addr(ar_local_flag_ipc)
+                            # Use raw pointer arithmetic to compute the address
+                            # of ar_rank_ready_flag_ptrs[ar_local_rank], avoiding
+                            # CuTe tensor indexing which doesn't produce raw MLIR
+                            # values inside nested runtime if-blocks.
+                            ar_flag_ptrs_base = ar_rank_ready_flag_ptrs.iterator.llvm_ptr
+                            ar_flag_ptr_off = i64_mul(i32_to_i64(ar_local_rank), cutlass.Int64(8))
+                            ar_flag_ptr_addr = ptr_add_i64(ar_flag_ptrs_base, ar_flag_ptr_off)
+                            ar_local_flag_ipc = ld_global_i64_from_addr(ar_flag_ptr_addr)
+                            st_release_sys_i32_one_addr(ar_local_flag_ipc)
 
                 # Step 4: Wait for all ranks to be ready (IPC read)
+                # Use raw pointer arithmetic for flag address lookup to avoid
+                # CuTe tensor indexing issues in @dsl_user_op context.
+                ar_flag_ptrs_base_rd = ar_rank_ready_flag_ptrs.iterator.llvm_ptr
                 for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
-                    ar_r_flag_ipc = ar_rank_ready_flag_ptrs[ar_r]
+                    ar_r_off = i64_mul(i32_to_i64(cutlass.Int32(ar_r)), cutlass.Int64(8))
+                    ar_r_ptr_addr = ptr_add_i64(ar_flag_ptrs_base_rd, ar_r_off)
+                    ar_r_flag_ipc = ld_global_i64_from_addr(ar_r_ptr_addr)
                     ar_flag = cutlass.Int32(0)
                     while ar_flag == 0:
                         ar_flag = ld_acquire_sys_i32_addr(ar_r_flag_ipc)
@@ -3370,8 +3378,12 @@ class FlashMoeFusedKernel:
                 if ar_cta_end > ar_total_vecs:
                     ar_cta_end = ar_total_vecs
 
-                # Precompute output base pointer
+                # Precompute output and staging base pointers
                 ar_out_base_addr = ar_output.iterator.llvm_ptr
+                ar_staging_base_addr = ar_staging_ipc_ptrs.iterator.llvm_ptr
+
+                # Pre-load rank 0's staging IPC pointer (invariant across iterations)
+                ar_ipc_ptr_0 = ld_global_i64_from_addr(ar_staging_base_addr)
 
                 ar_vec_idx = ar_cta_start + ar_thread_idx
                 while ar_vec_idx < ar_cta_end:
@@ -3379,14 +3391,16 @@ class FlashMoeFusedKernel:
                     ar_byte_offset = i64_mul(i32_to_i64(ar_vec_idx), cutlass.Int64(16))
 
                     # Load from first rank's staging and initialize accumulators
-                    # Read IPC pointer: staging_ipc_ptrs[0] (Int64)
-                    ar_ipc_ptr_0 = ar_staging_ipc_ptrs[0]
                     ar_addr = ptr_add_i64(ar_ipc_ptr_0, ar_byte_offset)
                     ar_acc0, ar_acc1, ar_acc2, ar_acc3 = ld_global_128b_from_i64_addr(ar_addr)
 
                     # Accumulate from remaining ranks
                     for ar_r in cutlass.range(1, self.ar_num_ranks, unroll_full=True):
-                        ar_ipc_ptr_r = ar_staging_ipc_ptrs[ar_r]
+                        ar_r_staging_off = i64_mul(
+                            i32_to_i64(cutlass.Int32(ar_r)), cutlass.Int64(8)
+                        )
+                        ar_r_staging_addr = ptr_add_i64(ar_staging_base_addr, ar_r_staging_off)
+                        ar_ipc_ptr_r = ld_global_i64_from_addr(ar_r_staging_addr)
                         ar_addr = ptr_add_i64(ar_ipc_ptr_r, ar_byte_offset)
                         ar_v0, ar_v1, ar_v2, ar_v3 = ld_global_128b_from_i64_addr(ar_addr)
                         ar_acc0 = add_bf16x2(ar_acc0, ar_v0)
