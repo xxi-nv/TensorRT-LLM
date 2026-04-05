@@ -196,6 +196,13 @@ def _worker(
         )
         from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 
+        # Initialize CUDA contexts on ALL devices (required for cross-device
+        # IPC: when this process receives a CUDA tensor from another process
+        # via Queue, PyTorch's cudaIpcOpenMemHandle needs a CUDA context on
+        # the originating device).
+        for i in range(world_size):
+            torch.cuda.set_device(i)
+            _ = torch.zeros(1, device=f"cuda:{i}")  # Force context creation
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
 
@@ -203,7 +210,7 @@ def _worker(
             sys.stderr.write(f"[Rank {rank}] {msg}\n")
             sys.stderr.flush()
 
-        log(f"Worker started on GPU {rank}")
+        log(f"Worker started on GPU {rank} (initialized {world_size} CUDA contexts)")
 
         # ---- Model config (identical across ranks) ----
         hidden_size = 7168
