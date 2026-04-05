@@ -85,12 +85,12 @@ from .utils import (
     i32_to_i64,
     i64_mul,
     ld_acquire_sys_i32_addr,
-    ld_global_128b_from_i64_addr,
+    ld_global_i32_from_i64_addr,
     ld_global_i64_from_addr,
     ld_volatile_global_i32_addr,
     ptr_add_i64,
     silu_f32,
-    st_global_128b_to_i64_addr,
+    st_global_i32_to_i64_addr,
     st_release_sys_i32_one_addr,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
@@ -3390,9 +3390,14 @@ class FlashMoeFusedKernel:
                     # Byte offset for this vector (8 bf16 = 16 bytes)
                     ar_byte_offset = i64_mul(i32_to_i64(ar_vec_idx), cutlass.Int64(16))
 
-                    # Load from first rank's staging and initialize accumulators
+                    # Load from first rank's staging as 4 x i32 (scalar loads
+                    # to avoid multi-result llvm.inline_asm which fails in
+                    # scf.while bodies with "must be a Type" ValueError).
                     ar_addr = ptr_add_i64(ar_ipc_ptr_0, ar_byte_offset)
-                    ar_acc0, ar_acc1, ar_acc2, ar_acc3 = ld_global_128b_from_i64_addr(ar_addr)
+                    ar_acc0 = ld_global_i32_from_i64_addr(ar_addr)
+                    ar_acc1 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(4)))
+                    ar_acc2 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(8)))
+                    ar_acc3 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(12)))
 
                     # Accumulate from remaining ranks
                     for ar_r in cutlass.range(1, self.ar_num_ranks, unroll_full=True):
@@ -3402,15 +3407,21 @@ class FlashMoeFusedKernel:
                         ar_r_staging_addr = ptr_add_i64(ar_staging_base_addr, ar_r_staging_off)
                         ar_ipc_ptr_r = ld_global_i64_from_addr(ar_r_staging_addr)
                         ar_addr = ptr_add_i64(ar_ipc_ptr_r, ar_byte_offset)
-                        ar_v0, ar_v1, ar_v2, ar_v3 = ld_global_128b_from_i64_addr(ar_addr)
+                        ar_v0 = ld_global_i32_from_i64_addr(ar_addr)
+                        ar_v1 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(4)))
+                        ar_v2 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(8)))
+                        ar_v3 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(12)))
                         ar_acc0 = add_bf16x2(ar_acc0, ar_v0)
                         ar_acc1 = add_bf16x2(ar_acc1, ar_v1)
                         ar_acc2 = add_bf16x2(ar_acc2, ar_v2)
                         ar_acc3 = add_bf16x2(ar_acc3, ar_v3)
 
-                    # Store reduced result to output
+                    # Store reduced result to output (4 x scalar i32 stores)
                     ar_out_addr = ptr_add_i64(ar_out_base_addr, ar_byte_offset)
-                    st_global_128b_to_i64_addr(ar_out_addr, ar_acc0, ar_acc1, ar_acc2, ar_acc3)
+                    st_global_i32_to_i64_addr(ar_out_addr, ar_acc0)
+                    st_global_i32_to_i64_addr(ptr_add_i64(ar_out_addr, cutlass.Int64(4)), ar_acc1)
+                    st_global_i32_to_i64_addr(ptr_add_i64(ar_out_addr, cutlass.Int64(8)), ar_acc2)
+                    st_global_i32_to_i64_addr(ptr_add_i64(ar_out_addr, cutlass.Int64(12)), ar_acc3)
 
                     ar_vec_idx = ar_vec_idx + self.ar_threads
 

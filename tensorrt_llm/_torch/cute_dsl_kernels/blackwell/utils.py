@@ -641,6 +641,41 @@ def st_global_128b_to_i64_addr(addr_i64, r0, r1, r2, r3, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_global_i32_from_i64_addr(addr_i64, *, loc=None, ip=None):
+    """Load a single i32 from a raw i64 address.
+
+    Unlike ld_global_128b_from_i64_addr (which uses multi-result
+    llvm.inline_asm and fails inside scf.while bodies), this returns a
+    single i32 and is safe to call in any loop context.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [addr_i64],
+        "ld.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def st_global_i32_to_i64_addr(addr_i64, val, *, loc=None, ip=None):
+    """Store a single i32 to a raw i64 address."""
+    val_v = val.ir_value() if hasattr(val, "ir_value") else val
+    llvm.inline_asm(
+        None,
+        [addr_i64, val_v],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def ld_global_i64_from_addr(addr_i64, *, loc=None, ip=None):
     """Load i64 from a raw i64 address. Used for reading IPC pointer arrays."""
     result = llvm.inline_asm(
