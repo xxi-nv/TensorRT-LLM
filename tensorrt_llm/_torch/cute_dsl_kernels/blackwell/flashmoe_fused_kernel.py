@@ -3353,7 +3353,7 @@ class FlashMoeFusedKernel:
                 # Use raw pointer arithmetic for flag address lookup to avoid
                 # CuTe tensor indexing issues in @dsl_user_op context.
                 ar_flag_ptrs_base_rd = ar_rank_ready_flag_ptrs.iterator.llvm_ptr
-                for ar_r in cutlass.range(self.ar_num_ranks, unroll_full=True):
+                for ar_r in range(self.ar_num_ranks):
                     ar_r_off = i64_mul(i32_to_i64(cutlass.Int32(ar_r)), cutlass.Int64(8))
                     ar_r_ptr_addr = ptr_add_i64(ar_flag_ptrs_base_rd, ar_r_off)
                     ar_r_flag_ipc = ld_global_i64_from_addr(ar_r_ptr_addr)
@@ -3399,8 +3399,11 @@ class FlashMoeFusedKernel:
                     ar_acc2 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(8)))
                     ar_acc3 = ld_global_i32_from_i64_addr(ptr_add_i64(ar_addr, cutlass.Int64(12)))
 
-                    # Accumulate from remaining ranks
-                    for ar_r in cutlass.range(1, self.ar_num_ranks, unroll_full=True):
+                    # Accumulate from remaining ranks.
+                    # Use Python range() instead of cutlass.range() to avoid
+                    # creating new MLIR blocks inside the while body. Raw MLIR
+                    # Values from @dsl_user_op cannot cross block boundaries.
+                    for ar_r in range(1, self.ar_num_ranks):
                         ar_r_staging_off = i64_mul(
                             i32_to_i64(cutlass.Int32(ar_r)), cutlass.Int64(8)
                         )
