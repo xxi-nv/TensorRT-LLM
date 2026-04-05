@@ -210,7 +210,7 @@ def run_ar_correctness_test():
 
     # AR config
     ar_num_ranks = 2
-    ar_local_rank = 0
+    ar_local_rank = cutlass.Int32(0)
     # Constant value for remote rank's staging buffer (exact in bf16)
     remote_staging_fill_value = 1.0
 
