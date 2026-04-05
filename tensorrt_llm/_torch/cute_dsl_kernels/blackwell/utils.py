@@ -646,7 +646,7 @@ def st_release_sys_i32_addr(addr_i64, val, *, loc=None, ip=None):
     """
     llvm.inline_asm(
         None,
-        [addr_i64, val.ir_value()],
+        [addr_i64, val],
         "st.release.sys.global.b32 [$0], $1;",
         "l,r",
         has_side_effects=True,
