@@ -1471,8 +1471,9 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
             # FP8 simulation closely matches kernel — tight tolerance
             verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
         else:
-            # NVLinkTwoSided uses NVFP4 (e2m1+scale), ref is float32 approx
-            verify_combine_results(all_results, config, rtol=0.15, atol=1.5)
+            # NVLinkTwoSided uses NVFP4 (e2m1+scale), ref is float32 approx.
+            # NVFP4 error scales with top_k (k2~0.9, k4~1.6, k8~2.6).
+            verify_combine_results(all_results, config, rtol=0.2, atol=3.5)
     elif config.comm_type == COMM_DEEP_EP_LL:
         verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
     else:
