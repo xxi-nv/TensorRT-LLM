@@ -1109,21 +1109,16 @@ def verify_combine_results(
     rtol: float = 0.05,
     atol: float = 0.1,
 ):
-    """Verify combine results against single-card reference.
+    """Verify combine results against per-rank bf16 accumulation reference.
 
-    For non-DeepEPLL comm types, uses simple_moe_reference_per_rank which
-    simulates per-rank bf16 partial sums then bf16 cross-rank accumulation.
-    This matches the actual distributed pipeline's accumulation order and
-    eliminates bf16 rounding-order error, isolating only combine-layer error.
-
-    DeepEPLL applies scales inside combine (not in MoE), so its rounding
-    order differs; we fall back to simple_moe_reference for that case.
+    Uses simple_moe_reference_per_rank which simulates per-rank bf16 partial
+    sums then bf16 cross-rank accumulation.  This matches the actual
+    distributed pipeline's accumulation order and isolates only the
+    combine-layer error (e.g. fp8 quantize/dequantize for low_precision_combine).
 
     For post-quant modes, uses pre-computed ref_hs_bf16 (dequantized on GPU
     by the worker) as the reference input instead of the raw original_hs.
     """
-    use_per_rank_ref = config.comm_type != COMM_DEEP_EP_LL
-
     for result in all_results:
         rank = result["rank"]
         original_slots = result["original_slots"]
@@ -1140,21 +1135,13 @@ def verify_combine_results(
         if num_tokens == 0:
             continue
 
-        if use_per_rank_ref:
-            ref = simple_moe_reference_per_rank(
-                ref_input,
-                original_slots,
-                original_scales,
-                config.num_experts,
-                config.ep_size,
-            )
-        else:
-            ref = simple_moe_reference(
-                ref_input,
-                original_slots,
-                original_scales,
-                config.num_experts,
-            )
+        ref = simple_moe_reference_per_rank(
+            ref_input,
+            original_slots,
+            original_scales,
+            config.num_experts,
+            config.ep_size,
+        )
 
         combined_tokens = combined[:num_tokens]
         ref_tokens = ref[:num_tokens]
