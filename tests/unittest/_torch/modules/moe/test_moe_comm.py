@@ -30,10 +30,11 @@ Dispatch verification:
 
 Combine verification:
   Uses simple_moe (weighted sum of hidden_states, no expert-specific
-  computation).  Routing correctness is already covered by dispatch
-  verification.  Dispatch-returned token_final_scales handle the
-  scale-application asymmetry across comms (DeepEPLL returns ones,
-  others return real scales).
+  computation).  Reference matches kernel behavior per comm type:
+  - lpcombine: simulates fp8 quant/dequant + float32 accumulation
+  - DeepEPLL: weighted reduction with real topk_weights
+  - Default: float32 accumulation matching kernel registers
+  This isolates purely the combine communication error.
 
 Singleton safety:
   NVLinkOneSided._WORKSPACE is reset before each creation to avoid
@@ -699,6 +700,7 @@ def _build_worker_result(
     moe_output: torch.Tensor,
     recv_source_info: List[Tuple[int, int]],
     config: CommTestConfig,
+    recv_hs_bf16: Optional[torch.Tensor] = None,
 ) -> dict:
     """Collect tensors needed by host-side verification."""
     result = {
@@ -717,6 +719,8 @@ def _build_worker_result(
         "moe_output": moe_output.cpu(),
         "recv_source_info": recv_source_info,
     }
+    if recv_hs_bf16 is not None:
+        result["recv_hs_bf16"] = recv_hs_bf16.cpu()
 
     if config.quant_mode == "w4afp8":
         result["original_fp8"] = _safe_cpu(worker_inputs.original_fp8)
@@ -789,8 +793,19 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             all_rank_max_num_tokens=max(config.all_num_tokens),
         )
 
+        # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
+        # needs raw dispatched hidden_states, not accumulated moe_output).
+        saved_recv_hs_bf16 = recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
+
         return _build_worker_result(
-            rank, worker_inputs, dispatch_outputs, combined, moe_output, recv_source_info, config
+            rank,
+            worker_inputs,
+            dispatch_outputs,
+            combined,
+            moe_output,
+            recv_source_info,
+            config,
+            recv_hs_bf16=saved_recv_hs_bf16,
         )
     except Exception:
         traceback.print_exc()
@@ -1063,29 +1078,83 @@ def _build_combine_reference(
     target_rank: int,
     config: CommTestConfig,
 ) -> torch.Tensor:
-    """Build combine reference from actual per-rank moe_outputs + routing info.
+    """Build combine reference from actual per-rank data + routing info.
 
-    For each original token (target_rank, t), sums the moe_output entries from
-    all processing ranks whose recv_source_info maps back to (target_rank, t).
-    The result is the exact pre-combine sum — the only remaining error vs
-    the actual combined output comes from the combine communication layer
-    itself (e.g. fp8 quantize/dequantize for low_precision_combine).
+    Three reference-building paths to match kernel behavior:
 
-    Accumulation is done in bf16 to match the combine's cross-rank reduction.
+    1. low_precision_combine (fp8): Simulates the prepare_combine fp8
+       quantization (bf16->fp8 per-element cast) and combine fp8->float32
+       accumulation, matching moeA2ACombineKernel's vectorized_combine_impl
+       which uses float32 accumulators.
+
+    2. DeepEP low-latency: Reconstructs weighted reduction using real
+       topk_weights (original_scales), since DeepEPLL's combine internally
+       applies weights rather than receiving pre-scaled moe_output.
+       Uses recv_hs_bf16 (raw dispatched hidden_states) instead of
+       accumulated moe_output.
+
+    3. Default: Accumulates moe_output in float32 to match the kernel's
+       use of float32 registers for cross-rank reduction.
+
+    All paths produce bf16 output to match the final kernel output dtype.
     """
     num_tokens = config.all_num_tokens[target_rank]
     hidden_size = config.hidden_size
-    ref = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16)
+    experts_per_rank = config.num_experts // config.ep_size
 
-    for proc_result in all_results:
-        moe_out = proc_result["moe_output"]  # [num_dispatched, hidden_size]
-        source_info = proc_result["recv_source_info"]  # [(src_rank, token_idx), ...]
+    # Use float32 accumulator for all paths (matches kernel behavior)
+    ref = torch.zeros(num_tokens, hidden_size, dtype=torch.float32)
 
-        for i, (src_rank, token_idx) in enumerate(source_info):
-            if src_rank == target_rank and token_idx < num_tokens:
-                ref[token_idx] = ref[token_idx] + moe_out[i]
+    if config.use_low_precision_combine:
+        # Path 1: fp8 quantize/dequantize + float32 accumulation.
+        # The prepare_combine kernel does vectorized_quant bf16->fp8
+        # (per-element cast, no scale). The combine kernel loads fp8,
+        # casts to float32, accumulates in float32, then casts to bf16.
+        for proc_result in all_results:
+            moe_out = proc_result["moe_output"]
+            source_info = proc_result["recv_source_info"]
+            for i, (src_rank, token_idx) in enumerate(source_info):
+                if src_rank == target_rank and token_idx < num_tokens:
+                    fp8_val = moe_out[i].to(torch.float8_e4m3fn)
+                    ref[token_idx] += fp8_val.float()
 
-    return ref
+    elif config.comm_type == COMM_DEEP_EP_LL:
+        # Path 2: DeepEPLL weighted reduction.
+        # DeepEPLL's dispatch returns ones as recv_scales, so simple_moe
+        # produces unweighted output. The combine kernel (low_latency_combine)
+        # internally applies real topk_weights during weighted reduction.
+        # Reconstruct by weighting recv_hs_bf16 per local expert with the
+        # real weights from original_scales on the source rank.
+        target_original_scales = all_results[target_rank]["original_scales"]
+
+        for proc_result in all_results:
+            proc_rank = proc_result["rank"]
+            recv_hs_bf16 = proc_result["recv_hs_bf16"]
+            recv_slots = proc_result["recv_slots"]
+            source_info = proc_result["recv_source_info"]
+            slot_start = proc_rank * experts_per_rank
+            slot_end = slot_start + experts_per_rank
+
+            for i, (src_rank, token_idx) in enumerate(source_info):
+                if src_rank == target_rank and token_idx < num_tokens:
+                    for k in range(config.top_k):
+                        eid = recv_slots[i, k].item()
+                        if slot_start <= eid < slot_end:
+                            weight = target_original_scales[token_idx, k].float()
+                            ref[token_idx] += recv_hs_bf16[i].float() * weight
+
+    else:
+        # Path 3: Default — float32 accumulation.
+        # The combine kernel (vectorized_combine_impl) uses float32
+        # registers for cross-rank reduction, then casts to bf16.
+        for proc_result in all_results:
+            moe_out = proc_result["moe_output"]
+            source_info = proc_result["recv_source_info"]
+            for i, (src_rank, token_idx) in enumerate(source_info):
+                if src_rank == target_rank and token_idx < num_tokens:
+                    ref[token_idx] += moe_out[i].float()
+
+    return ref.to(torch.bfloat16)
 
 
 def verify_combine_results(
@@ -1094,14 +1163,14 @@ def verify_combine_results(
     rtol: float = 0.05,
     atol: float = 0.1,
 ):
-    """Verify combine results against moe_output-based reference.
+    """Verify combine results against kernel-behavior-matched reference.
 
-    Builds the reference by aggregating actual per-rank moe_outputs back to
-    original token positions using the recv_source_info routing.  This isolates
-    ONLY the combine communication error (the reference uses the exact same
-    per-rank MoE computation that combine consumed).
-
-    Accumulation across ranks is done in bf16 to match combine's reduction.
+    Builds the reference using _build_combine_reference which has three paths
+    matching actual kernel behavior:
+    - lpcombine: fp8 quant/dequant + float32 accumulation
+    - DeepEPLL: weighted reduction with real topk_weights
+    - Default: float32 accumulation
+    All paths isolate ONLY the combine communication error.
     """
     for result in all_results:
         rank = result["rank"]
@@ -1120,6 +1189,23 @@ def verify_combine_results(
             f"Rank {rank}: shape mismatch. combined={combined_tokens.shape}, ref={ref_tokens.shape}"
         )
 
+        # --- PRECISION_STATS (temporary — remove after tolerance calibration) ---
+        abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
+        ref_abs = ref_tokens.float().abs().clamp(min=1e-12)
+        rel_diff = abs_diff / ref_abs
+        nonzero_mask = ref_tokens.float().abs() > 1e-6
+        print(
+            f"PRECISION_STATS rank={rank} comm={config.comm_type} "
+            f"lpc={config.use_low_precision_combine} "
+            f"tokens={num_tokens} hidden={config.hidden_size} "
+            f"max_abs={abs_diff.max():.6f} "
+            f"mean_abs={abs_diff.mean():.6f} "
+            f"max_rel={rel_diff[nonzero_mask].max():.6f} "
+            f"mean_rel={rel_diff[nonzero_mask].mean():.6f} "
+            f"rtol={rtol} atol={atol}"
+        )
+        # --- END PRECISION_STATS ---
+
         try:
             torch.testing.assert_close(
                 combined_tokens.float(),
@@ -1128,7 +1214,6 @@ def verify_combine_results(
                 atol=atol,
             )
         except AssertionError as e:
-            abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
             max_idx = abs_diff.argmax().item()
             token_idx = max_idx // combined_tokens.shape[1]
             elem_idx = max_idx % combined_tokens.shape[1]
@@ -1374,13 +1459,15 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
 
     verify_dispatch_results(all_results, config)
 
-    # DeepEPLL applies scales inside combine, while low-precision combine adds
-    # an extra quantize/dequantize hop on the return path. Both need looser
-    # tolerances than the bf16 reference path.
+    # Reference now matches kernel behavior closely:
+    # - lpcombine: fp8 quant/dequant + float32 accum (matches kernel pipeline)
+    # - DeepEPLL: weighted reduce with real topk_weights (matches combine kernel)
+    # - Default: float32 accumulation (matches kernel registers)
+    # Remaining error is purely from communication transport layer.
     if config.use_low_precision_combine:
-        verify_combine_results(all_results, config, rtol=0.2, atol=3.5)
+        verify_combine_results(all_results, config, rtol=0.05, atol=0.5)
     elif config.comm_type == COMM_DEEP_EP_LL:
-        verify_combine_results(all_results, config, rtol=0.1, atol=0.5)
+        verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
     else:
         verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
 
