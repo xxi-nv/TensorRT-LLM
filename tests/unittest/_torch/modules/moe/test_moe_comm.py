@@ -1279,23 +1279,6 @@ def verify_combine_results(
             f"Rank {rank}: shape mismatch. combined={combined_tokens.shape}, ref={ref_tokens.shape}"
         )
 
-        # --- PRECISION_STATS (temporary — remove after tolerance calibration) ---
-        abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
-        ref_abs = ref_tokens.float().abs().clamp(min=1e-12)
-        rel_diff = abs_diff / ref_abs
-        nonzero_mask = ref_tokens.float().abs() > 1e-6
-        print(
-            f"PRECISION_STATS rank={rank} comm={config.comm_type} "
-            f"lpc={config.use_low_precision_combine} "
-            f"tokens={num_tokens} hidden={config.hidden_size} "
-            f"max_abs={abs_diff.max():.6f} "
-            f"mean_abs={abs_diff.mean():.6f} "
-            f"max_rel={rel_diff[nonzero_mask].max():.6f} "
-            f"mean_rel={rel_diff[nonzero_mask].mean():.6f} "
-            f"rtol={rtol} atol={atol}"
-        )
-        # --- END PRECISION_STATS ---
-
         try:
             torch.testing.assert_close(
                 combined_tokens.float(),
@@ -1304,14 +1287,15 @@ def verify_combine_results(
                 atol=atol,
             )
         except AssertionError as e:
-            max_idx = abs_diff.argmax().item()
+            diff = (combined_tokens.float() - ref_tokens.float()).abs()
+            max_idx = diff.argmax().item()
             token_idx = max_idx // combined_tokens.shape[1]
             elem_idx = max_idx % combined_tokens.shape[1]
             raise AssertionError(
                 f"Rank {rank}: combine mismatch at token={token_idx}, elem={elem_idx}. "
                 f"combined={combined_tokens[token_idx, elem_idx]:.6f}, "
                 f"ref={ref_tokens[token_idx, elem_idx]:.6f}, "
-                f"max_abs_diff={abs_diff.max():.6f}\n"
+                f"max_abs_diff={diff.max():.6f}\n"
                 f"Original error: {e}"
             ) from e
 
