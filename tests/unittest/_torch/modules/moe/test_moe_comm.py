@@ -31,7 +31,8 @@ Dispatch verification:
 Combine verification:
   Uses simple_moe (weighted sum of hidden_states, no expert-specific
   computation).  Reference matches kernel behavior per comm type:
-  - lpcombine: simulates fp8 quant/dequant + float32 accumulation
+  - NVLinkOneSided lpc: fp8 quant/dequant simulation (moeA2ACombineKernel)
+  - NVLinkTwoSided lpc: float32 accum (NVFP4 too complex to simulate)
   - DeepEPLL: weighted reduction with real topk_weights
   - Default: float32 accumulation matching kernel registers
   This isolates purely the combine communication error.
@@ -1080,21 +1081,22 @@ def _build_combine_reference(
 ) -> torch.Tensor:
     """Build combine reference from actual per-rank data + routing info.
 
-    Three reference-building paths to match kernel behavior:
+    Reference paths matched to kernel behavior:
 
-    1. low_precision_combine (fp8): Simulates the prepare_combine fp8
-       quantization (bf16->fp8 per-element cast) and combine fp8->float32
-       accumulation, matching moeA2ACombineKernel's vectorized_combine_impl
-       which uses float32 accumulators.
+    1a. NVLinkOneSided + low_precision_combine: Simulates fp8 quant/dequant
+        (moeA2APrepareCombineKernel/moeA2ACombineKernel use bf16->fp8->float32
+        accumulation). Other lpc backends (NVLinkTwoSided uses NVFP4 in
+        fusedMoeCommKernels.cu) fall through to the default float32 path
+        since NVFP4 simulation is impractical.
 
-    2. DeepEP low-latency: Reconstructs weighted reduction using real
-       topk_weights (original_scales), since DeepEPLL's combine internally
-       applies weights rather than receiving pre-scaled moe_output.
-       Uses recv_hs_bf16 (raw dispatched hidden_states) instead of
-       accumulated moe_output.
+    2.  DeepEP low-latency: Reconstructs weighted reduction using real
+        topk_weights (original_scales), since DeepEPLL's combine internally
+        applies weights rather than receiving pre-scaled moe_output.
 
-    3. Default: Accumulates moe_output in float32 to match the kernel's
-       use of float32 registers for cross-rank reduction.
+    3.  Default (+ NVLinkTwoSided lpc): Accumulates moe_output in float32
+        to match the kernel's use of float32 registers for cross-rank
+        reduction. For NVLinkTwoSided lpc, this means wider tolerances
+        absorb the NVFP4 quantization noise.
 
     All paths produce bf16 output to match the final kernel output dtype.
     """
@@ -1105,10 +1107,10 @@ def _build_combine_reference(
     # Use float32 accumulator for all paths (matches kernel behavior)
     ref = torch.zeros(num_tokens, hidden_size, dtype=torch.float32)
 
-    if config.use_low_precision_combine:
-        # Path 1: fp8 quantize/dequantize + float32 accumulation.
-        # The prepare_combine kernel does vectorized_quant bf16->fp8
-        # (per-element cast, no scale). The combine kernel loads fp8,
+    if config.use_low_precision_combine and config.comm_type == COMM_NVLINK_ONE_SIDED:
+        # Path 1a: NVLinkOneSided fp8 quantize/dequantize + float32 accumulation.
+        # moeA2APrepareCombineKernel does vectorized_quant bf16->fp8
+        # (per-element cast, no scale). moeA2ACombineKernel loads fp8,
         # casts to float32, accumulates in float32, then casts to bf16.
         for proc_result in all_results:
             moe_out = proc_result["moe_output"]
@@ -1459,13 +1461,18 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
 
     verify_dispatch_results(all_results, config)
 
-    # Reference now matches kernel behavior closely:
-    # - lpcombine: fp8 quant/dequant + float32 accum (matches kernel pipeline)
-    # - DeepEPLL: weighted reduce with real topk_weights (matches combine kernel)
+    # Reference matches kernel behavior per comm type:
+    # - NVLinkOneSided lpc: fp8 simulation (matches moeA2ACombineKernel)
+    # - NVLinkTwoSided lpc: float32 accum (can't simulate NVFP4), wider tol
+    # - DeepEPLL: weighted reduce with real topk_weights
     # - Default: float32 accumulation (matches kernel registers)
-    # Remaining error is purely from communication transport layer.
     if config.use_low_precision_combine:
-        verify_combine_results(all_results, config, rtol=0.05, atol=0.5)
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            # FP8 simulation closely matches kernel — tight tolerance
+            verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
+        else:
+            # NVLinkTwoSided uses NVFP4 (e2m1+scale), ref is float32 approx
+            verify_combine_results(all_results, config, rtol=0.15, atol=1.5)
     elif config.comm_type == COMM_DEEP_EP_LL:
         verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
     else:
