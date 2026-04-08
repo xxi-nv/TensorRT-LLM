@@ -1163,22 +1163,6 @@ def verify_combine_results(
             f"Rank {rank}: shape mismatch. combined={combined_tokens.shape}, ref={ref_tokens.shape}"
         )
 
-        # Compute precision statistics for analysis.
-        abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
-        ref_abs = ref_tokens.float().abs()
-        nonzero_mask = ref_abs > 0
-        max_abs = abs_diff.max().item()
-        max_rel = (
-            (abs_diff[nonzero_mask] / ref_abs[nonzero_mask]).max().item()
-            if nonzero_mask.any()
-            else 0.0
-        )
-        tier = "lpcombine" if config.use_low_precision_combine else "default"
-        print(
-            f"PRECISION_STATS|{config.comm_type}|ep{config.ep_size}|k{config.top_k}"
-            f"|rank{rank}|{tier}|max_abs={max_abs:.6f}|max_rel={max_rel:.6f}"
-        )
-
         try:
             torch.testing.assert_close(
                 combined_tokens.float(),
@@ -1187,6 +1171,7 @@ def verify_combine_results(
                 atol=atol,
             )
         except AssertionError as e:
+            abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
             max_idx = abs_diff.argmax().item()
             token_idx = max_idx // combined_tokens.shape[1]
             elem_idx = max_idx % combined_tokens.shape[1]
