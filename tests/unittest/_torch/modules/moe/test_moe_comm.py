@@ -276,57 +276,6 @@ def simple_moe(
     return output.to(hidden_states.dtype)
 
 
-def simple_moe_reference(
-    hidden_states: torch.Tensor,
-    token_selected_slots: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    """Single-card reference: weighted sum with ALL experts (no EP)."""
-    output = torch.zeros_like(hidden_states, dtype=torch.float32)
-
-    for i in range(hidden_states.shape[0]):
-        for k in range(token_selected_slots.shape[1]):
-            eid = token_selected_slots[i, k].item()
-            if eid < 0 or eid >= num_experts:
-                continue
-            output[i] += hidden_states[i].float() * token_final_scales[i, k].float()
-
-    return output.to(hidden_states.dtype)
-
-
-def simple_moe_reference_per_rank(
-    hidden_states: torch.Tensor,
-    token_selected_slots: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    num_experts: int,
-    ep_size: int,
-) -> torch.Tensor:
-    """Per-rank accumulation reference that mimics the distributed pipeline.
-
-    Instead of a single fp32 accumulation across all experts (which
-    simple_moe_reference does), this computes per-rank partial sums in fp32
-    then accumulates across ranks in bf16.  This matches the actual
-    distributed pipeline's accumulation order:
-      rank0_partial(fp32->bf16) + rank1_partial(fp32->bf16) + ...
-
-    The remaining error vs actual combine is then ONLY from the communication
-    layer (e.g. fp8 quantize/dequantize for low_precision_combine).
-    """
-    experts_per_rank = num_experts // ep_size
-    result = torch.zeros_like(hidden_states)  # bf16
-    for r in range(ep_size):
-        partial = simple_moe(
-            hidden_states,
-            token_selected_slots,
-            token_final_scales,
-            r,
-            experts_per_rank,
-        )  # fp32 internal, returns bf16
-        result = result + partial  # bf16 accumulation
-    return result
-
-
 # ============================================================================
 # Communication Object Factory
 # ============================================================================
@@ -747,6 +696,8 @@ def _build_worker_result(
     worker_inputs: WorkerInputs,
     dispatch_outputs: DispatchOutputs,
     combined: torch.Tensor,
+    moe_output: torch.Tensor,
+    recv_source_info: List[Tuple[int, int]],
     config: CommTestConfig,
 ) -> dict:
     """Collect tensors needed by host-side verification."""
@@ -763,21 +714,13 @@ def _build_worker_result(
             dispatch_outputs.recv_scales.cpu() if dispatch_outputs.recv_scales is not None else None
         ),
         "combined": combined.cpu(),
+        "moe_output": moe_output.cpu(),
+        "recv_source_info": recv_source_info,
     }
 
     if config.quant_mode == "w4afp8":
         result["original_fp8"] = _safe_cpu(worker_inputs.original_fp8)
         result["w4afp8_roundtrip_ok"] = worker_inputs.w4afp8_roundtrip_ok
-
-    # Pre-compute bf16 reference input on GPU for combine verification (CPU in result).
-    # hidden_states_sf / global_scale are only set for nvfp4; _to_bf16 ignores them for fp8/w4afp8.
-    if config.quant_mode != "none":
-        result["ref_hs_bf16"] = _to_bf16(
-            worker_inputs.hs,
-            worker_inputs.hidden_states_sf,
-            worker_inputs.global_scale,
-            config.quant_mode,
-        ).cpu()
 
     return result
 
@@ -811,7 +754,17 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         worker_inputs = _prepare_worker_inputs(rank, config)
         dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
 
-        # ----- dequant + MoE + combine -----
+        # ----- decode routing + dequant + MoE + combine -----
+        # Decode source info from raw dispatch output (before dequant) so we
+        # know which original (src_rank, token_idx) each dispatched row maps to.
+        # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
+        # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
+        recv_source_info = decode_source_info(
+            dispatch_outputs.recv_hs,
+            dispatch_outputs.recv_hs.dtype,
+            dispatch_outputs.recv_hs.shape[1],
+        )
+
         recv_hs_bf16 = _to_bf16(
             dispatch_outputs.recv_hs,
             dispatch_outputs.recv_sf,
@@ -836,7 +789,9 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             all_rank_max_num_tokens=max(config.all_num_tokens),
         )
 
-        return _build_worker_result(rank, worker_inputs, dispatch_outputs, combined, config)
+        return _build_worker_result(
+            rank, worker_inputs, dispatch_outputs, combined, moe_output, recv_source_info, config
+        )
     except Exception:
         traceback.print_exc()
         raise
@@ -1103,45 +1058,60 @@ def verify_dispatch_results(
         verify_dispatch_alltoall(all_results, config)
 
 
+def _build_combine_reference(
+    all_results: List[dict],
+    target_rank: int,
+    config: CommTestConfig,
+) -> torch.Tensor:
+    """Build combine reference from actual per-rank moe_outputs + routing info.
+
+    For each original token (target_rank, t), sums the moe_output entries from
+    all processing ranks whose recv_source_info maps back to (target_rank, t).
+    The result is the exact pre-combine sum — the only remaining error vs
+    the actual combined output comes from the combine communication layer
+    itself (e.g. fp8 quantize/dequantize for low_precision_combine).
+
+    Accumulation is done in bf16 to match the combine's cross-rank reduction.
+    """
+    num_tokens = config.all_num_tokens[target_rank]
+    hidden_size = config.hidden_size
+    ref = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16)
+
+    for proc_result in all_results:
+        moe_out = proc_result["moe_output"]  # [num_dispatched, hidden_size]
+        source_info = proc_result["recv_source_info"]  # [(src_rank, token_idx), ...]
+
+        for i, (src_rank, token_idx) in enumerate(source_info):
+            if src_rank == target_rank and token_idx < num_tokens:
+                ref[token_idx] = ref[token_idx] + moe_out[i]
+
+    return ref
+
+
 def verify_combine_results(
     all_results: List[dict],
     config: CommTestConfig,
     rtol: float = 0.05,
     atol: float = 0.1,
 ):
-    """Verify combine results against per-rank bf16 accumulation reference.
+    """Verify combine results against moe_output-based reference.
 
-    Uses simple_moe_reference_per_rank which simulates per-rank bf16 partial
-    sums then bf16 cross-rank accumulation.  This matches the actual
-    distributed pipeline's accumulation order and isolates only the
-    combine-layer error (e.g. fp8 quantize/dequantize for low_precision_combine).
+    Builds the reference by aggregating actual per-rank moe_outputs back to
+    original token positions using the recv_source_info routing.  This isolates
+    ONLY the combine communication error (the reference uses the exact same
+    per-rank MoE computation that combine consumed).
 
-    For post-quant modes, uses pre-computed ref_hs_bf16 (dequantized on GPU
-    by the worker) as the reference input instead of the raw original_hs.
+    Accumulation across ranks is done in bf16 to match combine's reduction.
     """
     for result in all_results:
         rank = result["rank"]
-        original_slots = result["original_slots"]
-        original_scales = result["original_scales"]
         combined = result["combined"]
+        num_tokens = config.all_num_tokens[rank]
 
-        # Use pre-computed dequanted bf16 for post-quant modes.
-        if config.quant_mode != "none" and "ref_hs_bf16" in result:
-            ref_input = result["ref_hs_bf16"]
-        else:
-            ref_input = result["original_hs"]
-
-        num_tokens = ref_input.shape[0]
         if num_tokens == 0:
             continue
 
-        ref = simple_moe_reference_per_rank(
-            ref_input,
-            original_slots,
-            original_scales,
-            config.num_experts,
-            config.ep_size,
-        )
+        ref = _build_combine_reference(all_results, rank, config)
 
         combined_tokens = combined[:num_tokens]
         ref_tokens = ref[:num_tokens]
