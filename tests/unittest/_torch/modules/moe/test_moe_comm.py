@@ -16,7 +16,7 @@
 Unified Communication Strategy Tests for MoE
 
 Tests all Communication subclasses (AllGatherReduceScatter, DeepEP,
-DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided) via the public
+DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided, NVLinkTwoSidedFlashinfer) via the public
 dispatch() and combine() interfaces defined in Communication base class.
 
 Each test runs the full pipeline: dispatch -> verify dispatch -> simple_moe
@@ -59,14 +59,20 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
+    AllGatherReduceScatter,
+)
+from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
+from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashinfer import (
+    NVLinkTwoSidedFlashinfer,
+)
+from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
+from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
-
-# NOTE: Communication subclass imports (DeepEP, NVLink, etc.) and platform
-# utility imports (MnnvlMemory, deep_ep_installed) are intentionally lazy-loaded
-# inside the functions that use them.  These modules depend on optional
-# libraries / hardware and would cause the entire test file to fail to import
-# on machines without them.  Lazy loading allows unsupported tests to be
-# gracefully skipped instead.
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -84,6 +90,7 @@ COMM_DEEP_EP = "DeepEP"
 COMM_DEEP_EP_LL = "DeepEPLowLatency"
 COMM_NVLINK_ONE_SIDED = "NVLinkOneSided"
 COMM_NVLINK_TWO_SIDED = "NVLinkTwoSided"
+COMM_NVLINK_TWO_SIDED_FLASHINFER = "NVLinkTwoSidedFlashinfer"
 
 ALL_COMM_TYPES = [
     COMM_ALLGATHER_RS,
@@ -91,6 +98,7 @@ ALL_COMM_TYPES = [
     COMM_DEEP_EP_LL,
     COMM_NVLINK_ONE_SIDED,
     COMM_NVLINK_TWO_SIDED,
+    COMM_NVLINK_TWO_SIDED_FLASHINFER,
 ]
 
 # Must be in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES
@@ -121,6 +129,7 @@ class CommTestConfig:
     hidden_size: int
     all_num_tokens: List[int]
     quant_mode: str = "none"  # "none" | "fp8" | "nvfp4" | "w4afp8"
+    use_low_precision_combine: bool = False
 
     def __str__(self) -> str:
         tokens_str = "x".join(str(t) for t in self.all_num_tokens)
@@ -130,7 +139,33 @@ class CommTestConfig:
         )
         if self.quant_mode != "none":
             s += f"_q{self.quant_mode}"
+        if self.use_low_precision_combine:
+            s += "_lpcombine"
         return s
+
+
+@dataclass
+class WorkerInputs:
+    """Per-rank inputs prepared before dispatch."""
+
+    hs: torch.Tensor
+    hidden_states_sf: Optional[torch.Tensor]
+    global_scale: Optional[torch.Tensor]
+    slots: torch.Tensor
+    scales: torch.Tensor
+    dispatch_kwargs: Dict[str, torch.Tensor]
+    original_fp8: Optional[torch.Tensor] = None
+    w4afp8_roundtrip_ok: Optional[bool] = None
+
+
+@dataclass
+class DispatchOutputs:
+    """Per-rank tensors returned by dispatch()."""
+
+    recv_hs: torch.Tensor
+    recv_sf: Optional[torch.Tensor]
+    recv_slots: torch.Tensor
+    recv_scales: Optional[torch.Tensor]
 
 
 # ============================================================================
@@ -213,7 +248,6 @@ def simple_moe(
     hidden_states: torch.Tensor,
     token_selected_slots: torch.Tensor,
     token_final_scales: torch.Tensor,
-    num_slots: int,
     ep_rank: int,
     experts_per_rank: int,
 ) -> torch.Tensor:
@@ -286,15 +320,9 @@ def create_comm_object(
     )
 
     if comm_type == COMM_ALLGATHER_RS:
-        from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
-            AllGatherReduceScatter,
-        )
-
         return AllGatherReduceScatter(mapping=mapping)
 
     elif comm_type == COMM_DEEP_EP:
-        from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
-
         return DeepEP(
             mapping=mapping,
             num_slots=num_slots,
@@ -305,10 +333,6 @@ def create_comm_object(
         )
 
     elif comm_type == COMM_DEEP_EP_LL:
-        from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import (
-            DeepEPLowLatency,
-        )
-
         return DeepEPLowLatency(
             mapping=mapping,
             num_slots=num_slots,
@@ -317,14 +341,11 @@ def create_comm_object(
             quant_config=qc,
             expert_size_per_partition=num_experts // config.ep_size,
             max_num_tokens=max_num_tokens,
+            use_low_precision_combine=config.use_low_precision_combine,
             moe_max_num_tokens=max_num_tokens,
         )
 
     elif comm_type == COMM_NVLINK_ONE_SIDED:
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
-            NVLinkOneSided,
-        )
-
         # Reset class-level singleton to avoid assertion failures when
         # test params change across MPI process reuse.
         NVLinkOneSided._WORKSPACE = None
@@ -337,14 +358,25 @@ def create_comm_object(
             max_num_tokens_per_rank=max_num_tokens,
             hidden_size=config.hidden_size,
             dtype=torch.bfloat16,
+            use_low_precision_combine=config.use_low_precision_combine,
         )
 
     elif comm_type == COMM_NVLINK_TWO_SIDED:
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import (
-            NVLinkTwoSided,
+        # Keep combine() output reduced to [tokens, hidden] so it matches the
+        # single-card reference and the production CommunicationFactory default.
+        return NVLinkTwoSided(
+            mapping=mapping,
+            num_experts=num_experts,
+            num_slots=num_slots,
+            top_k=config.top_k,
+            use_low_precision_combine=config.use_low_precision_combine,
+            alltoall_result_do_sum=True,
         )
 
-        return NVLinkTwoSided(
+    elif comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
+        # FlashInfer requires reduced combine output and does not support the
+        # low-precision combine path.
+        return NVLinkTwoSidedFlashinfer(
             mapping=mapping,
             num_experts=num_experts,
             num_slots=num_slots,
@@ -363,8 +395,6 @@ def create_comm_object(
 
 def _check_mnnvl_support() -> Optional[str]:
     """Return skip reason if MNNVL is not supported, else None."""
-    from tensorrt_llm._mnnvl_utils import MnnvlMemory
-
     try:
         MnnvlMemory.initialize()
         if not MnnvlMemory.supports_mnnvl():
@@ -374,23 +404,34 @@ def _check_mnnvl_support() -> Optional[str]:
     return None
 
 
+def _check_flashinfer_mnnvl_support() -> Optional[str]:
+    """Return skip reason if FlashInfer MNNVL is not supported, else None."""
+    try:
+        if not NVLinkTwoSidedFlashinfer.is_platform_supported():
+            return "FlashInfer MNNVL not supported"
+    except Exception:
+        return "FlashInfer MNNVL initialization failed"
+    return None
+
+
 def check_platform_support(comm_type: str) -> Optional[str]:
     """Return skip reason string if comm type is unsupported, else None."""
     if comm_type == COMM_ALLGATHER_RS:
         return None
 
     if comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL):
-        try:
-            from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
-
-            if not deep_ep_installed:
-                return "DeepEP library not installed"
-        except ImportError:
-            return "DeepEP library not importable"
+        if not deep_ep_installed:
+            return "DeepEP library not installed"
         return _check_mnnvl_support()
 
-    if comm_type in (COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED):
+    if comm_type == COMM_NVLINK_ONE_SIDED:
         return _check_mnnvl_support()
+
+    if comm_type == COMM_NVLINK_TWO_SIDED:
+        return _check_mnnvl_support()
+
+    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
+        return _check_flashinfer_mnnvl_support()
 
     return f"Unknown comm type: {comm_type}"
 
@@ -400,17 +441,17 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     if config.num_experts % config.ep_size != 0:
         return f"num_experts={config.num_experts} not divisible by ep_size={config.ep_size}"
 
-    if comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL):
-        from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
+    if config.use_low_precision_combine and not _supports_low_precision_combine(config):
+        return (
+            f"{comm_type} does not support use_low_precision_combine for "
+            f"quant_mode={config.quant_mode}, hidden_size={config.hidden_size}"
+        )
 
+    if comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL):
         if not DeepEP._is_deepep_feasible(config.ep_size):
             return f"DeepEP not feasible for ep_size={config.ep_size}"
 
     if comm_type == COMM_DEEP_EP_LL:
-        from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import (
-            DeepEPLowLatency,
-        )
-
         qm = config.quant_mode
         if qm == "none":
             if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES:
@@ -429,12 +470,18 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
                 )
 
     if comm_type == COMM_NVLINK_ONE_SIDED:
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
-            NVLinkOneSided,
-        )
-
         if config.top_k > NVLinkOneSided.MAX_TOP_K:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
+
+    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
+        # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
+        # This test dispatches both int32 slots [N, top_k] and bf16 scales
+        # [N, top_k], so top_k must satisfy both alignments.
+        if config.top_k % 8 != 0:
+            return (
+                "NVLinkTwoSidedFlashinfer requires top_k to be a multiple of 8 "
+                f"for 16-byte row alignment, got top_k={config.top_k}"
+            )
 
     # W4AFP8: encode_source_info writes token_idx into fp8 low byte.
     # token_idx >= 127 can create fp8 NaN which may not survive bf16 roundtrip.
@@ -524,8 +571,6 @@ def _generate_postquant_data(
         global_scale = None
 
     elif config.quant_mode == "nvfp4":
-        from tensorrt_llm.deep_ep.buffer import Buffer
-
         global_scale = torch.ones(num_tokens, 1, device="cuda", dtype=torch.float32)
         hs, sf = Buffer.quantize_bf16_to_nvfp4(bf16_hs, global_scale)
 
@@ -560,18 +605,149 @@ def _to_bf16(
     global_scale: Optional[torch.Tensor],
     quant_mode: str,
 ) -> torch.Tensor:
-    """Dequantize to bf16 using real dequant ops.  Must run on CUDA."""
+    """Convert hidden states to bf16 for simple_moe.
+
+    For quant_mode 'none', hs is already bf16 from dispatch; return as-is.
+    FP8 / w4afp8 use PyTorch dtype conversion. NVFP4 uses Buffer CUDA dequant.
+    Must run on CUDA for nvfp4.
+    """
+    if quant_mode == "none":
+        return hs
     if quant_mode in ("fp8", "w4afp8"):
         return hs.to(torch.bfloat16)
     elif quant_mode == "nvfp4":
-        from tensorrt_llm.deep_ep.buffer import Buffer
-
         # global_scale must be (N, 1) where N == hs.size(0).  After dispatch
         # the received token count differs from the original, so recreate.
         if global_scale.size(0) != hs.size(0):
             global_scale = torch.ones(hs.size(0), 1, device=hs.device, dtype=torch.float32)
         return Buffer.dequantize_nvfp4_to_bf16(hs, global_scale, sf)
     raise ValueError(f"Unknown quant_mode: {quant_mode}")
+
+
+def _prepare_worker_inputs(rank: int, config: CommTestConfig) -> WorkerInputs:
+    """Generate and encode per-rank inputs before dispatch."""
+    if config.quant_mode == "none":
+        hs, slots, scales = _generate_test_data(rank, config)
+        return WorkerInputs(
+            hs=hs,
+            hidden_states_sf=None,
+            global_scale=None,
+            slots=slots,
+            scales=scales,
+            dispatch_kwargs={},
+        )
+
+    hs, hidden_states_sf, global_scale, slots, scales = _generate_postquant_data(rank, config)
+
+    if config.quant_mode == "w4afp8":
+        # Encode (rank_id, token_idx) in the FP8 payload so dispatch verification can
+        # match received rows to sources. DeepEPLowLatency w4afp8 expects bf16
+        # hidden_states at dispatch() and re-quantizes inside dispatch via
+        # (hs * pre_quant_scale).to(float8).view(bf16), so we must round-trip
+        # through bf16 before the kernel sees the tensor.
+        hs = encode_source_info(hs, rank)
+        original_fp8 = hs.clone()
+        # Preflight: if FP8 -> bf16 -> FP8 changes any element, byte-level
+        # dispatch checks against original_fp8 would be misleading (encoded
+        # trailing bytes may not survive conversion). verify_dispatch_alltoall
+        # skips per-row content equality when any rank sets this to False.
+        roundtrip_fp8 = hs.to(torch.bfloat16).to(torch.float8_e4m3fn)
+        w4afp8_roundtrip_ok = torch.equal(hs, roundtrip_fp8)
+        hs = hs.to(torch.bfloat16)
+        pre_quant_scale = torch.ones(
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        return WorkerInputs(
+            hs=hs,
+            hidden_states_sf=hidden_states_sf,
+            global_scale=global_scale,
+            slots=slots,
+            scales=scales,
+            dispatch_kwargs={"pre_quant_scale": pre_quant_scale},
+            original_fp8=original_fp8,
+            w4afp8_roundtrip_ok=w4afp8_roundtrip_ok,
+        )
+
+    return WorkerInputs(
+        hs=encode_source_info(hs, rank),
+        hidden_states_sf=hidden_states_sf,
+        global_scale=global_scale,
+        slots=slots,
+        scales=scales,
+        dispatch_kwargs={},
+    )
+
+
+def _run_worker_dispatch(
+    comm,
+    worker_inputs: WorkerInputs,
+    config: CommTestConfig,
+) -> DispatchOutputs:
+    """Prepare dispatch metadata if needed, then run dispatch()."""
+    if config.comm_type in (COMM_NVLINK_TWO_SIDED, COMM_NVLINK_TWO_SIDED_FLASHINFER):
+        comm.prepare_dispatch(worker_inputs.slots, config.all_num_tokens)
+
+    recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
+        worker_inputs.hs,
+        worker_inputs.hidden_states_sf,
+        worker_inputs.slots,
+        worker_inputs.scales,
+        config.all_num_tokens,
+        # Normalize invalid / non-local expert ids across backends so
+        # dispatch verification can use a consistent slot contract.
+        enable_sanitize_expert_ids=True,
+        **worker_inputs.dispatch_kwargs,
+    )
+
+    return DispatchOutputs(
+        recv_hs=recv_hs,
+        recv_sf=recv_sf,
+        recv_slots=recv_slots,
+        recv_scales=recv_scales,
+    )
+
+
+def _build_worker_result(
+    rank: int,
+    worker_inputs: WorkerInputs,
+    dispatch_outputs: DispatchOutputs,
+    combined: torch.Tensor,
+    config: CommTestConfig,
+) -> dict:
+    """Collect tensors needed by host-side verification."""
+    result = {
+        "rank": rank,
+        "original_hs": _safe_cpu(worker_inputs.hs),
+        "original_hs_sf": _safe_cpu(worker_inputs.hidden_states_sf),
+        "original_slots": worker_inputs.slots.cpu(),
+        "original_scales": worker_inputs.scales.cpu(),
+        "recv_hs": _safe_cpu(dispatch_outputs.recv_hs),
+        "recv_sf": _safe_cpu(dispatch_outputs.recv_sf),
+        "recv_slots": dispatch_outputs.recv_slots.cpu(),
+        "recv_scales": (
+            dispatch_outputs.recv_scales.cpu() if dispatch_outputs.recv_scales is not None else None
+        ),
+        "combined": combined.cpu(),
+    }
+
+    if config.quant_mode == "w4afp8":
+        result["original_fp8"] = _safe_cpu(worker_inputs.original_fp8)
+        result["w4afp8_roundtrip_ok"] = worker_inputs.w4afp8_roundtrip_ok
+
+    # Pre-compute bf16 reference input on GPU for combine verification (CPU in result).
+    # hidden_states_sf / global_scale are only set for nvfp4; _to_bf16 ignores them for fp8/w4afp8.
+    if config.quant_mode != "none":
+        result["ref_hs_bf16"] = _to_bf16(
+            worker_inputs.hs,
+            worker_inputs.hidden_states_sf,
+            worker_inputs.global_scale,
+            config.quant_mode,
+        ).cpu()
+
+    return result
 
 
 def _worker_full_pipeline(config: CommTestConfig) -> dict:
@@ -600,63 +776,25 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
 
         comm = create_comm_object(config.comm_type, mapping, config)
 
-        # ----- data generation + encode -----
-        original_fp8 = None
-        w4afp8_roundtrip_ok = None
-
-        if config.quant_mode == "none":
-            hs, slots, scales = _generate_test_data(rank, config)
-            hidden_states_sf = None
-            global_scale = None
-            dispatch_kwargs = {}
-        else:
-            hs, hidden_states_sf, global_scale, slots, scales = _generate_postquant_data(
-                rank, config
-            )
-
-            if config.quant_mode == "w4afp8":
-                hs = encode_source_info(hs, rank)
-                original_fp8 = hs.clone()
-                roundtrip_fp8 = hs.to(torch.bfloat16).to(torch.float8_e4m3fn)
-                w4afp8_roundtrip_ok = torch.equal(hs, roundtrip_fp8)
-                hs = hs.to(torch.bfloat16)
-                pre_quant_scale = torch.ones(
-                    1,
-                    config.hidden_size,
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-                dispatch_kwargs = {"pre_quant_scale": pre_quant_scale}
-            else:
-                hs = encode_source_info(hs, rank)
-                dispatch_kwargs = {}
-
-        # ----- prepare + dispatch -----
-        if config.comm_type == COMM_NVLINK_TWO_SIDED:
-            comm.prepare_dispatch(slots, config.all_num_tokens)
-
-        recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
-            hs,
-            hidden_states_sf,
-            slots,
-            scales,
-            config.all_num_tokens,
-            enable_sanitize_expert_ids=True,
-            **dispatch_kwargs,
-        )
+        worker_inputs = _prepare_worker_inputs(rank, config)
+        dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
 
         # ----- dequant + MoE + combine -----
-        if config.quant_mode != "none":
-            recv_hs_bf16 = _to_bf16(recv_hs, recv_sf, global_scale, config.quant_mode)
-        else:
-            recv_hs_bf16 = recv_hs
+        recv_hs_bf16 = _to_bf16(
+            dispatch_outputs.recv_hs,
+            dispatch_outputs.recv_sf,
+            worker_inputs.global_scale,
+            config.quant_mode,
+        )
 
         experts_per_rank = config.num_experts // config.ep_size
+        # Run a minimal local-expert compute step before combine(). This keeps
+        # the test aligned with the real MoE pipeline, where combine() consumes
+        # per-rank expert outputs rather than raw dispatch payloads.
         moe_output = simple_moe(
             recv_hs_bf16,
-            recv_slots,
-            recv_scales,
-            config.num_experts,
+            dispatch_outputs.recv_slots,
+            dispatch_outputs.recv_scales,
             rank,
             experts_per_rank,
         )
@@ -666,37 +804,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             all_rank_max_num_tokens=max(config.all_num_tokens),
         )
 
-        # ----- build result dict -----
-        # Use _safe_cpu for tensors that may be float8 (MPI serialization).
-        result = {
-            "rank": rank,
-            "original_hs": _safe_cpu(hs),
-            "original_hs_sf": _safe_cpu(hidden_states_sf),
-            "original_slots": slots.cpu(),
-            "original_scales": scales.cpu(),
-            "recv_hs": _safe_cpu(recv_hs),
-            "recv_sf": _safe_cpu(recv_sf),
-            "recv_slots": recv_slots.cpu(),
-            "recv_scales": recv_scales.cpu() if recv_scales is not None else None,
-            "combined": combined.cpu(),
-        }
-
-        if config.quant_mode == "w4afp8":
-            result["original_fp8"] = _safe_cpu(original_fp8)
-            result["w4afp8_roundtrip_ok"] = w4afp8_roundtrip_ok
-
-        # Pre-compute dequanted bf16 for combine reference ON GPU.
-        # Buffer.dequantize_nvfp4_to_bf16 is a CUDA C++ kernel and cannot
-        # run on CPU tensors; verify_combine_results runs outside the MPI
-        # worker with CPU data.
-        if config.quant_mode == "nvfp4":
-            result["ref_hs_bf16"] = _to_bf16(hs, hidden_states_sf, global_scale, "nvfp4").cpu()
-        elif config.quant_mode == "fp8":
-            result["ref_hs_bf16"] = hs.to(torch.bfloat16).cpu()
-        elif config.quant_mode == "w4afp8":
-            result["ref_hs_bf16"] = original_fp8.to(torch.bfloat16).cpu()
-
-        return result
+        return _build_worker_result(rank, worker_inputs, dispatch_outputs, combined, config)
     except Exception:
         traceback.print_exc()
         raise
@@ -775,6 +883,104 @@ def _compute_expected_tokens_per_rank(
     return expected
 
 
+def _get_dispatch_decode_spec(config: CommTestConfig) -> Tuple[torch.dtype, int]:
+    """Return decode dtype and hidden size used by decode_source_info()."""
+    qm = config.quant_mode
+    if qm == "fp8":
+        return torch.float8_e4m3fn, config.hidden_size
+    if qm == "nvfp4":
+        return torch.uint8, config.hidden_size // 2
+    if qm == "w4afp8":
+        return torch.float8_e4m3fn, config.hidden_size
+    return torch.bfloat16, config.hidden_size
+
+
+def _build_original_data_lookup(
+    all_results: List[dict],
+    quant_mode: str,
+) -> Dict[Tuple[int, int], torch.Tensor]:
+    """Build a (src_rank, token_idx) -> original row lookup for content checks."""
+    original_data: Dict[Tuple[int, int], torch.Tensor] = {}
+    for result in all_results:
+        src_rank = result["rank"]
+        orig = result["original_fp8"] if quant_mode == "w4afp8" else result["original_hs"]
+        for i in range(orig.shape[0]):
+            original_data[(src_rank, i)] = orig[i]
+    return original_data
+
+
+def _validate_dispatch_row_slots(
+    recv_slots_row: torch.Tensor,
+    token_idx: int,
+    recv_rank: int,
+    slot_start: int,
+    slot_end: int,
+    num_experts: int,
+    comm_type: str,
+) -> bool:
+    """Validate one received row of slots and return whether any slot is local."""
+    has_valid = False
+    for k in range(recv_slots_row.shape[0]):
+        slot = recv_slots_row[k].item()
+        if comm_type == COMM_DEEP_EP_LL:
+            is_local = slot_start <= slot < slot_end
+            is_invalid = slot == num_experts
+            assert is_local or is_invalid, (
+                f"Rank {recv_rank}, token {token_idx}, k={k}: slot={slot} "
+                f"not local [{slot_start},{slot_end}) and "
+                f"not invalid marker ({num_experts})"
+            )
+        else:
+            assert -1 <= slot < num_experts, (
+                f"Rank {recv_rank}, token {token_idx}, k={k}: slot={slot} "
+                f"out of valid range [-1, {num_experts})"
+            )
+            is_local = slot_start <= slot < slot_end
+        has_valid = has_valid or is_local
+    return has_valid
+
+
+def _record_received_token(
+    recv_hs: torch.Tensor,
+    decoded: List[Tuple[int, int]],
+    token_idx: int,
+    recv_rank: int,
+    original_data: Dict[Tuple[int, int], torch.Tensor],
+    skip_content_check: bool,
+    actually_received: Set[Tuple[int, int]],
+) -> None:
+    """Record one received token and optionally verify row content."""
+    src_rank, src_idx = decoded[token_idx]
+    key = (src_rank, src_idx)
+    actually_received.add(key)
+    if key in original_data and not skip_content_check:
+        assert torch.equal(recv_hs[token_idx], original_data[key]), (
+            f"Rank {recv_rank}, token {token_idx}: content mismatch. "
+            f"Source: rank={src_rank}, idx={src_idx}"
+        )
+
+
+def _check_dispatch_completeness(
+    recv_rank: int,
+    actually_received: Set[Tuple[int, int]],
+    expected_per_rank: Dict[int, Set[Tuple[int, int]]],
+    comm_type: str,
+) -> None:
+    """Check that a rank received all tokens expected by routing."""
+    # DeepEPLL rewrites output slots in _modify_output_to_adapt_fused_moe,
+    # so returned tensors no longer preserve source-level completeness.
+    if comm_type == COMM_DEEP_EP_LL:
+        return
+
+    expected_tokens = expected_per_rank[recv_rank]
+    missing = expected_tokens - actually_received
+    assert not missing, (
+        f"Rank {recv_rank}: {len(missing)} expected tokens not received. "
+        f"Expected {len(expected_tokens)}, got {len(actually_received)}. "
+        f"Missing (first 5): {list(missing)[:5]}"
+    )
+
+
 def verify_dispatch_alltoall(
     all_results: List[dict],
     config: CommTestConfig,
@@ -782,7 +988,8 @@ def verify_dispatch_alltoall(
     """Verify AllToAll dispatch: slot validity, content integrity, completeness.
 
     Slot semantics differ by communication backend:
-      - NVLinkOneSided / NVLinkTwoSided: valid tokens keep global expert IDs
+      - NVLinkOneSided / NVLinkTwoSided / NVLinkTwoSidedFlashinfer:
+        valid tokens keep global expert IDs
         [0, num_experts), padding tokens are set to -1 by sanitize kernel.
       - DeepEP: valid tokens keep global expert IDs [0, num_experts), empty-
         tensor padding uses num_experts as invalid marker.
@@ -798,35 +1005,14 @@ def verify_dispatch_alltoall(
     num_experts = config.num_experts
     experts_per_rank = num_experts // config.ep_size
 
-    # Determine decode dtype and hidden_size based on quant_mode.
     # For fp8/w4afp8, data is transported as fp8 viewed as bf16 (half width).
     # For nvfp4, data is packed uint8 (half width).
     qm = config.quant_mode
-    if qm == "fp8":
-        decode_dtype = torch.float8_e4m3fn
-        decode_hidden = config.hidden_size
-    elif qm == "nvfp4":
-        decode_dtype = torch.uint8
-        decode_hidden = config.hidden_size // 2
-    elif qm == "w4afp8":
-        decode_dtype = torch.float8_e4m3fn
-        decode_hidden = config.hidden_size
-    else:
-        decode_dtype = torch.bfloat16
-        decode_hidden = config.hidden_size
+    decode_dtype, decode_hidden = _get_dispatch_decode_spec(config)
 
     # Global lookup: (src_rank, token_idx) -> original hidden_states row.
     # For w4afp8, use original_fp8 (fp8 domain) for content comparison.
-    original_data: Dict[Tuple[int, int], torch.Tensor] = {}
-    for result in all_results:
-        src_rank = result["rank"]
-        if qm == "w4afp8":
-            orig = result["original_fp8"]
-        else:
-            orig = result["original_hs"]
-        for i in range(orig.shape[0]):
-            original_data[(src_rank, i)] = orig[i]
-
+    original_data = _build_original_data_lookup(all_results, qm)
     expected_per_rank = _compute_expected_tokens_per_rank(all_results, config)
 
     # For w4afp8: if any rank's preflight roundtrip failed, skip content check
@@ -843,46 +1029,35 @@ def verify_dispatch_alltoall(
         slot_end = slot_start + experts_per_rank
 
         decoded = decode_source_info(recv_hs, decode_dtype, decode_hidden)
-        top_k = recv_slots.shape[1]
-
         actually_received: Set[Tuple[int, int]] = set()
 
         for i in range(recv_hs.shape[0]):
-            for k in range(top_k):
-                slot = recv_slots[i, k].item()
-                if config.comm_type == COMM_DEEP_EP_LL:
-                    is_local = slot_start <= slot < slot_end
-                    is_invalid = slot == num_experts
-                    assert is_local or is_invalid, (
-                        f"Rank {recv_rank}, token {i}, k={k}: slot={slot} "
-                        f"not local [{slot_start},{slot_end}) and "
-                        f"not invalid marker ({num_experts})"
-                    )
-                else:
-                    assert -1 <= slot < num_experts, (
-                        f"Rank {recv_rank}, token {i}, k={k}: slot={slot} "
-                        f"out of valid range [-1, {num_experts})"
-                    )
-
-            has_valid = any(slot_start <= recv_slots[i, k].item() < slot_end for k in range(top_k))
-            if has_valid:
-                src_rank, src_idx = decoded[i]
-                key = (src_rank, src_idx)
-                actually_received.add(key)
-                if key in original_data and not w4afp8_skip_content:
-                    assert torch.equal(recv_hs[i], original_data[key]), (
-                        f"Rank {recv_rank}, token {i}: content mismatch. "
-                        f"Source: rank={src_rank}, idx={src_idx}"
-                    )
-
-        if config.comm_type != COMM_DEEP_EP_LL:
-            expected_tokens = expected_per_rank[recv_rank]
-            missing = expected_tokens - actually_received
-            assert not missing, (
-                f"Rank {recv_rank}: {len(missing)} expected tokens not received. "
-                f"Expected {len(expected_tokens)}, got {len(actually_received)}. "
-                f"Missing (first 5): {list(missing)[:5]}"
+            has_valid = _validate_dispatch_row_slots(
+                recv_slots[i],
+                i,
+                recv_rank,
+                slot_start,
+                slot_end,
+                num_experts,
+                config.comm_type,
             )
+            if has_valid:
+                _record_received_token(
+                    recv_hs,
+                    decoded,
+                    i,
+                    recv_rank,
+                    original_data,
+                    w4afp8_skip_content,
+                    actually_received,
+                )
+
+        _check_dispatch_completeness(
+            recv_rank,
+            actually_received,
+            expected_per_rank,
+            config.comm_type,
+        )
 
 
 def verify_dispatch_results(
@@ -967,10 +1142,17 @@ def verify_combine_results(
 
 
 POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
-    "fp8": [COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED, COMM_DEEP_EP_LL, COMM_ALLGATHER_RS],
+    "fp8": [
+        COMM_NVLINK_ONE_SIDED,
+        COMM_NVLINK_TWO_SIDED,
+        COMM_NVLINK_TWO_SIDED_FLASHINFER,
+        COMM_DEEP_EP_LL,
+        COMM_ALLGATHER_RS,
+    ],
     "nvfp4": [
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
+        COMM_NVLINK_TWO_SIDED_FLASHINFER,
         COMM_DEEP_EP,
         COMM_DEEP_EP_LL,
         COMM_ALLGATHER_RS,
@@ -979,11 +1161,29 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
 }
 """Only valid (quant_mode, comm_type) combinations for post-quant tests.
 
-- fp8: NVLink (payload-agnostic) + DeepEP LL (fp8 branch) + AllGatherRS.
+ - fp8: NVLink (payload-agnostic, including FlashInfer variant) + DeepEP LL
+   (fp8 branch) + AllGatherRS.
   DeepEP normal only supports nvfp4 post-quant, NOT fp8.
-- nvfp4: All 5 COMM types support nvfp4 post-quant.
+ - nvfp4: All tested COMM types except w4afp8-only branches support nvfp4
+   post-quant.
 - w4afp8: Only DeepEP LL has the w4afp8 dispatch branch.
 """
+
+
+def _supports_low_precision_combine(config: CommTestConfig) -> bool:
+    """Return whether this config can exercise the low-precision combine path."""
+    # NVLink backends accept low-precision combine for both the regular and
+    # post-quant test matrices. DeepEPLowLatency only supports it on the
+    # quantized branches guarded below.
+    if config.comm_type in (COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED):
+        return True
+
+    if config.comm_type == COMM_DEEP_EP_LL:
+        if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES_EXTENSION:
+            return False
+        return config.quant_mode in ("fp8", "nvfp4", "w4afp8")
+
+    return False
 
 
 def _make_workloads(ep_size: int) -> List[List[int]]:
@@ -1010,15 +1210,21 @@ def _make_test_params():
         for ep_size in [2, 4]:
             for top_k in [2, 4, 8]:
                 for workload in _make_workloads(ep_size):
-                    config = CommTestConfig(
-                        comm_type=comm_type,
-                        ep_size=ep_size,
-                        num_experts=FIXED_NUM_EXPERTS,
-                        top_k=top_k,
-                        hidden_size=DEFAULT_HIDDEN_SIZE,
-                        all_num_tokens=workload,
-                    )
-                    params.append(pytest.param(ep_size, config, id=str(config)))
+                    for use_low_precision_combine in [False, True]:
+                        config = CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=ep_size,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=top_k,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=workload,
+                            use_low_precision_combine=use_low_precision_combine,
+                        )
+                        if use_low_precision_combine and not _supports_low_precision_combine(
+                            config
+                        ):
+                            continue
+                        params.append(pytest.param(ep_size, config, id=str(config)))
     return params
 
 
@@ -1026,8 +1232,8 @@ def _make_boundary_test_params():
     """Generate boundary / edge-case test parameters."""
     params = []
     for comm_type in ALL_COMM_TYPES:
-        params.append(
-            pytest.param(
+        boundary_cases = [
+            (
                 2,
                 CommTestConfig(
                     comm_type=comm_type,
@@ -1037,12 +1243,9 @@ def _make_boundary_test_params():
                     hidden_size=DEFAULT_HIDDEN_SIZE,
                     all_num_tokens=[8, 8],
                 ),
-                id=f"{comm_type}_topk1",
-            )
-        )
-
-        params.append(
-            pytest.param(
+                f"{comm_type}_topk1",
+            ),
+            (
                 2,
                 CommTestConfig(
                     comm_type=comm_type,
@@ -1052,12 +1255,9 @@ def _make_boundary_test_params():
                     hidden_size=2048,
                     all_num_tokens=[16, 16],
                 ),
-                id=f"{comm_type}_h2048",
-            )
-        )
-
-        params.append(
-            pytest.param(
+                f"{comm_type}_h2048",
+            ),
+            (
                 4,
                 CommTestConfig(
                     comm_type=comm_type,
@@ -1067,14 +1267,14 @@ def _make_boundary_test_params():
                     hidden_size=DEFAULT_HIDDEN_SIZE,
                     all_num_tokens=[1, 1, 1, 1],
                 ),
-                id=f"{comm_type}_single_token",
-            )
-        )
+                f"{comm_type}_single_token",
+            ),
+        ]
 
         # Zero tokens on some ranks (DeepEPLL kernel does not support this).
         if comm_type != COMM_DEEP_EP_LL:
-            params.append(
-                pytest.param(
+            boundary_cases.append(
+                (
                     4,
                     CommTestConfig(
                         comm_type=comm_type,
@@ -1084,9 +1284,28 @@ def _make_boundary_test_params():
                         hidden_size=DEFAULT_HIDDEN_SIZE,
                         all_num_tokens=[32, 0, 16, 0],
                     ),
-                    id=f"{comm_type}_zero_tokens",
+                    f"{comm_type}_zero_tokens",
                 )
             )
+
+        for ep_size, base_config, case_id in boundary_cases:
+            for use_low_precision_combine in [False, True]:
+                config = CommTestConfig(
+                    comm_type=base_config.comm_type,
+                    ep_size=base_config.ep_size,
+                    num_experts=base_config.num_experts,
+                    top_k=base_config.top_k,
+                    hidden_size=base_config.hidden_size,
+                    all_num_tokens=base_config.all_num_tokens,
+                    quant_mode=base_config.quant_mode,
+                    use_low_precision_combine=use_low_precision_combine,
+                )
+                if use_low_precision_combine and not _supports_low_precision_combine(config):
+                    continue
+                param_id = case_id
+                if use_low_precision_combine:
+                    param_id += "_lpcombine"
+                params.append(pytest.param(ep_size, config, id=param_id))
 
     return params
 
@@ -1101,16 +1320,20 @@ def _make_postquant_test_params():
     params = []
     for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
         for comm_type in comm_types:
-            config = CommTestConfig(
-                comm_type=comm_type,
-                ep_size=2,
-                num_experts=FIXED_NUM_EXPERTS,
-                top_k=2,
-                hidden_size=DEFAULT_HIDDEN_SIZE,
-                all_num_tokens=[16, 16],
-                quant_mode=quant_mode,
-            )
-            params.append(pytest.param(2, config, id=str(config)))
+            for use_low_precision_combine in [False, True]:
+                config = CommTestConfig(
+                    comm_type=comm_type,
+                    ep_size=2,
+                    num_experts=FIXED_NUM_EXPERTS,
+                    top_k=2,
+                    hidden_size=DEFAULT_HIDDEN_SIZE,
+                    all_num_tokens=[16, 16],
+                    quant_mode=quant_mode,
+                    use_low_precision_combine=use_low_precision_combine,
+                )
+                if use_low_precision_combine and not _supports_low_precision_combine(config):
+                    continue
+                params.append(pytest.param(2, config, id=str(config)))
     return params
 
 
@@ -1146,12 +1369,15 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
 
     verify_dispatch_results(all_results, config)
 
-    # DeepEPLL: combine applies real scales internally, which introduces
-    # additional FP rounding vs our reference.
-    if config.comm_type == COMM_DEEP_EP_LL:
+    # DeepEPLL applies scales inside combine, while low-precision combine adds
+    # an extra quantize/dequantize hop on the return path. Both need looser
+    # tolerances than the bf16 reference path.
+    if config.use_low_precision_combine:
+        verify_combine_results(all_results, config, rtol=0.2, atol=3.5)
+    elif config.comm_type == COMM_DEEP_EP_LL:
         verify_combine_results(all_results, config, rtol=0.1, atol=0.5)
     else:
-        verify_combine_results(all_results, config, rtol=0.05, atol=0.1)
+        verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
 
 
 # ============================================================================
