@@ -1074,6 +1074,78 @@ def verify_dispatch_results(
         verify_dispatch_alltoall(all_results, config)
 
 
+def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> torch.Tensor:
+    """Simulate NVFP4 E2M1 quantize-dequantize round-trip per row.
+
+    Matches the two-level scaling scheme in fusedMoeCommKernels.cu:
+      quantize_nvfp4_sharedmem / dequantize_nvfp4_sharedmem.
+
+    Level 1 (per-group fp8 scale): Each group of ``group_size`` elements
+    gets an fp8_e4m3 scale factor derived from the group's absmax.
+    Level 2 (per-row global fp32 scale): SFScaleVal = 448*6 / row_amax.
+
+    Quantize path (per row):
+      SFScaleVal = 448 * 6 / global_amax
+      sf8 = fp8(SFScaleVal * group_max / 6)     # per-group fp8 scale
+      output_scale = SFScaleVal / float(sf8)
+      e2m1_val = round_to_e2m1(val * output_scale)
+
+    Dequantize path (per row):
+      dequant_scale = float(sf8) / SFScaleVal
+      result = e2m1_val * dequant_scale
+
+    E2M1 representable values: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+    """
+    if tensor.numel() == 0:
+        return tensor
+
+    x = tensor.float()
+    N, H = x.shape
+    assert H % group_size == 0
+
+    # E2M1 lookup tables (same as torch_quant.py)
+    e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    e2m1_pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
+
+    # Per-row global absmax (kernel computes global_amax per send-field)
+    row_amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [N, 1]
+
+    # Global scale per row: SFScaleVal = (448 * 6) / row_amax
+    sf_scale_val = (448.0 * 6.0) / row_amax  # [N, 1]
+
+    # Reshape into groups
+    x_grouped = x.reshape(N, H // group_size, group_size)
+
+    # Per-group vecMax
+    vec_max = x_grouped.abs().amax(dim=-1)  # [N, H//group_size]
+
+    # Per-group fp8 scale: sf8 = fp8(SFScaleVal * vecMax / 6)
+    sf_value = sf_scale_val * vec_max / 6.0
+    sf8 = sf_value.to(torch.float8_e4m3fn)
+    sf_narrow = sf8.float()
+
+    # output_scale = SFScaleVal / float(sf8)
+    # Kernel uses reciprocal_approximate_ftz (~1 ULP); we use exact division.
+    output_scale = torch.where(
+        vec_max > 0,
+        sf_scale_val / sf_narrow,
+        torch.zeros_like(sf_narrow),
+    )
+
+    # Scale each element and quantize to E2M1
+    scaled = x_grouped * output_scale.unsqueeze(-1)
+    sign = scaled.sign()
+    abs_scaled = scaled.abs()
+    idx = torch.searchsorted(e2m1_bounds, abs_scaled).clamp(max=7)
+    e2m1_quantized = e2m1_pos_vals[idx] * sign
+
+    # Dequantize: result = e2m1_val * float(sf8) / SFScaleVal
+    dequant_scale = sf_narrow / sf_scale_val
+    result = e2m1_quantized * dequant_scale.unsqueeze(-1)
+
+    return result.reshape(N, H).to(torch.bfloat16)
+
+
 def _build_combine_reference(
     all_results: List[dict],
     target_rank: int,
@@ -1085,18 +1157,19 @@ def _build_combine_reference(
 
     1a. NVLinkOneSided + low_precision_combine: Simulates fp8 quant/dequant
         (moeA2APrepareCombineKernel/moeA2ACombineKernel use bf16->fp8->float32
-        accumulation). Other lpc backends (NVLinkTwoSided uses NVFP4 in
-        fusedMoeCommKernels.cu) fall through to the default float32 path
-        since NVFP4 simulation is impractical.
+        accumulation).
+
+    1b. NVLinkTwoSided + low_precision_combine: Simulates NVFP4 E2M1
+        quant/dequant (fusedMoeCommKernels.cu quantize_nvfp4_sharedmem /
+        dequantize_nvfp4_sharedmem) with two-level scaling + float32
+        accumulation.
 
     2.  DeepEP low-latency: Reconstructs weighted reduction using real
         topk_weights (original_scales), since DeepEPLL's combine internally
         applies weights rather than receiving pre-scaled moe_output.
 
-    3.  Default (+ NVLinkTwoSided lpc): Accumulates moe_output in float32
-        to match the kernel's use of float32 registers for cross-rank
-        reduction. For NVLinkTwoSided lpc, this means wider tolerances
-        absorb the NVFP4 quantization noise.
+    3.  Default: Accumulates moe_output in float32 to match the kernel's
+        use of float32 registers for cross-rank reduction.
 
     All paths produce bf16 output to match the final kernel output dtype.
     """
@@ -1119,6 +1192,21 @@ def _build_combine_reference(
                 if src_rank == target_rank and token_idx < num_tokens:
                     fp8_val = moe_out[i].to(torch.float8_e4m3fn)
                     ref[token_idx] += fp8_val.float()
+
+    elif config.use_low_precision_combine and config.comm_type == COMM_NVLINK_TWO_SIDED:
+        # Path 1b: NVLinkTwoSided NVFP4 simulation + float32 accumulation.
+        # fusedMoeCommKernels.cu quantize_nvfp4_sharedmem uses two-level
+        # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
+        # with E2M1 quantization. After NVLink transfer,
+        # dequantize_nvfp4_sharedmem reverses the process. The top_k
+        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py.
+        for proc_result in all_results:
+            moe_out = proc_result["moe_output"]
+            nvfp4_out = _simulate_nvfp4_round_trip(moe_out)
+            source_info = proc_result["recv_source_info"]
+            for i, (src_rank, token_idx) in enumerate(source_info):
+                if src_rank == target_rank and token_idx < num_tokens:
+                    ref[token_idx] += nvfp4_out[i].float()
 
     elif config.comm_type == COMM_DEEP_EP_LL:
         # Path 2: DeepEPLL weighted reduction.
@@ -1463,7 +1551,7 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
 
     # Reference matches kernel behavior per comm type:
     # - NVLinkOneSided lpc: fp8 simulation (matches moeA2ACombineKernel)
-    # - NVLinkTwoSided lpc: float32 accum (can't simulate NVFP4), wider tol
+    # - NVLinkTwoSided lpc: NVFP4 simulation (matches fusedMoeCommKernels.cu)
     # - DeepEPLL: weighted reduce with real topk_weights
     # - Default: float32 accumulation (matches kernel registers)
     if config.use_low_precision_combine:
@@ -1471,9 +1559,10 @@ def _run_full_test(mpi_pool_executor, config: CommTestConfig):
             # FP8 simulation closely matches kernel — tight tolerance
             verify_combine_results(all_results, config, rtol=0.02, atol=0.15)
         else:
-            # NVLinkTwoSided uses NVFP4 (e2m1+scale), ref is float32 approx.
-            # NVFP4 error scales with top_k (k2~0.9, k4~1.6, k8~2.6).
-            verify_combine_results(all_results, config, rtol=0.2, atol=3.5)
+            # NVFP4 simulation matches kernel's two-level scaling.
+            # Residual error from reciprocal_approximate_ftz vs exact division
+            # and bf16 vs f32 top_k accumulation.
+            verify_combine_results(all_results, config, rtol=0.05, atol=0.5)
     elif config.comm_type == COMM_DEEP_EP_LL:
         verify_combine_results(all_results, config, rtol=0.05, atol=0.3)
     else:
