@@ -295,6 +295,38 @@ def simple_moe_reference(
     return output.to(hidden_states.dtype)
 
 
+def simple_moe_reference_per_rank(
+    hidden_states: torch.Tensor,
+    token_selected_slots: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+) -> torch.Tensor:
+    """Per-rank accumulation reference that mimics the distributed pipeline.
+
+    Instead of a single fp32 accumulation across all experts (which
+    simple_moe_reference does), this computes per-rank partial sums in fp32
+    then accumulates across ranks in bf16.  This matches the actual
+    distributed pipeline's accumulation order:
+      rank0_partial(fp32->bf16) + rank1_partial(fp32->bf16) + ...
+
+    The remaining error vs actual combine is then ONLY from the communication
+    layer (e.g. fp8 quantize/dequantize for low_precision_combine).
+    """
+    experts_per_rank = num_experts // ep_size
+    result = torch.zeros_like(hidden_states)  # bf16
+    for r in range(ep_size):
+        partial = simple_moe(
+            hidden_states,
+            token_selected_slots,
+            token_final_scales,
+            r,
+            experts_per_rank,
+        )  # fp32 internal, returns bf16
+        result = result + partial  # bf16 accumulation
+    return result
+
+
 # ============================================================================
 # Communication Object Factory
 # ============================================================================
@@ -1079,12 +1111,19 @@ def verify_combine_results(
 ):
     """Verify combine results against single-card reference.
 
-    Computes simple_moe_reference (all experts, no EP) and compares
-    with the distributed dispatch+simple_moe+combine pipeline output.
+    For non-DeepEPLL comm types, uses simple_moe_reference_per_rank which
+    simulates per-rank bf16 partial sums then bf16 cross-rank accumulation.
+    This matches the actual distributed pipeline's accumulation order and
+    eliminates bf16 rounding-order error, isolating only combine-layer error.
+
+    DeepEPLL applies scales inside combine (not in MoE), so its rounding
+    order differs; we fall back to simple_moe_reference for that case.
 
     For post-quant modes, uses pre-computed ref_hs_bf16 (dequantized on GPU
     by the worker) as the reference input instead of the raw original_hs.
     """
+    use_per_rank_ref = config.comm_type != COMM_DEEP_EP_LL
+
     for result in all_results:
         rank = result["rank"]
         original_slots = result["original_slots"]
@@ -1101,18 +1140,43 @@ def verify_combine_results(
         if num_tokens == 0:
             continue
 
-        ref = simple_moe_reference(
-            ref_input,
-            original_slots,
-            original_scales,
-            config.num_experts,
-        )
+        if use_per_rank_ref:
+            ref = simple_moe_reference_per_rank(
+                ref_input,
+                original_slots,
+                original_scales,
+                config.num_experts,
+                config.ep_size,
+            )
+        else:
+            ref = simple_moe_reference(
+                ref_input,
+                original_slots,
+                original_scales,
+                config.num_experts,
+            )
 
         combined_tokens = combined[:num_tokens]
         ref_tokens = ref[:num_tokens]
 
         assert combined_tokens.shape == ref_tokens.shape, (
             f"Rank {rank}: shape mismatch. combined={combined_tokens.shape}, ref={ref_tokens.shape}"
+        )
+
+        # Compute precision statistics for analysis.
+        abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
+        ref_abs = ref_tokens.float().abs()
+        nonzero_mask = ref_abs > 0
+        max_abs = abs_diff.max().item()
+        max_rel = (
+            (abs_diff[nonzero_mask] / ref_abs[nonzero_mask]).max().item()
+            if nonzero_mask.any()
+            else 0.0
+        )
+        tier = "lpcombine" if config.use_low_precision_combine else "default"
+        print(
+            f"PRECISION_STATS|{config.comm_type}|ep{config.ep_size}|k{config.top_k}"
+            f"|rank{rank}|{tier}|max_abs={max_abs:.6f}|max_rel={max_rel:.6f}"
         )
 
         try:
@@ -1123,7 +1187,6 @@ def verify_combine_results(
                 atol=atol,
             )
         except AssertionError as e:
-            abs_diff = (combined_tokens.float() - ref_tokens.float()).abs()
             max_idx = abs_diff.argmax().item()
             token_idx = max_idx // combined_tokens.shape[1]
             elem_idx = max_idx % combined_tokens.shape[1]
