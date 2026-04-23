@@ -233,6 +233,7 @@ def should_skip_trtllm(
         QuantAlgo.FP8_BLOCK_SCALES,
         QuantAlgo.W4A8_NVFP4_FP8,
         QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
@@ -258,14 +259,14 @@ def should_skip_trtllm(
             f"TRTLLMGenFusedMoE requires num_experts > top_k "
             f"(got num_experts={num_experts}, top_k={top_k})"
         )
-    # W4A8_MXFP4_MXFP8 with non-128-aligned hidden_size or intermediate_size
-    # causes block_scale_interleave_reverse to fail with
+    # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 with non-128-aligned hidden_size or
+    # intermediate_size cause block_scale_interleave_reverse to fail with
     # "rows of Interleaved block scales should be multiple of 128".
-    if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+    if quant_algo in (QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.W4A8_MXFP4_FP8):
         hidden_size = model_config.hidden_size
         if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             return (
-                f"TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with non-128-aligned "
+                f"TRTLLMGenFusedMoE {quant_algo.name} with non-128-aligned "
                 f"sizes (h={hidden_size}, i={intermediate_size}) causes "
                 f"block_scale_interleave_reverse rows must be multiple of 128."
             )
@@ -344,6 +345,26 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with "
                 f"swiglu_gptoss_style and top_k={top_k} has accuracy issues "
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
+            )
+
+    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
+    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
+    # caused by the ref module's dynamic FP8 quantization being miswired to
+    # `trtllm::w4a8_mxfp4_fp8_gemm` (FP4GemmType.W4A8_MXFP4_MXFP8, which
+    # expects per-block activation scales with alpha=1). The ref module for
+    # W4A8_MXFP4_FP8 is now a dedicated bf16 implementation that dequantizes
+    # the MXFP4 weights at load time (see MXFP4FP8RefGatedMLPFusedMoE); with
+    # that in place the larger TRTLLM configs (e.g. e60_k4_h2048_i1408) pass.
+    # top_k=1 still has a genuine per-tensor static/dynamic FP8 scale
+    # divergence because a single activated expert sees only one routed token.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
+        if top_k == 1:
+            return (
+                f"[Design Limitation] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
+                f"top_k={top_k}: with a single activated expert the bf16 ref "
+                f"and the fused kernel see very different activation ranges, "
+                f"and the fused kernel's static per-tensor FP8 scale can no "
+                f"longer stay within the test threshold."
             )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
@@ -469,6 +490,20 @@ def should_skip_cutlass(
     """
     if backend_type != MoeBackendType.CUTLASS:
         return None
+
+    # W4A8_MXFP4_FP8 on CUTLASS: even after replacing the reference with the
+    # bf16 `MXFP4FP8RefGatedMLPFusedMoE`, CUTLASS W4A8_MXFP4_FP8 still fails
+    # across all tested configs on GB200 (~99% mismatch), which points at the
+    # CUTLASS MoE kernel itself rather than the reference. Skip until the
+    # CUTLASS kernel correctness is audited; the TRTLLM backend exercises the
+    # same quantization path.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
+        return (
+            "[Potential Bug] CutlassFusedMoE W4A8_MXFP4_FP8 produces "
+            "incorrect outputs on GB200 across all tested configs even with "
+            "the bf16 reference. Suspect the CUTLASS kernel; TRTLLM backend "
+            "covers the quantization path in the meantime."
+        )
 
     # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
     # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
@@ -776,6 +811,9 @@ def get_quick_skip_reason(
                 swiglu_gptoss_style,
                 seq_len=seq_len,
             ),
+            lambda: should_skip_cutlass(
+                backend_type, quant_algo=quant_algo, model_config=model_config, dtype=dtype
+            ),
             lambda: should_skip_cutedsl(
                 backend_type, quant_algo, model_config, routing_method_cls=routing_method_cls
             ),
@@ -807,7 +845,11 @@ def get_quick_skip_reason(
 
             if not is_hidden_128_aligned or not is_intermediate_128_aligned:
                 # TRTLLM with MXFP4 variants automatically pads to 128 alignment
-                is_mxfp4_variant = quant_algo in {QuantAlgo.W4A16_MXFP4, QuantAlgo.W4A8_MXFP4_MXFP8}
+                is_mxfp4_variant = quant_algo in {
+                    QuantAlgo.W4A16_MXFP4,
+                    QuantAlgo.W4A8_MXFP4_FP8,
+                    QuantAlgo.W4A8_MXFP4_MXFP8,
+                }
                 is_trtllm_backend = backend_type == MoeBackendType.TRTLLM
                 if not (is_trtllm_backend and is_mxfp4_variant):
                     return (

@@ -168,6 +168,22 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
                 # CUTLASS and others use weight_alignment for both
                 quant_kwargs["weight_alignment"] = 128
                 quant_kwargs["input_hidden_alignment"] = 128
+    elif quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
+        quantize_util_cls = MXFP4FP8QuantizeUtil
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_FP8)
+        # Per-tensor FP8 activation scale. Mirror NVFP4_FP8 convention.
+        x_sf_global = 448 / x.abs().max().float()
+        quant_kwargs["x_sf_global"] = x_sf_global
+        # Same backend-specific alignment as W4A8_MXFP4_MXFP8 since both share
+        # MXFP4WeightCutlassFusedMoEMethod / MXFP4WeightTRTLLMGenFusedMoEMethod.
+        backend_name = _normalize_backend_name(backend_type)
+        if backend_name is not None:
+            if backend_name == "TRTLLM":
+                quant_kwargs["weight_alignment"] = 128
+                quant_kwargs["input_hidden_alignment"] = 512
+            elif backend_name == "CUTLASS":
+                quant_kwargs["weight_alignment"] = 128
+                quant_kwargs["input_hidden_alignment"] = 128
     elif quant_algo == QuantAlgo.W4A16_MXFP4:
         quantize_util_cls = WFP4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
@@ -1409,12 +1425,17 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
         """
-        Create quantized weights for MoE experts using W4A8_MXFP4_MXFP8 quantization.
+        Create quantized weights for MoE experts using MXFP4 quantization.
+
+        Shared weight generation for both W4A8_MXFP4_MXFP8 and W4A8_MXFP4_FP8:
+        the FP4 weights + E8M0 block scales are identical; they differ only in
+        how activations are quantized (per-block MXFP8 vs per-tensor FP8),
+        which is handled by subclasses adding extra scale keys.
         """
-        assert (
-            self.quant_config is not None
-            and self.quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
-        ), "expect quant_algo to be W4A8_MXFP4_MXFP8"
+        assert self.quant_config is not None and self.quant_config.quant_algo in (
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+            QuantAlgo.W4A8_MXFP4_FP8,
+        ), "expect quant_algo to be W4A8_MXFP4_MXFP8 or W4A8_MXFP4_FP8"
 
         scaling_vector_size = quant_kwargs.get("scaling_vector_size", 32)
         hidden_size_in = quant_kwargs.get("hidden_size_in", self.hidden_size)
@@ -1619,6 +1640,194 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
             swiglu_limit=self.swiglu_limit,
         )
         return ref_fused_moe
+
+
+class MXFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
+    """
+    Reference implementation of W4A8_MXFP4_FP8 quantization for correctness testing.
+
+    The original design delegated to GatedMLP + ``W4A8MXFP4FP8LinearMethod``,
+    but that path was empirically shown to produce outputs ~50-70x larger than
+    the fused MoE kernel for large configs (verified on GB200,
+    e60_k4_h2048_i1408 bf16: ref ~744 vs fused ~10.9 per element). Root cause:
+    ``W4A8MXFP4FP8LinearMethod.apply`` passes a dynamic per-tensor FP8
+    input_scale into ``trtllm::w4a8_mxfp4_fp8_gemm``, which is wired to
+    ``FP4GemmType.W4A8_MXFP4_MXFP8`` and expects per-block activation scales
+    combined with ``alpha=1``; the per-tensor scale is not applied correctly
+    and the dequant is off by roughly ``1/input_scale`` (= 448/amax).
+
+    To keep the reference aligned with the fused kernel, this class follows
+    the ``WFP4A16RefGatedMLPFusedMoE`` pattern: it dequantizes the MXFP4
+    weights to bf16 at load time and runs a plain bf16 GatedMLP forward.
+    This mirrors what the fused kernel computes up to the FP8 activation
+    quantization noise, which is covered by the relaxed thresholds in
+    ``check_accuracy`` below.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        routing_method: BaseMoeRoutingMethod,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: Optional[ModelConfig] = None,
+        bias=False,
+        hidden_size_unpadded: Optional[int] = None,
+        swiglu_gptoss_style: bool = False,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
+    ):
+        # Preserve the original quant_config for weight-loading assertions and
+        # for sharing activation scales with the fused backend, but build the
+        # GatedMLP experts without it so the Linear layers use plain bf16.
+        self._original_quant_config = model_config.quant_config if model_config else None
+
+        super().__init__(
+            num_experts=num_experts,
+            routing_method=routing_method,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            model_config=ModelConfig(),  # no quant_config → plain bf16 Linear
+            bias=bias,
+            activation_type=activation_type,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+        self.hidden_size_unpadded = (
+            hidden_size_unpadded if hidden_size_unpadded is not None else hidden_size
+        )
+        self.swiglu_gptoss_style = swiglu_gptoss_style
+
+    def load_weights(self, weights_list: List[Dict]):
+        assert len(weights_list) == 1
+        weights = weights_list[0]
+        assert (
+            self._original_quant_config is not None
+            and self._original_quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        ), "expect quant_algo to be W4A8_MXFP4_FP8"
+
+        unpacker = torch.ops.trtllm.mxfp4_dequantize_unswizzled
+
+        for expert in range(self.num_experts):
+            w1 = weights[f"{expert}.w1.weight"]
+            s1 = weights[f"{expert}.w1.weight_scale"]
+            w3 = weights[f"{expert}.w3.weight"]
+            s3 = weights[f"{expert}.w3.weight_scale"]
+            w2 = weights[f"{expert}.w2.weight"]
+            s2 = weights[f"{expert}.w2.weight_scale"]
+
+            # scaling_group_size = input_dim / scale_last_dim
+            scaling_group_size = self.hidden_size // s1.shape[-1]
+
+            # mxfp4_dequantize_unswizzled returns (out_features, in_features)
+            # which matches F.linear weight layout (out, in). Do NOT transpose.
+            w1_dequant = (
+                unpacker(w1.cpu(), s1.cpu(), scaling_group_size)
+                .to(dtype=self.dtype, device="cuda")
+                .contiguous()
+            )
+            w3_dequant = (
+                unpacker(w3.cpu(), s3.cpu(), scaling_group_size)
+                .to(dtype=self.dtype, device="cuda")
+                .contiguous()
+            )
+            w2_dequant = (
+                unpacker(w2.cpu(), s2.cpu(), scaling_group_size)
+                .to(dtype=self.dtype, device="cuda")
+                .contiguous()
+            )
+
+            gate_up_proj_weights = [{}, {}]
+            down_proj_weights = [{}]
+            gate_up_proj_weights[0]["weight"] = w1_dequant
+            gate_up_proj_weights[1]["weight"] = w3_dequant
+            down_proj_weights[0]["weight"] = w2_dequant
+
+            if self.bias:
+                gate_up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
+                gate_up_proj_weights[1]["bias"] = weights[f"{expert}.w3.bias"]
+                down_proj_weights[0]["bias"] = weights[f"{expert}.w2.bias"]
+
+            self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+            self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        # Pad input if hidden_size_unpadded < hidden_size
+        if self.hidden_size_unpadded < self.hidden_size:
+            pad_size = self.hidden_size - self.hidden_size_unpadded
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, pad_size))
+
+        output = super().forward(hidden_states, router_logits)
+
+        if self.hidden_size_unpadded < self.hidden_size:
+            output = output[:, : self.hidden_size_unpadded]
+        return output
+
+    def check_accuracy(self, output, ref_output):
+        # The bf16 reference skips the FP8 per-tensor activation quantization
+        # that the fused kernel applies, which introduces a few percent of
+        # additional noise. Use slightly looser rtol than the MXFP8 sibling.
+        if self.swiglu_gptoss_style:
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.8)
+        elif self.hidden_size >= 4096:
+            check_accuracy(output, ref_output, rtol=0.2, atol=0.3, percent=0.85)
+        else:
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.2, percent=0.85)
+
+
+class MXFP4FP8QuantizeUtil(MXFP4MXFP8QuantizeUtil):
+    """
+    Quantize util for W4A8_MXFP4_FP8 MoE backends.
+
+    Produces the same MXFP4 weights + E8M0 block scales as
+    MXFP4MXFP8QuantizeUtil, plus per-expert per-tensor FP8 activation
+    input_scales. Both W4A8MXFP4FP8CutlassFusedMoEMethod and
+    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod require w1.input_scale == w3.input_scale
+    (asserted inside load_quant_scales); we satisfy this by using a shared
+    activation scale derived from x_sf_global.
+    """
+
+    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+        assert (
+            self.quant_config is not None
+            and self.quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        ), "expect quant_algo to be W4A8_MXFP4_FP8"
+        assert "x_sf_global" in quant_kwargs, "x_sf_global is required for W4A8_MXFP4_FP8 quant"
+
+        weights = super().create_weights(**quant_kwargs)
+
+        # x_sf_global = 448 / max(|x|), so the activation scale stored on the
+        # module (reciprocal form, matching NVFP4_FP8 convention) is 1 / x_sf_global.
+        x_sf_global = quant_kwargs["x_sf_global"]
+        input_scale_value = (1.0 / x_sf_global).float().cuda()
+
+        for expert_id in range(self.num_experts):
+            # w1 and w3 MUST share input_scale — enforced by the MoE methods.
+            weights[f"{expert_id}.w1.input_scale"] = input_scale_value.clone()
+            weights[f"{expert_id}.w3.input_scale"] = input_scale_value.clone()
+            weights[f"{expert_id}.w2.input_scale"] = input_scale_value.clone()
+        return weights
+
+    def create_ref_module(
+        self,
+        routing_method,
+        ref_cls=MXFP4FP8RefGatedMLPFusedMoE,
+        hidden_size_in: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        hidden_size_unpadded: Optional[int] = None,
+    ) -> torch.nn.Module:
+        return super().create_ref_module(
+            routing_method,
+            ref_cls=ref_cls,
+            hidden_size_in=hidden_size_in,
+            intermediate_size=intermediate_size,
+            hidden_size_unpadded=hidden_size_unpadded,
+        )
 
 
 class WFP4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
