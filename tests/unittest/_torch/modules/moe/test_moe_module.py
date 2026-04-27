@@ -761,6 +761,7 @@ CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
+    MoeModelConfig(16, 2, 1024, 1024),  # compact aligned config for MXFP4-FP8 module coverage
 ]
 
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
@@ -893,6 +894,26 @@ def _get_comm_method_skip_reason(
     return None
 
 
+def _get_configurable_moe_skip_reason(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    model_config: MoeModelConfig,
+) -> Optional[str]:
+    """Return known high-level ConfigurableMoE limitations not shared by backend tests."""
+    if (
+        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        and backend_type == MoeBackendType.TRTLLM
+        and model_config.num_experts >= 60
+        and model_config.intermediate_size >= 1408
+    ):
+        return (
+            "[Follow-up] ConfigurableMoE W4A8_MXFP4_FP8 TRTLLM "
+            f"{model_config}: fused_moe.forward vs bf16 ref diverges on this large config; "
+            "test_moe_backend.py covers the same backend-level config and passes."
+        )
+    return None
+
+
 def generate_multi_gpu_test_params(
     parallel_modes,
     comm_methods,
@@ -990,6 +1011,7 @@ def generate_multi_gpu_test_params(
                     should_skip_multi_gpu(
                         parallel_mode, model_config, world_size=4, comm_method=comm_method
                     ),
+                    _get_configurable_moe_skip_reason(backend_type, quant_algo, model_config),
                 ):
                     if reason:
                         skip_reason = reason
@@ -1051,6 +1073,9 @@ def generate_base_test_params(
     ) in iter_base_test_configs(
         swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
     ):
+        if skip_reason:
+            continue
+        skip_reason = _get_configurable_moe_skip_reason(backend_type, quant_algo, model_config)
         if skip_reason:
             continue
         param_values = (
@@ -1121,28 +1146,6 @@ def test_configurable_moe_single_gpu(
     )
     if ci_skip:
         pytest.skip(ci_skip)
-
-    # Module-test-only skip: W4A8_MXFP4_FP8 with the large e60_k4_h2048_i1408
-    # config passes the backend-level test (`test_moe_backend.py`) with the
-    # new bf16 reference, but the high-level `fused_moe.forward` path via
-    # ConfigurableMoE still diverges from the reference on the same config.
-    # The divergence is out of scope for the ref fix; candidates for follow-up
-    # include ConfigurableMoE wrapping (comm/scatter/gather/chunking),
-    # autotuner state sharing between unrelated tests, and routing semantics
-    # drift between backend and module entry points.
-    if (
-        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
-        and moe_backend == MoeBackendType.TRTLLM.value
-        and model_config.num_experts >= 60
-        and model_config.intermediate_size >= 1408
-    ):
-        pytest.skip(
-            "[Follow-up] test_moe_module.py W4A8_MXFP4_FP8 TRTLLM "
-            f"e{model_config.num_experts}_k{model_config.top_k}_h{model_config.hidden_size}_"
-            f"i{model_config.intermediate_size}: fused_moe.forward vs bf16 ref "
-            "divergence on this large config; test_moe_backend.py covers the "
-            "same config at backend level and passes."
-        )
 
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
