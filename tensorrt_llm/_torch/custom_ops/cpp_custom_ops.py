@@ -844,6 +844,56 @@ def _register_fake():
                 total_num_padded_tokens, num_non_exiting_tiles
             ]
 
+    if hasattr(torch.ops.trtllm, "mega_moe_m5_materialize_from_moe_sort"):
+
+        @torch.library.register_fake(
+            "trtllm::mega_moe_m5_materialize_from_moe_sort")
+        def _(
+            input: torch.Tensor,
+            input_sf: torch.Tensor,
+            topk_scales: torch.Tensor,
+            token_offsets: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            l1_acts_pool: torch.Tensor,
+            l1_acts_sf_pool: torch.Tensor,
+            l1_topk_weights_pool: torch.Tensor,
+            token_src_metadata: torch.Tensor,
+            l1_arrival_count: torch.Tensor,
+            tile_tokens_dim: int,
+        ) -> None:
+            return None
+
+    if hasattr(torch.ops.trtllm,
+               "mega_moe_m5_materialize_direct_from_moe_sort"):
+
+        @torch.library.register_fake(
+            "trtllm::mega_moe_m5_materialize_direct_from_moe_sort")
+        def _(
+            input: torch.Tensor,
+            input_sf: torch.Tensor,
+            topk_scales: torch.Tensor,
+            token_offsets: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            l1_acts_pool: torch.Tensor,
+            l1_acts_sf_pool: torch.Tensor,
+            l1_topk_weights_pool: torch.Tensor,
+            token_src_metadata: torch.Tensor,
+            l1_arrival_count: torch.Tensor,
+            active_pool_slots: torch.Tensor,
+            active_combine_rows: torch.Tensor,
+            active_route_count: torch.Tensor,
+            output_permuted_idx_to_expanded_idx: torch.Tensor,
+            output_token_final_scales: torch.Tensor,
+            tile_tokens_dim: int,
+            max_num_tokens_per_rank: int,
+            combine_layout_rows: int,
+        ) -> None:
+            return None
+
     @torch.library.register_fake("trtllm::moe_permute")
     def _(
         input: torch.Tensor,

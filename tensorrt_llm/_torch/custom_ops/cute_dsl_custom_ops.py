@@ -334,6 +334,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_mega_moe_fusion import \
+        BlockScaledMegaMoeFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
@@ -342,6 +344,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.mega_moe_direct_route import \
+        build_direct_input_route_from_ranked_topk
+    from ..cute_dsl_kernels.blackwell.mega_moe_m6_reduce import \
+        reduce_m6_combine_buffer_bf16_out
+    from ..cute_dsl_kernels.blackwell.mega_moe_stage import \
+        stage_dispatch_inputs_u64
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -2168,14 +2176,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
+            use_blkred = True
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m, b_tensor_l_sizes)
+                         cluster_shape_mn, raster_along_m, b_tensor_l_sizes,
+                         use_blkred)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
-                    use_blkred=True,
+                    use_blkred=use_blkred,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
                 )
@@ -2822,8 +2832,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return self.__class__.tuning_config_cache[key]
 
-        def forward(self, inputs: List,
-                    tactic: Optional[tuple]) -> torch.Tensor:
+        def forward(self,
+                    inputs: List,
+                    tactic: Optional[tuple],
+                    output: Optional[torch.Tensor] = None,
+                    output_sf: Optional[torch.Tensor] = None,
+                    **_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
             """Forward pass supporting both single tensor and list inputs.
 
             Input layout (positions 1, 3, 4 are lists for multi-B support):
@@ -2837,6 +2851,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 7: permuted_idx_to_expanded_idx    - tensor
                 8: num_non_exiting_tiles           - tensor
                 9: global_sf                       - tensor
+
+            If ``output`` / ``output_sf`` are supplied, the caller owns the
+            allocation (Phase C-a.1 persistent L2-warm pool) and the kernel
+            writes into those buffers in place. Shapes / dtypes must match
+            what the ``None`` branch would have allocated.
             """
             a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx, \
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
@@ -2889,11 +2908,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert global_sf.dtype == torch.float32
             assert global_sf.numel() == 1
 
-            # Allocate output tensors
-            c = torch.empty(m, interm_size // 2, dtype=a.dtype, device=a.device)
-            c_sf = torch.empty(m * interm_size // self.scaling_vector_size,
-                               dtype=a_sf.dtype,
-                               device=a_sf.device)
+            # Allocate output tensors, or bind to caller-provided buffers
+            # (Phase C-a.1 persistent L2-warm activation pool).
+            if output is not None:
+                assert output_sf is not None, (
+                    "output and output_sf must be supplied together")
+                assert output.dtype == a.dtype and output.size() == (
+                    m, interm_size // 2), (
+                        f"output must be {(m, interm_size // 2)} "
+                        f"{a.dtype}, got {tuple(output.size())} {output.dtype}")
+                assert output_sf.dtype == a_sf.dtype and output_sf.numel() == (
+                    m * interm_size //
+                    self.scaling_vector_size), "output_sf size mismatch"
+                c = output
+                c_sf = output_sf
+            else:
+                c = torch.empty(m,
+                                interm_size // 2,
+                                dtype=a.dtype,
+                                device=a.device)
+                c_sf = torch.empty(m * interm_size // self.scaling_vector_size,
+                                   dtype=a_sf.dtype,
+                                   device=a_sf.device)
 
             # Create common pointers
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
@@ -3026,6 +3062,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compiled_gemm(*exec_args, stream=stream)
 
             return c, c_sf
+
+    class Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner):
+        """Compatibility runner for callers that require the SwiGLU-only path."""
+
+        def __init__(self,
+                     num_experts: int,
+                     top_k: int,
+                     num_local_experts: int,
+                     local_expert_offset: int,
+                     tile_size: int,
+                     scaling_vector_size: int = 16,
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+            super().__init__(num_experts, top_k, num_local_experts,
+                             local_expert_offset, tile_size,
+                             scaling_vector_size, b_tensor_l_sizes,
+                             ActivationType.Swiglu)
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
@@ -3202,6 +3255,1789 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
+
+    # ------------------------------------------------------------------
+    # Phase C-a.1: FC1 variant that writes into a caller-owned activation
+    # pool. MegaMoE.__init__ allocates a persistent L2-warm buffer that is
+    # reused across decode steps so the FC1 store → FC2 load path stays
+    # L2-resident (see deepseek_mega_moe_discussion.md §三.2).
+    # ------------------------------------------------------------------
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_out",
+        mutates_args=("output", "output_sf"),
+        device_types="cuda")
+    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        output: torch.Tensor,
+        output_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        """FC1 gather grouped GEMM + SwiGLU fusion writing into caller buffers.
+
+        Identical compute to ``cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell``
+        but avoids the per-call ``torch.empty`` for the FP4 output and its
+        block-scale. Used by MegaMoE to keep FC1 → FC2 activations L2-resident.
+        """
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, scaling_vector_size, (weight.size(0), ))
+        inputs = [
+            input, [weight], input_scale, [weight_scale], [alpha],
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
+        ]
+
+        # Share the autotuner cache key with the allocating multi-B variant —
+        # the optimal tactic depends only on the GEMM shape, not on whether
+        # the output is caller-provided.
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+
+        runner.forward(inputs,
+                       tactic=best_tactic,
+                       output=output,
+                       output_sf=output_sf)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_out")
+    def _fake_swiglu_out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        output: torch.Tensor,
+        output_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        return None
+
+    # ------------------------------------------------------------------
+    # MegaMoE Linear1-only regression runner
+    # ------------------------------------------------------------------
+    # This runner invokes BlockScaledMegaMoeFusionKernel through a distinct
+    # torch op with the same signature as the standalone FC1 grouped GEMM
+    # SwiGLU op. The Linear1-only test keeps the shared FC1 path covered
+    # independently from the fused FC2/combine path.
+    class Sm100BlockScaledMegaMoeFusionRunner(
+            Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner):
+        kernel_class = BlockScaledMegaMoeFusionKernel
+        # Independent caches so the FC1 runner and the mega runner do not
+        # share compiled-kernel state.
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+    # ------------------------------------------------------------------
+    # MegaMoE fused FC1+SwiGLU+FC2+combine runner
+    # ------------------------------------------------------------------
+    # Instantiates the kernel with ``enable_linear2=True`` and invokes
+    # ``wrapper_fused`` so a single kernel launch performs FC1, SwiGLU,
+    # the HBM pool hand-off, FC2, and the combine scatter. Used by the
+    # fused ``cute_dsl_nvfp4_mega_moe_blackwell`` op.
+    #
+    # Inherits ``__init__`` / ``unique_id`` from the L1-mode mega runner
+    # so the tile geometry + expert bookkeeping args stay symmetric; the
+    # Linear2 weight shape is inferred per-call from ``inputs[5]``.
+    class Sm100BlockScaledMegaMoeBlackwellRunner(
+            Sm100BlockScaledMegaMoeFusionRunner):
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        def forward(self, inputs: List, tactic: Optional[tuple],
+                    **kwargs) -> None:
+            """Fused FC1+FC2+combine forward. Writes into ``inputs[18]``.
+
+            Input layout:
+                0:  a (FP4, orig_m × hidden_packed)
+                1:  b_l1_list (FP4 weights, per-group)
+                2:  a_sf (UE8M0, orig_m × scale_k)
+                3:  b_sf_l1_list (UE8M0)
+                4:  alpha_l1_list (FP32)
+                5:  b_l2_list (FP4 FC2 weights)
+                6:  b_sf_l2_list (UE8M0)
+                7:  alpha_l2_list (FP32)
+                8:  tile_idx_to_group_idx (Int32, num_tiles)
+                9:  tile_idx_to_mn_limit (Int32, num_tiles)
+                10: token_id_mapping (Int32, m; FC1 gather)
+                11: output_permuted_idx_to_expanded_idx (Int32, m; FC2 combine)
+                12: num_non_exiting_tiles (Int32, 1)
+                13: global_sf (FP32, 1)
+                14: token_final_scales (FP32, orig_m × topk)
+                15: pool_tensor (FP4 activation hand-off, m × interm_size/2)
+                16: pool_sf_tensor (UE8M0, m*interm_size/SV)
+                17: l2_arrival_mask (Int64/uint64 bitmask, num_tiles)
+                18: output (BF16, orig_m × hidden, or rank-strided combine buffer)
+            """
+            (
+                a,
+                b_l1_list,
+                a_sf,
+                b_sf_l1_list,
+                alpha_l1_list,
+                b_l2_list,
+                b_sf_l2_list,
+                alpha_l2_list,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                token_id_mapping,
+                output_permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                global_sf,
+                token_final_scales,
+                pool_tensor,
+                pool_sf_tensor,
+                l2_arrival_mask,
+                output,
+                *optional_monolithic,
+            ) = inputs
+            monolithic_direct_topk_input = a
+            monolithic_direct_topk_input_scale = a_sf
+            monolithic_direct_topk_idx = l2_arrival_mask
+            monolithic_direct_topk_scales = token_final_scales
+            monolithic_direct_topk_token_counts = num_non_exiting_tiles
+            monolithic_direct_topk_local_input = a
+            monolithic_direct_topk_local_input_scale = a_sf
+            monolithic_direct_topk_local_idx = l2_arrival_mask
+            monolithic_direct_topk_local_scales = token_final_scales
+            if optional_monolithic:
+                if len(optional_monolithic) == 2:
+                    monolithic_final_output, monolithic_control = optional_monolithic
+                elif len(optional_monolithic) == 7:
+                    (
+                        monolithic_final_output,
+                        monolithic_control,
+                        monolithic_direct_topk_input,
+                        monolithic_direct_topk_input_scale,
+                        monolithic_direct_topk_idx,
+                        monolithic_direct_topk_scales,
+                        monolithic_direct_topk_token_counts,
+                    ) = optional_monolithic
+                elif len(optional_monolithic) == 11:
+                    (
+                        monolithic_final_output,
+                        monolithic_control,
+                        monolithic_direct_topk_input,
+                        monolithic_direct_topk_input_scale,
+                        monolithic_direct_topk_idx,
+                        monolithic_direct_topk_scales,
+                        monolithic_direct_topk_token_counts,
+                        monolithic_direct_topk_local_input,
+                        monolithic_direct_topk_local_input_scale,
+                        monolithic_direct_topk_local_idx,
+                        monolithic_direct_topk_local_scales,
+                    ) = optional_monolithic
+                else:
+                    raise ValueError(
+                        "MegaMoE monolithic inputs must be "
+                        "(monolithic_final_output, monolithic_control), "
+                        "that pair plus direct-topk tensors, or those tensors "
+                        "plus local direct-topk staging tensors")
+            else:
+                monolithic_final_output = output
+                monolithic_control = l2_arrival_mask
+
+            b_tensor_l_sizes = tuple(bi.size(0) for bi in b_l1_list)
+            b_tensor_l_sizes_l2 = tuple(bi.size(0) for bi in b_l2_list)
+            direct_combine_output = bool(
+                kwargs.get("direct_combine_output", False))
+            direct_combine_atomic_output = bool(
+                kwargs.get("direct_combine_atomic_output", False))
+            direct_combine_token_major_output = bool(
+                kwargs.get("direct_combine_token_major_output", False))
+            if direct_combine_atomic_output and not direct_combine_output:
+                raise ValueError(
+                    "direct_combine_atomic_output requires direct_combine_output"
+                )
+            if direct_combine_token_major_output and not direct_combine_output:
+                raise ValueError(
+                    "direct_combine_token_major_output requires direct_combine_output"
+                )
+            combine_output_ep_size = int(kwargs.get("combine_output_ep_size",
+                                                    1))
+            combine_output_top_k = int(kwargs.get("combine_output_top_k", 1))
+            combine_output_max_num_tokens_per_rank = int(
+                kwargs.get("combine_output_max_num_tokens_per_rank", 0))
+            combine_output_rank_stride_elements = int(
+                kwargs.get("combine_output_rank_stride_elements", 0))
+            monolithic_reduce_output = bool(
+                kwargs.get("monolithic_reduce_output", False))
+            monolithic_control_rank_stride_elements = int(
+                kwargs.get("monolithic_control_rank_stride_elements", 0))
+            monolithic_local_rank = int(kwargs.get("monolithic_local_rank", 0))
+            monolithic_local_tokens = int(
+                kwargs.get("monolithic_local_tokens", 0))
+            monolithic_direct_topk_materialize = bool(
+                kwargs.get("monolithic_direct_topk_materialize", False))
+            monolithic_direct_topk_stage_inputs = bool(
+                kwargs.get("monolithic_direct_topk_stage_inputs", False))
+            monolithic_direct_topk_input_rank_stride_elements = int(
+                kwargs.get("monolithic_direct_topk_input_rank_stride_elements",
+                           0))
+            monolithic_direct_topk_input_scale_rank_stride_elements = int(
+                kwargs.get(
+                    "monolithic_direct_topk_input_scale_rank_stride_elements",
+                    0))
+            monolithic_direct_topk_idx_rank_stride_elements = int(
+                kwargs.get("monolithic_direct_topk_idx_rank_stride_elements",
+                           0))
+            monolithic_direct_topk_scales_rank_stride_elements = int(
+                kwargs.get("monolithic_direct_topk_scales_rank_stride_elements",
+                           0))
+            monolithic_direct_topk_local_expert_offset = int(
+                kwargs.get("monolithic_direct_topk_local_expert_offset",
+                           self.local_expert_offset))
+            monolithic_direct_topk_num_local_experts = int(
+                kwargs.get("monolithic_direct_topk_num_local_experts",
+                           self.num_local_experts))
+            if monolithic_control_rank_stride_elements == 0:
+                monolithic_control_rank_stride_elements = (
+                    monolithic_control.stride(0)
+                    if monolithic_control.dim() >= 2 else 64)
+
+            b_l1_0 = b_l1_list[0]
+            b_l2_0 = b_l2_list[0]
+
+            assert a.dtype == torch.float4_e2m1fn_x2
+            assert a.dim() == 2
+            assert b_l1_0.dtype == torch.float4_e2m1fn_x2
+            assert b_l1_0.dim() == 3
+            assert b_l2_0.dtype == torch.float4_e2m1fn_x2
+            assert b_l2_0.dim() == 3
+            assert a_sf.dtype == torch.uint8
+            assert b_sf_l1_list[0].dtype == torch.uint8
+            assert b_sf_l2_list[0].dtype == torch.uint8
+            assert alpha_l1_list[0].dtype == torch.float32
+            assert alpha_l2_list[0].dtype == torch.float32
+            assert pool_tensor.dtype == torch.float4_e2m1fn_x2
+            assert pool_sf_tensor.dtype == torch.uint8
+            assert l2_arrival_mask.dtype == torch.int64
+            assert output.dtype == torch.bfloat16
+            assert token_final_scales.dtype == torch.float32
+            if monolithic_reduce_output:
+                assert direct_combine_output
+                assert monolithic_final_output.dtype == torch.bfloat16
+                assert monolithic_final_output.dim() == 2
+                assert monolithic_final_output.stride(1) == 1
+                assert monolithic_control.dtype == torch.int64
+                assert monolithic_control.dim() == 2
+                assert monolithic_control.size(0) >= combine_output_ep_size
+                assert monolithic_control.size(1) >= 64
+                assert monolithic_control.stride(1) == 1
+                if monolithic_control_rank_stride_elements == 0:
+                    monolithic_control_rank_stride_elements = monolithic_control.stride(
+                        0)
+                assert monolithic_control.stride(
+                    0) == monolithic_control_rank_stride_elements
+            if monolithic_direct_topk_materialize:
+                assert monolithic_reduce_output
+                assert monolithic_direct_topk_input.dtype == torch.uint8
+                assert monolithic_direct_topk_input.dim() == 3
+                assert monolithic_direct_topk_input_scale.dtype == torch.uint8
+                assert monolithic_direct_topk_input_scale.dim() == 3
+                assert monolithic_direct_topk_idx.dtype == torch.int64
+                assert monolithic_direct_topk_idx.dim() == 3
+                assert monolithic_direct_topk_scales.dtype == torch.float32
+                assert monolithic_direct_topk_scales.dim() == 3
+                if not monolithic_direct_topk_stage_inputs:
+                    assert monolithic_direct_topk_token_counts is not None
+                    assert monolithic_direct_topk_token_counts.dtype == torch.int32
+                    assert monolithic_direct_topk_token_counts.dim() == 1
+                assert monolithic_direct_topk_input.size(
+                    0) >= combine_output_ep_size
+                assert monolithic_direct_topk_input_scale.size(
+                    0) >= combine_output_ep_size
+                assert monolithic_direct_topk_idx.size(
+                    0) >= combine_output_ep_size
+                assert monolithic_direct_topk_scales.size(
+                    0) >= combine_output_ep_size
+                assert monolithic_direct_topk_idx.size(
+                    2) == combine_output_top_k
+                assert monolithic_direct_topk_scales.size(
+                    2) == combine_output_top_k
+                if not monolithic_direct_topk_stage_inputs:
+                    assert monolithic_direct_topk_token_counts.numel(
+                    ) >= combine_output_ep_size
+                if monolithic_direct_topk_stage_inputs:
+                    assert monolithic_direct_topk_local_input.dtype == torch.uint8
+                    assert monolithic_direct_topk_local_input.dim() == 2
+                    assert monolithic_direct_topk_local_input_scale.dtype == torch.uint8
+                    assert monolithic_direct_topk_local_input_scale.dim() == 2
+                    assert monolithic_direct_topk_local_idx.dtype == torch.int64
+                    assert monolithic_direct_topk_local_idx.dim() == 2
+                    assert monolithic_direct_topk_local_scales.dtype == torch.float32
+                    assert monolithic_direct_topk_local_scales.dim() == 2
+
+            # Shapes. FC1: (orig_m, k) x (n_l1, k) -> (m, interm_size=n_l1/2)
+            # after SwiGLU. FC2: (m, interm_size) x (n_l2, interm_size) ->
+            # (orig_m, n_l2) combined.
+            orig_m, k = a.size(0), a.size(1) * 2
+            m = token_id_mapping.size(0)
+            n_l1 = b_l1_0.size(1)
+            n_l2 = b_l2_0.size(1)
+            interm_size = n_l1 // 2
+            scale_k = k // self.scaling_vector_size
+
+            assert m % self.tile_size == 0
+            assert k % (self.scaling_vector_size * 4) == 0
+            assert n_l1 % (self.scaling_vector_size * 4 * 2) == 0
+            assert n_l2 % (self.scaling_vector_size * 4) == 0
+            assert b_l1_0.size(2) * 2 == k
+            assert b_l2_0.size(2) * 2 == interm_size
+            assert a_sf.size() == (orig_m, scale_k)
+            if monolithic_direct_topk_materialize:
+                assert monolithic_direct_topk_input.size(2) * 2 == k
+                assert monolithic_direct_topk_input_scale.size(2) == scale_k
+                assert monolithic_direct_topk_input.size(
+                    1) >= combine_output_max_num_tokens_per_rank
+                assert monolithic_direct_topk_input_scale.size(
+                    1) >= combine_output_max_num_tokens_per_rank
+                assert monolithic_direct_topk_idx.size(
+                    1) >= combine_output_max_num_tokens_per_rank
+                assert monolithic_direct_topk_scales.size(
+                    1) >= combine_output_max_num_tokens_per_rank
+                if monolithic_direct_topk_stage_inputs:
+                    assert monolithic_direct_topk_local_input.size(
+                        0) >= monolithic_local_tokens
+                    assert monolithic_direct_topk_local_input.size(1) * 2 == k
+                    assert monolithic_direct_topk_local_input_scale.size(
+                        0) >= monolithic_local_tokens
+                    assert monolithic_direct_topk_local_input_scale.size(
+                        1) == scale_k
+                    assert monolithic_direct_topk_local_idx.size(
+                        0) >= monolithic_local_tokens
+                    assert monolithic_direct_topk_local_idx.size(
+                        1) == combine_output_top_k
+                    assert monolithic_direct_topk_local_scales.size(
+                        0) >= monolithic_local_tokens
+                    assert monolithic_direct_topk_local_scales.size(
+                        1) == combine_output_top_k
+            assert pool_tensor.size() == (m, interm_size // 2), (
+                f"pool_tensor shape {tuple(pool_tensor.size())} != expected "
+                f"({m}, {interm_size // 2})")
+            assert pool_sf_tensor.numel(
+            ) == m * interm_size // self.scaling_vector_size
+            if direct_combine_output:
+                assert combine_output_ep_size > 0
+                assert combine_output_top_k > 0
+                assert combine_output_max_num_tokens_per_rank > 0
+                required_output_elements_per_rank = (
+                    combine_output_top_k *
+                    combine_output_max_num_tokens_per_rank * n_l2)
+                assert output.dim() == 2
+                assert output.size(0) >= combine_output_ep_size
+                assert output.size(1) >= required_output_elements_per_rank, (
+                    f"direct combine output row has {output.size(1)} elements, "
+                    f"need {required_output_elements_per_rank}")
+                assert output.stride(1) == 1
+                if combine_output_rank_stride_elements == 0:
+                    combine_output_rank_stride_elements = output.stride(0)
+                assert output.stride(0) == combine_output_rank_stride_elements
+                if monolithic_reduce_output:
+                    assert 0 <= monolithic_local_rank < combine_output_ep_size
+                    assert 0 <= monolithic_local_tokens <= combine_output_max_num_tokens_per_rank
+                    assert monolithic_final_output.size(
+                        0) >= monolithic_local_tokens
+                    assert monolithic_final_output.size(1) == n_l2
+            else:
+                assert output.size() == (orig_m, n_l2), (
+                    f"output shape {tuple(output.size())} != ({orig_m}, {n_l2})"
+                )
+            assert token_final_scales.size() == (orig_m, self.top_k)
+
+            num_tiles = m // self.tile_size
+            assert l2_arrival_mask.size() == (num_tiles, )
+            assert tile_idx_to_group_idx.dtype == torch.int32
+            assert tile_idx_to_group_idx.size() == (num_tiles, )
+            assert tile_idx_to_mn_limit.dtype == torch.int32
+            assert tile_idx_to_mn_limit.size() == (num_tiles, )
+            assert token_id_mapping.dtype == torch.int32
+            assert token_id_mapping.size() == (m, )
+            assert output_permuted_idx_to_expanded_idx.dtype == torch.int32
+            assert output_permuted_idx_to_expanded_idx.size() == (m, )
+            assert num_non_exiting_tiles.dtype == torch.int32
+            assert num_non_exiting_tiles.numel() == 1
+            assert global_sf.dtype == torch.float32
+            assert global_sf.numel() == 1
+
+            # Pointers.
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_byte_ptr = make_ptr(cutlass.Uint8,
+                                  a.data_ptr(),
+                                  cute.AddressSpace.gmem,
+                                  assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            pool_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                pool_tensor.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=32)
+            pool_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                   pool_sf_tensor.data_ptr(),
+                                   cute.AddressSpace.gmem,
+                                   assumed_align=16)
+            l2_arrival_mask_ptr = make_ptr(cutlass.Uint64,
+                                           l2_arrival_mask.data_ptr(),
+                                           cute.AddressSpace.gmem,
+                                           assumed_align=8)
+            out_ptr = make_ptr(cutlass.BFloat16,
+                               output.data_ptr(),
+                               cute.AddressSpace.gmem,
+                               assumed_align=16)
+            monolithic_final_output_ptr = make_ptr(
+                cutlass.BFloat16,
+                monolithic_final_output.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16)
+            monolithic_control_ptr = make_ptr(cutlass.Uint64,
+                                              monolithic_control.data_ptr(),
+                                              cute.AddressSpace.gmem,
+                                              assumed_align=8)
+            tile_idx_to_group_idx_ptr = make_ptr(
+                cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                cute.AddressSpace.gmem)
+            tile_idx_to_mn_limit_ptr = make_ptr(cutlass.Int32,
+                                                tile_idx_to_mn_limit.data_ptr(),
+                                                cute.AddressSpace.gmem)
+            token_id_mapping_ptr = make_ptr(cutlass.Int32,
+                                            token_id_mapping.data_ptr(),
+                                            cute.AddressSpace.gmem)
+            output_permuted_idx_ptr = make_ptr(
+                cutlass.Int32, output_permuted_idx_to_expanded_idx.data_ptr(),
+                cute.AddressSpace.gmem)
+            num_non_exiting_tiles_ptr = make_ptr(
+                cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                cute.AddressSpace.gmem)
+            global_sf_ptr = make_ptr(cutlass.Float32, global_sf.data_ptr(),
+                                     cute.AddressSpace.gmem)
+            token_final_scales_ptr = make_ptr(cutlass.Float32,
+                                              token_final_scales.data_ptr(),
+                                              cute.AddressSpace.gmem)
+            if monolithic_direct_topk_materialize:
+                monolithic_direct_topk_input_ptr = make_ptr(
+                    cutlass.Uint8,
+                    monolithic_direct_topk_input.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=32)
+                monolithic_direct_topk_input_scale_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    monolithic_direct_topk_input_scale.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16)
+                monolithic_direct_topk_idx_ptr = make_ptr(
+                    cutlass.Int64,
+                    monolithic_direct_topk_idx.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=8)
+                monolithic_direct_topk_scales_ptr = make_ptr(
+                    cutlass.Float32,
+                    monolithic_direct_topk_scales.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4)
+                if monolithic_direct_topk_token_counts is not None:
+                    monolithic_direct_topk_token_counts_ptr = make_ptr(
+                        cutlass.Int32,
+                        monolithic_direct_topk_token_counts.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4)
+                else:
+                    monolithic_direct_topk_token_counts_ptr = make_ptr(
+                        cutlass.Int32,
+                        monolithic_direct_topk_idx.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4)
+                if monolithic_direct_topk_stage_inputs:
+                    monolithic_direct_topk_local_input_ptr = make_ptr(
+                        cutlass.Uint8,
+                        monolithic_direct_topk_local_input.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=32)
+                    monolithic_direct_topk_local_input_scale_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        monolithic_direct_topk_local_input_scale.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16)
+                    monolithic_direct_topk_local_idx_ptr = make_ptr(
+                        cutlass.Int64,
+                        monolithic_direct_topk_local_idx.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=8)
+                    monolithic_direct_topk_local_scales_ptr = make_ptr(
+                        cutlass.Float32,
+                        monolithic_direct_topk_local_scales.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4)
+                else:
+                    monolithic_direct_topk_local_input_ptr = monolithic_direct_topk_input_ptr
+                    monolithic_direct_topk_local_input_scale_ptr = monolithic_direct_topk_input_scale_ptr
+                    monolithic_direct_topk_local_idx_ptr = monolithic_direct_topk_idx_ptr
+                    monolithic_direct_topk_local_scales_ptr = monolithic_direct_topk_scales_ptr
+            else:
+                monolithic_direct_topk_input_ptr = a_byte_ptr
+                monolithic_direct_topk_input_scale_ptr = a_sf_ptr
+                monolithic_direct_topk_idx_ptr = l2_arrival_mask_ptr
+                monolithic_direct_topk_scales_ptr = token_final_scales_ptr
+                monolithic_direct_topk_token_counts_ptr = num_non_exiting_tiles_ptr
+                monolithic_direct_topk_local_input_ptr = a_byte_ptr
+                monolithic_direct_topk_local_input_scale_ptr = a_sf_ptr
+                monolithic_direct_topk_local_idx_ptr = l2_arrival_mask_ptr
+                monolithic_direct_topk_local_scales_ptr = token_final_scales_ptr
+
+            b_l1_ptr = tuple(
+                make_ptr(cutlass.Float4E2M1FN,
+                         bi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32) for bi in b_l1_list)
+            b_sf_l1_ptr = tuple(
+                make_ptr(cutlass.Float8E4M3FN,
+                         bsfi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16) for bsfi in b_sf_l1_list)
+            alpha_l1_ptr = tuple(
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
+                for ai in alpha_l1_list)
+            b_l2_ptr = tuple(
+                make_ptr(cutlass.Float4E2M1FN,
+                         bi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32) for bi in b_l2_list)
+            b_sf_l2_ptr = tuple(
+                make_ptr(cutlass.Float8E4M3FN,
+                         bsfi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16) for bsfi in b_sf_l2_list)
+            alpha_l2_ptr = tuple(
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
+                for ai in alpha_l2_list)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
+            else:
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+            # FC2 shares the tile M with FC1 (``tile_size``); FC2 N defaults
+            # to 128 as a safe starting tactic. A dedicated L2 autotune
+            # dimension can be added once the fused path is shipped.
+            mma_tiler_mn_l2 = (self.tile_size, 128)
+
+            cache_key = (
+                self.scaling_vector_size, self.tile_size, self.top_k,
+                mma_tiler_mn, mma_tiler_mn_l2, cluster_shape_mn, raster_along_m,
+                b_tensor_l_sizes, b_tensor_l_sizes_l2, n_l2,
+                direct_combine_output, direct_combine_atomic_output,
+                direct_combine_token_major_output, combine_output_ep_size,
+                combine_output_top_k, combine_output_max_num_tokens_per_rank,
+                combine_output_rank_stride_elements, monolithic_reduce_output,
+                monolithic_control_rank_stride_elements, monolithic_local_rank,
+                monolithic_direct_topk_materialize,
+                monolithic_direct_topk_input_rank_stride_elements,
+                monolithic_direct_topk_input_scale_rank_stride_elements,
+                monolithic_direct_topk_idx_rank_stride_elements,
+                monolithic_direct_topk_scales_rank_stride_elements,
+                monolithic_direct_topk_stage_inputs,
+                monolithic_direct_topk_local_expert_offset,
+                monolithic_direct_topk_num_local_experts)
+
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    vectorized_f32=True,
+                    topk=self.top_k,
+                    raster_along_m=raster_along_m,
+                    b_tensor_l_sizes=b_tensor_l_sizes,
+                    enable_linear2=True,
+                    b_tensor_l_sizes_l2=b_tensor_l_sizes_l2,
+                    mma_tiler_mn_l2=mma_tiler_mn_l2,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compile_args = [
+                    a_ptr,
+                    a_byte_ptr,
+                    b_l1_ptr,
+                    a_sf_ptr,
+                    b_sf_l1_ptr,
+                    alpha_l1_ptr,
+                    b_l2_ptr,
+                    b_sf_l2_ptr,
+                    alpha_l2_ptr,
+                    pool_ptr,
+                    pool_sf_ptr,
+                    l2_arrival_mask_ptr,
+                    out_ptr,
+                    monolithic_final_output_ptr,
+                    monolithic_control_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    token_id_mapping_ptr,
+                    num_non_exiting_tiles_ptr,
+                    output_permuted_idx_ptr,
+                    token_final_scales_ptr,
+                    global_sf_ptr,
+                    monolithic_direct_topk_input_ptr,
+                    monolithic_direct_topk_input_scale_ptr,
+                    monolithic_direct_topk_idx_ptr,
+                    monolithic_direct_topk_scales_ptr,
+                    monolithic_direct_topk_token_counts_ptr,
+                    monolithic_direct_topk_local_input_ptr,
+                    monolithic_direct_topk_local_input_scale_ptr,
+                    monolithic_direct_topk_local_idx_ptr,
+                    monolithic_direct_topk_local_scales_ptr,
+                    orig_m,
+                    m,
+                    n_l1,
+                    n_l2,
+                    k,
+                    monolithic_local_tokens,
+                ]
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_fused,
+                    *compile_args,
+                    tile_size=self.tile_size,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    direct_combine_output=direct_combine_output,
+                    direct_combine_atomic_output=direct_combine_atomic_output,
+                    direct_combine_token_major_output=
+                    direct_combine_token_major_output,
+                    combine_output_ep_size=combine_output_ep_size,
+                    combine_output_top_k=combine_output_top_k,
+                    combine_output_max_num_tokens_per_rank=(
+                        combine_output_max_num_tokens_per_rank),
+                    combine_output_rank_stride_elements=
+                    combine_output_rank_stride_elements,
+                    combine_output_hidden_size=n_l2,
+                    monolithic_reduce_output=monolithic_reduce_output,
+                    monolithic_control_rank_stride_elements=(
+                        monolithic_control_rank_stride_elements),
+                    monolithic_local_rank=monolithic_local_rank,
+                    monolithic_direct_topk_materialize=(
+                        monolithic_direct_topk_materialize),
+                    monolithic_direct_topk_stage_inputs=
+                    monolithic_direct_topk_stage_inputs,
+                    monolithic_direct_topk_input_rank_stride_elements=(
+                        monolithic_direct_topk_input_rank_stride_elements),
+                    monolithic_direct_topk_input_scale_rank_stride_elements=(
+                        monolithic_direct_topk_input_scale_rank_stride_elements
+                    ),
+                    monolithic_direct_topk_idx_rank_stride_elements=(
+                        monolithic_direct_topk_idx_rank_stride_elements),
+                    monolithic_direct_topk_scales_rank_stride_elements=(
+                        monolithic_direct_topk_scales_rank_stride_elements),
+                    monolithic_direct_topk_local_expert_offset=(
+                        monolithic_direct_topk_local_expert_offset),
+                    monolithic_direct_topk_num_local_experts=(
+                        monolithic_direct_topk_num_local_experts),
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            exec_args = [
+                a_ptr,
+                a_byte_ptr,
+                b_l1_ptr,
+                a_sf_ptr,
+                b_sf_l1_ptr,
+                alpha_l1_ptr,
+                b_l2_ptr,
+                b_sf_l2_ptr,
+                alpha_l2_ptr,
+                pool_ptr,
+                pool_sf_ptr,
+                l2_arrival_mask_ptr,
+                out_ptr,
+                monolithic_final_output_ptr,
+                monolithic_control_ptr,
+                tile_idx_to_group_idx_ptr,
+                tile_idx_to_mn_limit_ptr,
+                token_id_mapping_ptr,
+                num_non_exiting_tiles_ptr,
+                output_permuted_idx_ptr,
+                token_final_scales_ptr,
+                global_sf_ptr,
+                monolithic_direct_topk_input_ptr,
+                monolithic_direct_topk_input_scale_ptr,
+                monolithic_direct_topk_idx_ptr,
+                monolithic_direct_topk_scales_ptr,
+                monolithic_direct_topk_token_counts_ptr,
+                monolithic_direct_topk_local_input_ptr,
+                monolithic_direct_topk_local_input_scale_ptr,
+                monolithic_direct_topk_local_idx_ptr,
+                monolithic_direct_topk_local_scales_ptr,
+                orig_m,
+                m,
+                n_l1,
+                n_l2,
+                k,
+                monolithic_local_tokens,
+            ]
+
+            compiled_gemm(*exec_args, stream=stream)
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_mega_moe_linear1_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_nvfp4_mega_moe_linear1_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """MegaMoE kernel invoked in Linear1-only mode.
+
+        Thin wrapper around ``BlockScaledMegaMoeFusionKernel`` with the same
+        signature as ``cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell``.
+        This op intentionally exercises the Linear1 path without enabling
+        Linear2 so FC1 behavior stays covered independently from the fused
+        FC2/combine path.
+        """
+        tuner = AutoTuner.get()
+        b_tensor_l_sizes = (weight.size(0), )
+        runner = Sm100BlockScaledMegaMoeFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, scaling_vector_size, b_tensor_l_sizes)
+        inputs = [
+            input, [weight], input_scale, [weight_scale], [alpha],
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
+        ]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_mega_moe_linear1_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        return runner.forward(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_mega_moe_linear1_blackwell")
+    def _fake_mega_linear1(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m = permuted_idx_to_expanded_idx.size(0)
+        n = weight.size(1)
+        interm_size = n // 2
+        output = torch.empty(m,
+                             interm_size // 2,
+                             dtype=input.dtype,
+                             device=input.device)
+        output_scale = torch.empty(m * interm_size // scaling_vector_size,
+                                   dtype=input_scale.dtype,
+                                   device=input_scale.device)
+        return output, output_scale
+
+    # ------------------------------------------------------------------
+    # MegaMoE fused FC1+FC2 op
+    # ------------------------------------------------------------------
+    # This is the public fused-kernel entry point used by ``fused_moe_mega.py``.
+    # The op signature keeps FC1 and FC2 operands separated by suffix
+    # (``weight_l1`` / ``weight_l2`` etc.) and allocates transient pool buffers
+    # for the FC1 -> FC2 hand-off before invoking the fused kernel body.
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mega_moe_m5_build_direct_input_route_from_ranked_topk",
+        mutates_args=(
+            "direct_input",
+            "direct_input_sf",
+            "expert_route_offsets",
+            "expert_route_base_offsets",
+            "token_id_mapping",
+            "output_mapping",
+            "output_scales",
+            "tile_idx_to_expert_idx",
+            "tile_idx_to_mn_limit",
+            "num_non_exiting_tiles",
+        ),
+        device_types="cuda")
+    def cute_dsl_mega_moe_m5_build_direct_input_route_from_ranked_topk(
+        input: torch.Tensor,
+        input_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scales: torch.Tensor,
+        token_counts: torch.Tensor,
+        direct_input: torch.Tensor,
+        direct_input_sf: torch.Tensor,
+        expert_route_offsets: torch.Tensor,
+        expert_route_base_offsets: torch.Tensor,
+        token_id_mapping: torch.Tensor,
+        output_mapping: torch.Tensor,
+        output_scales: torch.Tensor,
+        tile_idx_to_expert_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        local_rank: int,
+        tile_tokens_dim: int,
+        combine_layout_rows: int,
+        direct_atomic_output: bool = False,
+        direct_token_major_output: bool = False,
+    ) -> None:
+        """CuTe DSL direct-input route builder for MegaMoE M5."""
+        build_direct_input_route_from_ranked_topk(
+            input,
+            input_sf,
+            topk_idx,
+            topk_scales,
+            token_counts,
+            direct_input,
+            direct_input_sf,
+            expert_route_offsets,
+            expert_route_base_offsets,
+            token_id_mapping,
+            output_mapping,
+            output_scales,
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            num_non_exiting_tiles,
+            local_rank,
+            tile_tokens_dim,
+            combine_layout_rows,
+            direct_atomic_output,
+            direct_token_major_output,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_mega_moe_m5_build_direct_input_route_from_ranked_topk"
+    )
+    def _fake_cute_dsl_mega_moe_m5_build_direct_input_route_from_ranked_topk(
+        input: torch.Tensor,
+        input_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scales: torch.Tensor,
+        token_counts: torch.Tensor,
+        direct_input: torch.Tensor,
+        direct_input_sf: torch.Tensor,
+        expert_route_offsets: torch.Tensor,
+        expert_route_base_offsets: torch.Tensor,
+        token_id_mapping: torch.Tensor,
+        output_mapping: torch.Tensor,
+        output_scales: torch.Tensor,
+        tile_idx_to_expert_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        local_rank: int,
+        tile_tokens_dim: int,
+        combine_layout_rows: int,
+        direct_atomic_output: bool = False,
+        direct_token_major_output: bool = False,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op("trtllm::cute_dsl_mega_moe_stage_dispatch_inputs",
+                             mutates_args=(
+                                 "input_buffer",
+                                 "input_sf_buffer",
+                                 "topk_idx_buffer",
+                                 "topk_scales_buffer",
+                             ),
+                             device_types="cuda")
+    def cute_dsl_mega_moe_stage_dispatch_inputs(
+        input: torch.Tensor,
+        input_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scales: torch.Tensor,
+        input_buffer: torch.Tensor,
+        input_sf_buffer: torch.Tensor,
+        topk_idx_buffer: torch.Tensor,
+        topk_scales_buffer: torch.Tensor,
+    ) -> None:
+        """CuTe DSL dispatch staging for MegaMoE direct-input path."""
+        stage_dispatch_inputs_u64(
+            input,
+            input_sf,
+            topk_idx,
+            topk_scales,
+            input_buffer,
+            input_sf_buffer,
+            topk_idx_buffer,
+            topk_scales_buffer,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_mega_moe_stage_dispatch_inputs")
+    def _fake_cute_dsl_mega_moe_stage_dispatch_inputs(
+        input: torch.Tensor,
+        input_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_scales: torch.Tensor,
+        input_buffer: torch.Tensor,
+        input_sf_buffer: torch.Tensor,
+        topk_idx_buffer: torch.Tensor,
+        topk_scales_buffer: torch.Tensor,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mega_moe_m6_reduce_combine_buffer_bf16_out",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_mega_moe_m6_reduce_combine_buffer_bf16_out(
+        combine_buffer: torch.Tensor,
+        output: torch.Tensor,
+        local_tokens: int,
+        token_major: bool = False,
+    ) -> None:
+        """CuTe DSL BF16 M6 reduce for MegaMoE direct combine buffers."""
+        reduce_m6_combine_buffer_bf16_out(
+            combine_buffer,
+            output,
+            local_tokens,
+            token_major=token_major,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_mega_moe_m6_reduce_combine_buffer_bf16_out")
+    def _fake_cute_dsl_mega_moe_m6_reduce_combine_buffer_bf16_out(
+        combine_buffer: torch.Tensor,
+        output: torch.Tensor,
+        local_tokens: int,
+        token_major: bool = False,
+    ) -> None:
+        return None
+
+    # ``tile_idx_to_mn_limit`` carries the per-tile row limit produced by
+    # ``moe_sort`` and is consumed by both the FC1 gather and FC2 combine paths.
+    def _run_cute_dsl_nvfp4_mega_moe_blackwell_with_pool(
+        input: torch.Tensor,
+        weight_l1: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        output_permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        pool_tensor: torch.Tensor,
+        pool_sf_tensor: torch.Tensor,
+        l2_arrival_mask: torch.Tensor,
+        output: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int,
+        direct_combine_output: bool,
+        direct_combine_atomic_output: bool,
+        direct_combine_token_major_output: bool,
+        combine_output_ep_size: int,
+        combine_output_top_k: int,
+        combine_output_max_num_tokens_per_rank: int,
+        combine_output_rank_stride_elements: int,
+        monolithic_final_output: Optional[torch.Tensor] = None,
+        monolithic_control: Optional[torch.Tensor] = None,
+        monolithic_reduce_output: bool = False,
+        monolithic_local_rank: int = 0,
+        monolithic_local_tokens: int = 0,
+        monolithic_epoch: int = 1,
+        monolithic_direct_topk_materialize: bool = False,
+        monolithic_direct_topk_input: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_input_scale: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_idx: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_scales: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_token_counts: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_stage_inputs: bool = False,
+        monolithic_direct_topk_local_input: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_scales: Optional[torch.Tensor] = None,
+    ) -> None:
+        l2_arrival_mask.zero_()
+        runner = Sm100BlockScaledMegaMoeBlackwellRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, scaling_vector_size, (weight_l1.size(0), ))
+        inputs = [
+            input,
+            [weight_l1],
+            input_scale,
+            [weight_scale_l1],
+            [alpha_l1],
+            [weight_l2],
+            [weight_scale_l2],
+            [alpha_l2],
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            output_permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            token_final_scales,
+            pool_tensor,
+            pool_sf_tensor,
+            l2_arrival_mask,
+            output,
+        ]
+        if monolithic_reduce_output:
+            if monolithic_final_output is None or monolithic_control is None:
+                raise ValueError(
+                    "monolithic MegaMoE reduce requires final output and control tensors"
+                )
+            inputs.extend([monolithic_final_output, monolithic_control])
+            if monolithic_direct_topk_materialize:
+                if (monolithic_direct_topk_input is None
+                        or monolithic_direct_topk_input_scale is None
+                        or monolithic_direct_topk_idx is None
+                        or monolithic_direct_topk_scales is None
+                        or (not monolithic_direct_topk_stage_inputs
+                            and monolithic_direct_topk_token_counts is None)):
+                    raise ValueError(
+                        "monolithic direct-topk MegaMoE reduce requires staged top-k tensors"
+                    )
+                inputs.extend([
+                    monolithic_direct_topk_input,
+                    monolithic_direct_topk_input_scale,
+                    monolithic_direct_topk_idx,
+                    monolithic_direct_topk_scales,
+                    monolithic_direct_topk_token_counts,
+                ])
+                if monolithic_direct_topk_stage_inputs:
+                    if (monolithic_direct_topk_local_input is None
+                            or monolithic_direct_topk_local_input_scale is None
+                            or monolithic_direct_topk_local_idx is None
+                            or monolithic_direct_topk_local_scales is None):
+                        raise ValueError(
+                            "monolithic staged direct-topk MegaMoE reduce requires local tensors"
+                        )
+                    inputs.extend([
+                        monolithic_direct_topk_local_input,
+                        monolithic_direct_topk_local_input_scale,
+                        monolithic_direct_topk_local_idx,
+                        monolithic_direct_topk_local_scales,
+                    ])
+        # Default tactic; autotune for the fused path is deferred (FC2
+        # shape adds an orthogonal tuning dimension to the existing FC1
+        # tactic search).
+        runner.forward(
+            inputs,
+            tactic=None,
+            direct_combine_output=direct_combine_output,
+            direct_combine_atomic_output=direct_combine_atomic_output,
+            direct_combine_token_major_output=direct_combine_token_major_output,
+            combine_output_ep_size=combine_output_ep_size,
+            combine_output_top_k=combine_output_top_k,
+            combine_output_max_num_tokens_per_rank=
+            combine_output_max_num_tokens_per_rank,
+            combine_output_rank_stride_elements=
+            combine_output_rank_stride_elements,
+            monolithic_reduce_output=monolithic_reduce_output,
+            monolithic_control_rank_stride_elements=(
+                monolithic_control.stride(0) if monolithic_control is not None
+                and monolithic_control.dim() >= 2 else 0),
+            monolithic_local_rank=monolithic_local_rank,
+            monolithic_local_tokens=monolithic_local_tokens,
+            monolithic_direct_topk_materialize=
+            monolithic_direct_topk_materialize,
+            monolithic_direct_topk_stage_inputs=
+            monolithic_direct_topk_stage_inputs,
+            monolithic_direct_topk_input_rank_stride_elements=(
+                monolithic_direct_topk_input.stride(0)
+                if monolithic_direct_topk_input is not None else 0),
+            monolithic_direct_topk_input_scale_rank_stride_elements=(
+                monolithic_direct_topk_input_scale.stride(0)
+                if monolithic_direct_topk_input_scale is not None else 0),
+            monolithic_direct_topk_idx_rank_stride_elements=(
+                monolithic_direct_topk_idx.stride(0)
+                if monolithic_direct_topk_idx is not None else 0),
+            monolithic_direct_topk_scales_rank_stride_elements=(
+                monolithic_direct_topk_scales.stride(0)
+                if monolithic_direct_topk_scales is not None else 0),
+            monolithic_direct_topk_local_expert_offset=local_expert_offset,
+            monolithic_direct_topk_num_local_experts=num_local_experts,
+        )
+
+    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_mega_moe_blackwell",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_nvfp4_mega_moe_blackwell(
+        input: torch.Tensor,
+        weight_l1: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        output_permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+        direct_combine_output: bool = False,
+        direct_combine_atomic_output: bool = False,
+        direct_combine_token_major_output: bool = False,
+        combine_output_ep_size: int = 1,
+        combine_output_top_k: int = 1,
+        combine_output_max_num_tokens_per_rank: int = 0,
+        combine_output_rank_stride_elements: int = 0,
+    ) -> None:
+        """Fused FC1+SwiGLU+FC2+combine MegaMoE op (in-place BF16 ``output``).
+
+        Delegates to :class:`Sm100BlockScaledMegaMoeBlackwellRunner`, which
+        instantiates the kernel with ``enable_linear2=True`` and invokes
+        ``wrapper_fused`` so FC1, SwiGLU, the HBM pool hand-off, FC2, and the
+        combine scatter run in a single kernel launch. The ``output`` buffer
+        must be pre-zeroed by the caller because the FC2 combine path writes
+        via atomic add.
+
+        The FC1 -> FC2 activation and scale-factor hand-off uses transient
+        per-call buffers allocated here.
+        """
+        m_permuted = permuted_idx_to_expanded_idx.size(0)
+        n_l1 = weight_l1.size(1)
+        interm_size = n_l1 // 2
+        pool_tensor = torch.empty(
+            m_permuted,
+            interm_size // 2,
+            dtype=input.dtype,
+            device=input.device,
+        )
+        pool_sf_tensor = torch.empty(
+            m_permuted * interm_size // scaling_vector_size,
+            dtype=input_scale.dtype,
+            device=input_scale.device,
+        )
+        l2_arrival_mask = torch.zeros(
+            m_permuted // tile_size,
+            dtype=torch.int64,
+            device=input.device,
+        )
+
+        _run_cute_dsl_nvfp4_mega_moe_blackwell_with_pool(
+            input,
+            weight_l1,
+            input_scale,
+            weight_scale_l1,
+            alpha_l1,
+            weight_l2,
+            weight_scale_l2,
+            alpha_l2,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            output_permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            token_final_scales,
+            pool_tensor,
+            pool_sf_tensor,
+            l2_arrival_mask,
+            output,
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            scaling_vector_size,
+            direct_combine_output,
+            direct_combine_atomic_output,
+            direct_combine_token_major_output,
+            combine_output_ep_size,
+            combine_output_top_k,
+            combine_output_max_num_tokens_per_rank,
+            combine_output_rank_stride_elements,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_nvfp4_mega_moe_blackwell")
+    def _fake_mega(
+        input: torch.Tensor,
+        weight_l1: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        output_permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+        direct_combine_output: bool = False,
+        direct_combine_atomic_output: bool = False,
+        direct_combine_token_major_output: bool = False,
+        combine_output_ep_size: int = 1,
+        combine_output_top_k: int = 1,
+        combine_output_max_num_tokens_per_rank: int = 0,
+        combine_output_rank_stride_elements: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_mega_moe_blackwell_monolithic_reduce",
+        mutates_args=("output", "monolithic_output", "monolithic_control"),
+        device_types="cuda")
+    def cute_dsl_nvfp4_mega_moe_blackwell_monolithic_reduce(
+        input: torch.Tensor,
+        weight_l1: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        output_permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output: torch.Tensor,
+        monolithic_output: torch.Tensor,
+        monolithic_control: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int,
+        combine_output_ep_size: int,
+        combine_output_top_k: int,
+        combine_output_max_num_tokens_per_rank: int,
+        combine_output_rank_stride_elements: int,
+        monolithic_local_rank: int,
+        monolithic_local_tokens: int,
+    ) -> None:
+        """Fused FC1+FC2 plus in-kernel direct-combine-buffer reduction.
+
+        ``output`` is the rank-strided direct combine buffer. The same CuTe DSL
+        kernel writes unique route rows to it, publishes M6 readiness through
+        ``monolithic_control``, waits for peer ranks, and reduces this rank's
+        top-k rows into ``monolithic_output`` before the launch returns.
+        """
+        m_permuted = permuted_idx_to_expanded_idx.size(0)
+        n_l1 = weight_l1.size(1)
+        interm_size = n_l1 // 2
+        pool_tensor = torch.empty(
+            m_permuted,
+            interm_size // 2,
+            dtype=input.dtype,
+            device=input.device,
+        )
+        pool_sf_tensor = torch.empty(
+            m_permuted * interm_size // scaling_vector_size,
+            dtype=input_scale.dtype,
+            device=input_scale.device,
+        )
+        l2_arrival_mask = torch.zeros(
+            m_permuted // tile_size,
+            dtype=torch.int64,
+            device=input.device,
+        )
+
+        _run_cute_dsl_nvfp4_mega_moe_blackwell_with_pool(
+            input,
+            weight_l1,
+            input_scale,
+            weight_scale_l1,
+            alpha_l1,
+            weight_l2,
+            weight_scale_l2,
+            alpha_l2,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            output_permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            token_final_scales,
+            pool_tensor,
+            pool_sf_tensor,
+            l2_arrival_mask,
+            output,
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            scaling_vector_size,
+            True,
+            False,
+            False,
+            combine_output_ep_size,
+            combine_output_top_k,
+            combine_output_max_num_tokens_per_rank,
+            combine_output_rank_stride_elements,
+            monolithic_final_output=monolithic_output,
+            monolithic_control=monolithic_control,
+            monolithic_reduce_output=True,
+            monolithic_local_rank=monolithic_local_rank,
+            monolithic_local_tokens=monolithic_local_tokens,
+        )
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_mega_moe_blackwell_monolithic_direct_topk_reduce",
+        mutates_args=(
+            "direct_topk_input",
+            "direct_topk_input_scale",
+            "direct_topk_idx",
+            "direct_topk_scales",
+            "output",
+            "monolithic_output",
+            "monolithic_control",
+            "monolithic_input_tensor",
+            "monolithic_input_scale",
+            "monolithic_tile_idx_to_group_idx",
+            "monolithic_tile_idx_to_mn_limit",
+            "monolithic_token_id_mapping",
+            "monolithic_output_mapping",
+            "monolithic_num_non_exiting_tiles",
+            "monolithic_token_final_scales",
+            "monolithic_pool_tensor",
+            "monolithic_pool_sf_tensor",
+            "monolithic_l2_arrival_mask",
+        ),
+        device_types="cuda")
+    def cute_dsl_nvfp4_mega_moe_blackwell_monolithic_direct_topk_reduce(
+        direct_topk_input: torch.Tensor,
+        direct_topk_input_scale: torch.Tensor,
+        direct_topk_idx: torch.Tensor,
+        direct_topk_scales: torch.Tensor,
+        direct_topk_token_counts: Optional[torch.Tensor],
+        weight_l1: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        global_sf: torch.Tensor,
+        output: torch.Tensor,
+        monolithic_output: torch.Tensor,
+        monolithic_control: torch.Tensor,
+        num_pool_tokens: int,
+        num_experts: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int,
+        combine_output_ep_size: int,
+        combine_output_top_k: int,
+        combine_output_max_num_tokens_per_rank: int,
+        combine_output_rank_stride_elements: int,
+        monolithic_local_rank: int,
+        monolithic_local_tokens: int,
+        monolithic_epoch: int = 1,
+        monolithic_direct_topk_stage_inputs: bool = False,
+        monolithic_direct_topk_materialize: bool = True,
+        monolithic_direct_topk_local_input: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_scales: Optional[torch.Tensor] = None,
+        monolithic_input_tensor: Optional[torch.Tensor] = None,
+        monolithic_input_scale: Optional[torch.Tensor] = None,
+        monolithic_tile_idx_to_group_idx: Optional[torch.Tensor] = None,
+        monolithic_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
+        monolithic_token_id_mapping: Optional[torch.Tensor] = None,
+        monolithic_output_mapping: Optional[torch.Tensor] = None,
+        monolithic_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+        monolithic_token_final_scales: Optional[torch.Tensor] = None,
+        monolithic_pool_tensor: Optional[torch.Tensor] = None,
+        monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
+        monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Monolithic MegaMoE direct top-k dispatch + FC1/FC2 + M6 reduce.
+
+        The kernel consumes all-rank staged top-k dispatch inputs directly and
+        materializes the FC1 scratch rows/routing metadata in-kernel before the
+        existing fused FC1/FC2/direct-combine-buffer/M6 body runs.
+        """
+        if num_pool_tokens <= 0 or num_pool_tokens % tile_size != 0:
+            raise ValueError(
+                "num_pool_tokens must be positive and tile-aligned")
+        hidden_packed = direct_topk_input.size(2)
+        hidden_size = hidden_packed * 2
+        scale_k = hidden_size // scaling_vector_size
+        if direct_topk_input_scale.size(2) != scale_k:
+            raise ValueError(
+                "direct_topk_input_scale has incompatible hidden scale size")
+        if monolithic_direct_topk_stage_inputs:
+            if (monolithic_direct_topk_local_input is None
+                    or monolithic_direct_topk_local_input_scale is None
+                    or monolithic_direct_topk_local_idx is None
+                    or monolithic_direct_topk_local_scales is None):
+                raise ValueError(
+                    "monolithic staged direct-topk reduce requires local staging tensors"
+                )
+            if monolithic_direct_topk_local_input.dtype != torch.uint8:
+                raise ValueError("local direct_topk_input must be uint8")
+            if monolithic_direct_topk_local_input_scale.dtype != torch.uint8:
+                raise ValueError("local direct_topk_input_scale must be uint8")
+            if monolithic_direct_topk_local_idx.dtype != torch.int64:
+                raise ValueError("local direct_topk_idx must be int64")
+            if monolithic_direct_topk_local_scales.dtype != torch.float32:
+                raise ValueError("local direct_topk_scales must be float32")
+            if monolithic_direct_topk_local_input.dim() != 2:
+                raise ValueError("local direct_topk_input must be rank-2")
+            if monolithic_direct_topk_local_input_scale.dim() != 2:
+                raise ValueError("local direct_topk_input_scale must be rank-2")
+            if monolithic_direct_topk_local_idx.dim() != 2:
+                raise ValueError("local direct_topk_idx must be rank-2")
+            if monolithic_direct_topk_local_scales.dim() != 2:
+                raise ValueError("local direct_topk_scales must be rank-2")
+            if monolithic_direct_topk_local_input.size(
+                    0) < monolithic_local_tokens:
+                raise ValueError("local direct_topk_input has too few tokens")
+            if monolithic_direct_topk_local_input_scale.size(
+                    0) < monolithic_local_tokens:
+                raise ValueError(
+                    "local direct_topk_input_scale has too few tokens")
+            if monolithic_direct_topk_local_idx.size(
+                    0) < monolithic_local_tokens:
+                raise ValueError("local direct_topk_idx has too few tokens")
+            if monolithic_direct_topk_local_scales.size(
+                    0) < monolithic_local_tokens:
+                raise ValueError("local direct_topk_scales has too few tokens")
+            if monolithic_direct_topk_local_input.size(1) != hidden_packed:
+                raise ValueError("local direct_topk_input hidden size mismatch")
+            if monolithic_direct_topk_local_input_scale.size(1) != scale_k:
+                raise ValueError(
+                    "local direct_topk_input_scale hidden size mismatch")
+            if monolithic_direct_topk_local_idx.size(1) != combine_output_top_k:
+                raise ValueError("local direct_topk_idx top-k mismatch")
+            if monolithic_direct_topk_local_scales.size(
+                    1) != combine_output_top_k:
+                raise ValueError("local direct_topk_scales top-k mismatch")
+        n_l1 = weight_l1.size(1)
+        interm_size = n_l1 // 2
+        input_shape = (num_pool_tokens, hidden_packed)
+        input_scale_shape = (num_pool_tokens, scale_k)
+        tile_count = num_pool_tokens // tile_size
+
+        def _use_scratch_tensor(
+            name: str,
+            tensor: Optional[torch.Tensor],
+            shape: tuple[int, ...],
+            dtype: torch.dtype,
+            device: torch.device,
+        ) -> torch.Tensor:
+            if tensor is None:
+                return torch.empty(*shape, dtype=dtype, device=device)
+            if tensor.dtype != dtype:
+                raise ValueError(f"{name} must be {dtype}")
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"{name} shape mismatch: {tuple(tensor.shape)} vs {shape}")
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            return tensor
+
+        input_tensor = _use_scratch_tensor(
+            "monolithic_input_tensor",
+            monolithic_input_tensor,
+            input_shape,
+            torch.float4_e2m1fn_x2,
+            direct_topk_input.device,
+        )
+        input_scale = _use_scratch_tensor(
+            "monolithic_input_scale",
+            monolithic_input_scale,
+            input_scale_shape,
+            torch.uint8,
+            direct_topk_input_scale.device,
+        )
+        tile_idx_to_group_idx = _use_scratch_tensor(
+            "monolithic_tile_idx_to_group_idx",
+            monolithic_tile_idx_to_group_idx,
+            (tile_count, ),
+            torch.int32,
+            direct_topk_input.device,
+        )
+        tile_idx_to_mn_limit = _use_scratch_tensor(
+            "monolithic_tile_idx_to_mn_limit",
+            monolithic_tile_idx_to_mn_limit,
+            (tile_count, ),
+            torch.int32,
+            direct_topk_input.device,
+        )
+        token_id_mapping = _use_scratch_tensor(
+            "monolithic_token_id_mapping",
+            monolithic_token_id_mapping,
+            (num_pool_tokens, ),
+            torch.int32,
+            direct_topk_input.device,
+        )
+        output_mapping = _use_scratch_tensor(
+            "monolithic_output_mapping",
+            monolithic_output_mapping,
+            (num_pool_tokens, ),
+            torch.int32,
+            direct_topk_input.device,
+        )
+        num_non_exiting_tiles = _use_scratch_tensor(
+            "monolithic_num_non_exiting_tiles",
+            monolithic_num_non_exiting_tiles,
+            (1, ),
+            torch.int32,
+            direct_topk_input.device,
+        )
+        num_non_exiting_tiles.zero_()
+        token_final_scales = _use_scratch_tensor(
+            "monolithic_token_final_scales",
+            monolithic_token_final_scales,
+            (num_pool_tokens, 1),
+            torch.float32,
+            direct_topk_input.device,
+        )
+        pool_tensor = _use_scratch_tensor(
+            "monolithic_pool_tensor",
+            monolithic_pool_tensor,
+            (num_pool_tokens, interm_size // 2),
+            torch.float4_e2m1fn_x2,
+            direct_topk_input.device,
+        )
+        pool_sf_tensor = _use_scratch_tensor(
+            "monolithic_pool_sf_tensor",
+            monolithic_pool_sf_tensor,
+            (num_pool_tokens * interm_size // scaling_vector_size, ),
+            torch.uint8,
+            direct_topk_input.device,
+        )
+        l2_arrival_mask = _use_scratch_tensor(
+            "monolithic_l2_arrival_mask",
+            monolithic_l2_arrival_mask,
+            (tile_count, ),
+            torch.int64,
+            direct_topk_input.device,
+        )
+
+        _run_cute_dsl_nvfp4_mega_moe_blackwell_with_pool(
+            input_tensor,
+            weight_l1,
+            input_scale,
+            weight_scale_l1,
+            alpha_l1,
+            weight_l2,
+            weight_scale_l2,
+            alpha_l2,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            token_id_mapping,
+            output_mapping,
+            num_non_exiting_tiles,
+            global_sf,
+            token_final_scales,
+            pool_tensor,
+            pool_sf_tensor,
+            l2_arrival_mask,
+            output,
+            num_experts,
+            1,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            scaling_vector_size,
+            True,
+            False,
+            False,
+            combine_output_ep_size,
+            combine_output_top_k,
+            combine_output_max_num_tokens_per_rank,
+            combine_output_rank_stride_elements,
+            monolithic_final_output=monolithic_output,
+            monolithic_control=monolithic_control,
+            monolithic_reduce_output=True,
+            monolithic_local_rank=monolithic_local_rank,
+            monolithic_local_tokens=monolithic_local_tokens,
+            monolithic_direct_topk_materialize=
+            monolithic_direct_topk_materialize,
+            monolithic_direct_topk_input=direct_topk_input,
+            monolithic_direct_topk_input_scale=direct_topk_input_scale,
+            monolithic_direct_topk_idx=direct_topk_idx,
+            monolithic_direct_topk_scales=direct_topk_scales,
+            monolithic_direct_topk_token_counts=direct_topk_token_counts,
+            monolithic_direct_topk_stage_inputs=
+            monolithic_direct_topk_stage_inputs,
+            monolithic_direct_topk_local_input=
+            monolithic_direct_topk_local_input,
+            monolithic_direct_topk_local_input_scale=
+            monolithic_direct_topk_local_input_scale,
+            monolithic_direct_topk_local_idx=monolithic_direct_topk_local_idx,
+            monolithic_direct_topk_local_scales=
+            monolithic_direct_topk_local_scales,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_mega_moe_blackwell_monolithic_direct_topk_reduce"
+    )
+    def _fake_mega_monolithic_direct_topk_reduce(
+        direct_topk_input: torch.Tensor,
+        direct_topk_input_scale: torch.Tensor,
+        direct_topk_idx: torch.Tensor,
+        direct_topk_scales: torch.Tensor,
+        direct_topk_token_counts: Optional[torch.Tensor],
+        weight_l1: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        global_sf: torch.Tensor,
+        output: torch.Tensor,
+        monolithic_output: torch.Tensor,
+        monolithic_control: torch.Tensor,
+        num_pool_tokens: int,
+        num_experts: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int,
+        combine_output_ep_size: int,
+        combine_output_top_k: int,
+        combine_output_max_num_tokens_per_rank: int,
+        combine_output_rank_stride_elements: int,
+        monolithic_local_rank: int,
+        monolithic_local_tokens: int,
+        monolithic_epoch: int = 1,
+        monolithic_direct_topk_stage_inputs: bool = False,
+        monolithic_direct_topk_materialize: bool = True,
+        monolithic_direct_topk_local_input: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
+        monolithic_direct_topk_local_scales: Optional[torch.Tensor] = None,
+        monolithic_input_tensor: Optional[torch.Tensor] = None,
+        monolithic_input_scale: Optional[torch.Tensor] = None,
+        monolithic_tile_idx_to_group_idx: Optional[torch.Tensor] = None,
+        monolithic_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
+        monolithic_token_id_mapping: Optional[torch.Tensor] = None,
+        monolithic_output_mapping: Optional[torch.Tensor] = None,
+        monolithic_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+        monolithic_token_final_scales: Optional[torch.Tensor] = None,
+        monolithic_pool_tensor: Optional[torch.Tensor] = None,
+        monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
+        monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_mega_moe_blackwell_monolithic_reduce")
+    def _fake_mega_monolithic_reduce(
+        input: torch.Tensor,
+        weight_l1: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale_l1: torch.Tensor,
+        alpha_l1: torch.Tensor,
+        weight_l2: torch.Tensor,
+        weight_scale_l2: torch.Tensor,
+        alpha_l2: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        output_permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output: torch.Tensor,
+        monolithic_output: torch.Tensor,
+        monolithic_control: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int,
+        combine_output_ep_size: int,
+        combine_output_top_k: int,
+        combine_output_max_num_tokens_per_rank: int,
+        combine_output_rank_stride_elements: int,
+        monolithic_local_rank: int,
+        monolithic_local_tokens: int,
+    ) -> None:
+        return None
 
     class CuteDSLFp8BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
