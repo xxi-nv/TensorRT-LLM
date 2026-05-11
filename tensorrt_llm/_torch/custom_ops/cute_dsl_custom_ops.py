@@ -3498,6 +3498,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kwargs.get("monolithic_local_tokens", 0))
             monolithic_direct_topk_materialize = bool(
                 kwargs.get("monolithic_direct_topk_materialize", False))
+            monolithic_direct_topk_source_input = bool(
+                kwargs.get("monolithic_direct_topk_source_input", False))
             monolithic_direct_topk_stage_inputs = bool(
                 kwargs.get("monolithic_direct_topk_stage_inputs", False))
             monolithic_direct_topk_input_rank_stride_elements = int(
@@ -3753,6 +3755,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     monolithic_direct_topk_input.data_ptr(),
                     cute.AddressSpace.gmem,
                     assumed_align=32)
+                monolithic_direct_topk_input_fp4_ptr = make_ptr(
+                    cutlass.Float4E2M1FN,
+                    monolithic_direct_topk_input.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=32)
                 monolithic_direct_topk_input_scale_ptr = make_ptr(
                     cutlass.Float8E4M3FN,
                     monolithic_direct_topk_input_scale.data_ptr(),
@@ -3808,6 +3815,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     monolithic_direct_topk_local_scales_ptr = monolithic_direct_topk_scales_ptr
             else:
                 monolithic_direct_topk_input_ptr = a_byte_ptr
+                monolithic_direct_topk_input_fp4_ptr = a_ptr
                 monolithic_direct_topk_input_scale_ptr = a_sf_ptr
                 monolithic_direct_topk_idx_ptr = l2_arrival_mask_ptr
                 monolithic_direct_topk_scales_ptr = token_final_scales_ptr
@@ -3868,6 +3876,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 combine_output_rank_stride_elements, monolithic_reduce_output,
                 monolithic_control_rank_stride_elements, monolithic_local_rank,
                 monolithic_direct_topk_materialize,
+                monolithic_direct_topk_source_input,
                 monolithic_direct_topk_input_rank_stride_elements,
                 monolithic_direct_topk_input_scale_rank_stride_elements,
                 monolithic_direct_topk_idx_rank_stride_elements,
@@ -3917,6 +3926,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     token_final_scales_ptr,
                     global_sf_ptr,
                     monolithic_direct_topk_input_ptr,
+                    monolithic_direct_topk_input_fp4_ptr,
                     monolithic_direct_topk_input_scale_ptr,
                     monolithic_direct_topk_idx_ptr,
                     monolithic_direct_topk_scales_ptr,
@@ -3966,6 +3976,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ),
                     monolithic_direct_topk_idx_rank_stride_elements=(
                         monolithic_direct_topk_idx_rank_stride_elements),
+                    monolithic_direct_topk_source_input=(
+                        monolithic_direct_topk_source_input),
                     monolithic_direct_topk_scales_rank_stride_elements=(
                         monolithic_direct_topk_scales_rank_stride_elements),
                     monolithic_direct_topk_local_expert_offset=(
@@ -4001,6 +4013,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 token_final_scales_ptr,
                 global_sf_ptr,
                 monolithic_direct_topk_input_ptr,
+                monolithic_direct_topk_input_fp4_ptr,
                 monolithic_direct_topk_input_scale_ptr,
                 monolithic_direct_topk_idx_ptr,
                 monolithic_direct_topk_scales_ptr,
@@ -4308,6 +4321,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_local_tokens: int = 0,
         monolithic_epoch: int = 1,
         monolithic_direct_topk_materialize: bool = False,
+        monolithic_direct_topk_source_input: bool = False,
         monolithic_direct_topk_input: Optional[torch.Tensor] = None,
         monolithic_direct_topk_input_scale: Optional[torch.Tensor] = None,
         monolithic_direct_topk_idx: Optional[torch.Tensor] = None,
@@ -4404,6 +4418,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_local_tokens=monolithic_local_tokens,
             monolithic_direct_topk_materialize=
             monolithic_direct_topk_materialize,
+            monolithic_direct_topk_source_input=
+            monolithic_direct_topk_source_input,
             monolithic_direct_topk_stage_inputs=
             monolithic_direct_topk_stage_inputs,
             monolithic_direct_topk_input_rank_stride_elements=(
@@ -4714,6 +4730,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_epoch: int = 1,
         monolithic_direct_topk_stage_inputs: bool = False,
         monolithic_direct_topk_materialize: bool = True,
+        monolithic_direct_topk_source_input: bool = False,
         monolithic_direct_topk_local_input: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
@@ -4942,6 +4959,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_direct_topk_token_counts=direct_topk_token_counts,
             monolithic_direct_topk_stage_inputs=
             monolithic_direct_topk_stage_inputs,
+            monolithic_direct_topk_source_input=
+            monolithic_direct_topk_source_input,
             monolithic_direct_topk_local_input=
             monolithic_direct_topk_local_input,
             monolithic_direct_topk_local_input_scale=
@@ -4985,6 +5004,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_epoch: int = 1,
         monolithic_direct_topk_stage_inputs: bool = False,
         monolithic_direct_topk_materialize: bool = True,
+        monolithic_direct_topk_source_input: bool = False,
         monolithic_direct_topk_local_input: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
