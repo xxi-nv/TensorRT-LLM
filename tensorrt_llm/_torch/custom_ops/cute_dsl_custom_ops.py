@@ -2260,6 +2260,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c
 
     @torch.library.custom_op(
+        "trtllm::cute_dsl_moe_output_zero_no_local_rows_inplace",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_moe_output_zero_no_local_rows_inplace(
+        output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+    ) -> None:
+        """Zero MoE output rows that have no local route."""
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.moe_output_zero import \
+            zero_no_local_moe_output_rows
+
+        zero_no_local_moe_output_rows(output, expanded_idx_to_permuted_idx)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_moe_output_zero_no_local_rows_inplace")
+    def _fake_cute_dsl_moe_output_zero_no_local_rows_inplace(
+        output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
         mutates_args=("output", ),
         device_types="cuda")
