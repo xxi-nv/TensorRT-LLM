@@ -1720,15 +1720,6 @@ class BlockScaledMegaMoeFusionKernel:
                     ],
                     self.buffer_align_bytes,
                 ]
-                # FC2 BF16 output staging ahead of the TMA S2G store built
-                # in ``__call__`` (``tma_atom_out``/``tma_tensor_out``).
-                sC_l2: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.l2_out_dtype,
-                        cute.cosize(self.c_smem_layout_staged_l2.outer),
-                    ],
-                    self.buffer_align_bytes,
-                ]
 
         @cute.struct
         class SharedStorage2cta:
@@ -1827,15 +1818,6 @@ class BlockScaledMegaMoeFusionKernel:
                     cute.struct.MemRange[
                         self.sf_dtype,
                         cute.cosize(self.sfa_smem_layout_staged_l2),
-                    ],
-                    self.buffer_align_bytes,
-                ]
-                # FC2 BF16 output staging ahead of the TMA S2G store built
-                # in ``__call__`` (``tma_atom_out``/``tma_tensor_out``).
-                sC_l2: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.l2_out_dtype,
-                        cute.cosize(self.c_smem_layout_staged_l2.outer),
                     ],
                     self.buffer_align_bytes,
                 ]
