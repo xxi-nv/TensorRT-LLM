@@ -6266,12 +6266,8 @@ class BlockScaledMegaMoeFusionKernel:
                         topk_idx = cutlass.Int32(0)
                         token_scale = self.final_scale_dtype(0.0)
                         if is_valid_row:
-                            if cutlass.const_expr(self.topk == 1):
-                                token_idx = expanded_idx
-                                topk_idx = cutlass.Int32(0)
-                            else:
-                                token_idx = expanded_idx // self.topk
-                                topk_idx = expanded_idx % self.topk
+                            token_idx = expanded_idx // self.topk
+                            topk_idx = expanded_idx % self.topk
                             token_scale = token_final_scales[(token_idx, topk_idx)]
 
                         # Re-derive alpha from the Linear2 B-tensor-specific
