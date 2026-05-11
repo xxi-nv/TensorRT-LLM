@@ -782,7 +782,7 @@ class BlockScaledMegaMoeFusionKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        self.epi_tile = (64, 64)
+        self.epi_tile = (128, 64)
         self.epi_tile_cnt = (
             self.cta_tile_shape_mnk_c[0] // self.epi_tile[0],
             self.cta_tile_shape_mnk_c[1] // self.epi_tile[1],
