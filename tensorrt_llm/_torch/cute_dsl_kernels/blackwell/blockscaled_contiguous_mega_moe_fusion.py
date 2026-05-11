@@ -3859,20 +3859,21 @@ class BlockScaledMegaMoeFusionKernel:
 
                         cached_l2_arrival_mask = cutlass.Uint64(0)
                         l2_arrival_mask_ptr = l2_arrival_mask.iterator + l2_pool_block_idx
+                        needed_l2_arrival_mask = cutlass.Uint64(0)
+                        for wait_k in cutlass.range(0, k_tile_cnt_l2, 1, unroll=1):
+                            needed_l2_arrival_mask = needed_l2_arrival_mask | (
+                                cutlass.Uint64(self.l2_arrival_mask_per_k_tile)
+                                << cutlass.Uint64(wait_k * self.l2_arrival_bits_per_k_tile)
+                            )
+                        while (
+                            cached_l2_arrival_mask & needed_l2_arrival_mask
+                        ) != needed_l2_arrival_mask:
+                            cached_l2_arrival_mask = ld_acquire_gpu_u64(l2_arrival_mask_ptr)
+
                         for k_tile in cutlass.range(0, k_tile_cnt_l2, 1, unroll=1):
                             a_pipeline_l2.producer_acquire(
                                 a_producer_state_l2, peek_a_empty_status_l2
                             )
-
-                            needed_l2_arrival_mask = cutlass.Uint64(
-                                self.l2_arrival_mask_per_k_tile
-                            ) << cutlass.Uint64(
-                                a_producer_state_l2.count * self.l2_arrival_bits_per_k_tile
-                            )
-                            while (
-                                cached_l2_arrival_mask & needed_l2_arrival_mask
-                            ) != needed_l2_arrival_mask:
-                                cached_l2_arrival_mask = ld_acquire_gpu_u64(l2_arrival_mask_ptr)
 
                             tAgA_l2_ktile = tAgA_l2[(None, None, a_producer_state_l2.count)]
                             tAsA_pool_ktile = tAsA_pool_tiled[
@@ -4321,6 +4322,18 @@ class BlockScaledMegaMoeFusionKernel:
                         l2_pool_block_idx = tile_info[0] // cute.size(tiled_mma_l2.thr_id.shape)
                         l2_arrival_mask_ptr = l2_arrival_mask.iterator + l2_pool_block_idx
                         cached_sfa_pool_l2_arrival_mask = cutlass.Uint64(0)
+                        needed_sfa_pool_l2_arrival_mask = cutlass.Uint64(0)
+                        for wait_k in cutlass.range(0, k_tile_cnt_l2, 1, unroll=1):
+                            needed_sfa_pool_l2_arrival_mask = needed_sfa_pool_l2_arrival_mask | (
+                                cutlass.Uint64(self.l2_arrival_mask_per_k_tile)
+                                << cutlass.Uint64(wait_k * self.l2_arrival_bits_per_k_tile)
+                            )
+                        while (
+                            cached_sfa_pool_l2_arrival_mask & needed_sfa_pool_l2_arrival_mask
+                        ) != needed_sfa_pool_l2_arrival_mask:
+                            cached_sfa_pool_l2_arrival_mask = ld_acquire_gpu_u64(
+                                l2_arrival_mask_ptr
+                            )
                         for k_tile in cutlass.range(0, k_tile_cnt_l2, 1, unroll=1):
                             b_pipeline_l2.producer_acquire(
                                 b_producer_state_l2, peek_ab_empty_status
@@ -4642,21 +4655,9 @@ class BlockScaledMegaMoeFusionKernel:
                                         )
 
                             # Pool SFA is published by the FC1 epilogue together
-                            # with the FP4 pool activation. Match the activation
-                            # LDGSTS path and wait for the release-published arrival
-                            # bit before issuing the SFA TMA read from HBM.
-                            needed_sfa_pool_l2_arrival_mask = cutlass.Uint64(
-                                self.l2_arrival_mask_per_k_tile
-                            ) << cutlass.Uint64(
-                                sfa_pool_producer_state_l2.count * self.l2_arrival_bits_per_k_tile
-                            )
-                            while (
-                                cached_sfa_pool_l2_arrival_mask & needed_sfa_pool_l2_arrival_mask
-                            ) != needed_sfa_pool_l2_arrival_mask:
-                                cached_sfa_pool_l2_arrival_mask = ld_acquire_gpu_u64(
-                                    l2_arrival_mask_ptr
-                                )
-
+                            # with the FP4 pool activation. The full block mask
+                            # was acquired once before the K loop, mirroring the
+                            # DeepGEMM scheduler contract for complete L2 waves.
                             cute.copy(
                                 tma_atom_pool_sfa_l2,
                                 tAgSFA_pool_l2_slice[(None, sfa_pool_producer_state_l2.count)],
