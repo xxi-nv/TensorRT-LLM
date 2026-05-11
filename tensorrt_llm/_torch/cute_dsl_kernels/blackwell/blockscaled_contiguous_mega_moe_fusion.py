@@ -1010,7 +1010,6 @@ class BlockScaledMegaMoeFusionKernel:
             # (H=512/I=512, H=1024/I=1024) shapes. Future work can split
             # proportional to ``ab_bytes_per_stage`` once FC2 tiling lands.
             smem_capacity_l2 = self.num_smem_capacity // 2
-            reserve_c_smem_l2 = self.mma_tiler_l2[0] != 128
             (
                 self.num_acc_stage_l2,
                 self.num_ab_stage_l2,
@@ -1028,7 +1027,6 @@ class BlockScaledMegaMoeFusionKernel:
                 self.sf_vec_size,
                 smem_capacity_l2,
                 self.occupancy,
-                reserve_c_smem=reserve_c_smem_l2,
             )
 
             self.a_smem_layout_staged_l2 = sm100_utils.make_smem_layout_a(
@@ -1059,7 +1057,7 @@ class BlockScaledMegaMoeFusionKernel:
                 self.l2_out_dtype,
                 self.l2_output_layout,
                 self.epi_tile,
-                (self.num_c_stage_l2 if reserve_c_smem_l2 else 1),
+                self.num_c_stage_l2,
             )
 
             # L1 and L2 keep their separately computed AB stage counts. Both
@@ -6799,7 +6797,6 @@ class BlockScaledMegaMoeFusionKernel:
         sf_vec_size: int,
         num_smem_capacity: int,
         occupancy: int,
-        reserve_c_smem: bool = True,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -6825,8 +6822,6 @@ class BlockScaledMegaMoeFusionKernel:
         :type num_smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
-        :param reserve_c_smem: Whether to reserve C-output shared-memory stages.
-        :type reserve_c_smem: bool
 
         :return: A tuple containing the computed number of stages for:
                  (ACC stages, A/B operand stages, C stages)
@@ -6836,7 +6831,7 @@ class BlockScaledMegaMoeFusionKernel:
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
         # Default C stages
-        num_c_stage = 2 if reserve_c_smem else 0
+        num_c_stage = 2
 
         # Default Tile info stages
         num_tile_stage = 2
@@ -6884,9 +6879,7 @@ class BlockScaledMegaMoeFusionKernel:
         )
         # 1024B alignment
         mbar_helpers_bytes = 1024
-        c_bytes_per_stage = (
-            cute.size_in_bytes(c_dtype, c_smem_layout_staged_one) if reserve_c_smem else 0
-        )
+        c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * num_c_stage
 
         # Calculate A/B stages:
@@ -6900,12 +6893,11 @@ class BlockScaledMegaMoeFusionKernel:
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
-        if reserve_c_smem:
-            num_c_stage += (
-                num_smem_capacity
-                - occupancy * ab_bytes_per_stage * num_ab_stage
-                - occupancy * (mbar_helpers_bytes + c_bytes)
-            ) // (occupancy * c_bytes_per_stage)
+        num_c_stage += (
+            num_smem_capacity
+            - occupancy * ab_bytes_per_stage * num_ab_stage
+            - occupancy * (mbar_helpers_bytes + c_bytes)
+        ) // (occupancy * c_bytes_per_stage)
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
 
     @staticmethod
