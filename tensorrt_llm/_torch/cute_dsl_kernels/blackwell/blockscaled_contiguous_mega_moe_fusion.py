@@ -6043,6 +6043,28 @@ class BlockScaledMegaMoeFusionKernel:
                                     acc_vec_gate_alpha, fastmath=True
                                 )
 
+                        if cutlass.const_expr(self.enable_linear2):
+                            # DeepGEMM-style route-weight placement: fold the
+                            # top-k scale into the FC1 activation before FP4
+                            # requant, so FC2 epilogue only applies alpha_l2.
+                            route_scale_l1 = cutlass.Float32(1.0)
+                            l1_tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                            l1_permuted_row = l1_tile_m_start + epi_tidx
+                            if l1_permuted_row < tile_info[4]:
+                                l1_expanded_idx = permuted_idx_to_expanded_idx[l1_permuted_row]
+                                l1_token_idx = l1_expanded_idx // self.topk
+                                l1_topk_idx = l1_expanded_idx % self.topk
+                                route_scale_l1 = token_final_scales[(l1_token_idx, l1_topk_idx)]
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (tCompute[i], tCompute[i + 1]),
+                                        (route_scale_l1, route_scale_l1),
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                                    tCompute[i] = tCompute[i] * route_scale_l1
+
                         if cutlass.const_expr(self.generate_sfc):
                             #
                             # Quantization path for Float4E2M1FN output:
@@ -6282,11 +6304,9 @@ class BlockScaledMegaMoeFusionKernel:
                         # pre-scatter scale.
                         token_idx = cutlass.Int32(0)
                         topk_idx = cutlass.Int32(0)
-                        token_scale = self.final_scale_dtype(0.0)
                         if is_valid_row:
                             token_idx = expanded_idx // self.topk
                             topk_idx = expanded_idx % self.topk
-                            token_scale = token_final_scales[(token_idx, topk_idx)]
 
                         # Re-derive alpha from the Linear2 B-tensor-specific
                         # tuple. The current implementation assumes ``num_b_tensors_l2 == 1``;
@@ -6303,8 +6323,6 @@ class BlockScaledMegaMoeFusionKernel:
                         # (applied at the final acc_vec scale below); drop
                         # the stale ``alpha_val * token_scale`` fold.
                         alpha_val_l2 = alpha_l2_tuple[0][expert_idx - self.b_tensor_l_offsets_l2[0]]
-                        if is_valid_row:
-                            alpha_val_l2 = alpha_val_l2 * token_scale
 
                         tTR_tAcc_l2 = tTR_tAcc_base_l2[
                             (None, None, None, None, None, acc_stage_index)
