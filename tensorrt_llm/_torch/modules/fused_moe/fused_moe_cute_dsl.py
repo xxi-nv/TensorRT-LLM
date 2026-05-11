@@ -627,7 +627,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                   and moe_output.size(0) <= 1)
         use_output_store_first = (self.use_fused_finalize and enable_alltoall
                                   and self.mapping.moe_ep_size
-                                  <= effective_top_k)
+                                  <= effective_top_k
+                                  and moe_output.numel() >= 32 * 1024 * 1024)
         if self.use_fused_finalize and not use_output_store_first:
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(
