@@ -452,7 +452,6 @@ def test_mega_moe_fused_kernel_matches_two_kernel(
                 alpha=mega.quant_scales.fc1_global,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 global_sf=mega.fc2_input_scale,
