@@ -625,9 +625,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         use_direct_output_zero = (self.use_fused_finalize
                                   and not enable_alltoall
                                   and moe_output.size(0) <= 1)
-        use_output_store_first = (self.use_fused_finalize and enable_alltoall
-                                  and self.mapping.moe_ep_size
-                                  <= effective_top_k)
+        # Store-first finalize races with other route atomics across CTAs.
+        use_output_store_first = False
         if self.use_fused_finalize:
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(
