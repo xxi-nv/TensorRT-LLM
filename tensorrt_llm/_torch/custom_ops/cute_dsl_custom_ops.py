@@ -3881,7 +3881,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
-                    vectorized_f32=False,
+                    vectorized_f32=True,
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
