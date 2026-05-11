@@ -198,7 +198,7 @@ class GroupedGemmInputsHelper:
 
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(
             num_tokens, approx_max_load=True)
@@ -224,7 +224,7 @@ class GroupedGemmInputsHelper:
             local_num_experts=self.num_local_experts,
             tile_tokens_dim=self.tile_size,
         )
-        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
+        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
 class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
@@ -1952,7 +1952,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+                     output_store_first: bool = False):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -1964,6 +1965,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
             self.b_tensor_l_sizes = b_tensor_l_sizes
+            self.output_store_first = output_store_first
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -1985,6 +1987,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.scaling_vector_size,
                 self.b_tensor_l_sizes,
+                self.output_store_first,
             )
 
         def get_valid_tactics(
@@ -2054,9 +2057,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
                         ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(8, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(
-                            8, 0, helper.infer_shape_max_num_permuted_tokens),
-                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
+                            9, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(11, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
                 )
@@ -2064,7 +2068,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b_list, a_sf, b_sf_list, alpha_list, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b_list, a_sf, b_sf_list, alpha_list, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             if not isinstance(b_list, (list, tuple)):
                 raise TypeError("weight must be a list of tensors")
             if not isinstance(b_sf_list, (list, tuple)):
@@ -2114,6 +2118,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert tile_idx_to_group_idx.size() == (num_tiles, )
             assert tile_idx_to_mn_limit.dtype == torch.int32
             assert tile_idx_to_mn_limit.size() == (num_tiles, )
+            assert expanded_idx_to_permuted_idx.dtype == torch.int32
+            assert expanded_idx_to_permuted_idx.size() == (num_tokens,
+                                                           self.top_k)
             assert permuted_idx_to_expanded_idx.dtype == torch.int32
             assert permuted_idx_to_expanded_idx.size() == (m, )
             assert num_non_exiting_tiles.dtype == torch.int32
@@ -2136,6 +2143,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_idx_to_mn_limit_ptr = make_ptr(cutlass.Int32,
                                                 tile_idx_to_mn_limit.data_ptr(),
                                                 cute.AddressSpace.gmem)
+            expanded_idx_to_permuted_idx_ptr = make_ptr(
+                cutlass.Int32, expanded_idx_to_permuted_idx.data_ptr(),
+                cute.AddressSpace.gmem)
             permuted_idx_to_expanded_idx_ptr = make_ptr(
                 cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
                 cute.AddressSpace.gmem)
@@ -2176,10 +2186,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
-            use_blkred = True
+            use_blkred = not self.output_store_first
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m, b_tensor_l_sizes,
-                         use_blkred)
+                         use_blkred, self.output_store_first)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -2203,6 +2213,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     alpha_ptr,
                     tile_idx_to_group_idx_ptr,
                     tile_idx_to_mn_limit_ptr,
+                    expanded_idx_to_permuted_idx_ptr,
                     permuted_idx_to_expanded_idx_ptr,
                     num_non_exiting_tiles_ptr,
                     token_final_scales_ptr,
@@ -2259,6 +2270,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
         num_non_exiting_tiles: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -2269,6 +2281,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        output_store_first: bool = False,
     ) -> None:
         tuner = AutoTuner.get()
 
@@ -2276,13 +2289,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  for w in weight) if len(weight) > 1 else None
         runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size, b_tensor_l_sizes)
+            tile_size, output_dtype, scaling_vector_size, b_tensor_l_sizes,
+            output_store_first)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-            token_final_scales
+            expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles, token_final_scales
         ]
 
         _, best_tactic = tuner.choose_one(
@@ -2305,6 +2319,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
         num_non_exiting_tiles: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -2315,6 +2330,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        output_store_first: bool = False,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
         n = weight[0].size(1)
@@ -2331,6 +2347,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output=output,
             tile_idx_to_group_idx=tile_idx_to_group_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             token_final_scales=token_final_scales,
@@ -2341,6 +2358,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size=tile_size,
             output_dtype=output_dtype,
             scaling_vector_size=scaling_vector_size,
+            output_store_first=output_store_first,
         )
         return output
 
@@ -2354,6 +2372,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
         num_non_exiting_tiles: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -2364,6 +2383,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        output_store_first: bool = False,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
         n = weight[0].size(1)
