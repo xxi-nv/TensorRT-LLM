@@ -2245,6 +2245,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 alpha_ptr,
                 tile_idx_to_group_idx_ptr,
                 tile_idx_to_mn_limit_ptr,
+                expanded_idx_to_permuted_idx_ptr,
                 permuted_idx_to_expanded_idx_ptr,
                 num_non_exiting_tiles_ptr,
                 token_final_scales_ptr,
