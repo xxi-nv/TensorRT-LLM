@@ -341,6 +341,9 @@ class MegaMoE(MoE):
         self._full_fusion_monolithic_direct_topk_materialize_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_materialize", True)
         )
+        self._full_fusion_monolithic_direct_topk_source_input_enabled = bool(
+            extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_source_input", False)
+        )
         self._full_fusion_cutedsl_stage_dispatch_inputs_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_cutedsl_stage_dispatch_inputs", False)
         )
@@ -1293,6 +1296,7 @@ class MegaMoE(MoE):
                     producer_epoch,
                     self._full_fusion_monolithic_direct_topk_stage_inputs_enabled,
                     self._full_fusion_monolithic_direct_topk_materialize_enabled,
+                    self._full_fusion_monolithic_direct_topk_source_input_enabled,
                     local_input,
                     local_input_scale,
                     local_topk_idx,

@@ -1121,8 +1121,12 @@ class BlockScaledMegaMoeFusionKernel:
         monolithic_local_tokens: cutlass.Int64 = 0,
         monolithic_grid_sync_blocks: cutlass.Constexpr = 0,
         monolithic_direct_topk_materialize: cutlass.Constexpr = False,
+        monolithic_direct_topk_source_input: cutlass.Constexpr = False,
         monolithic_direct_topk_input: Optional[cute.Tensor] = None,
+        monolithic_direct_topk_input_fp4: Optional[cute.Tensor] = None,
         monolithic_direct_topk_input_scale: Optional[cute.Tensor] = None,
+        monolithic_direct_topk_input_rank_stride_fp4: cutlass.Constexpr = 0,
+        monolithic_direct_topk_input_scale_rank_stride_elements: cutlass.Constexpr = 0,
         monolithic_direct_topk_idx: Optional[cute.Tensor] = None,
         monolithic_direct_topk_scales: Optional[cute.Tensor] = None,
         monolithic_direct_topk_token_counts: Optional[cute.Tensor] = None,
@@ -2025,9 +2029,13 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_sfa_smem_layout_staged_l2,
             kernel_epi_layout_l2,
             monolithic_direct_topk_input if monolithic_direct_topk_input is not None else a,
+            monolithic_direct_topk_input_fp4 if monolithic_direct_topk_input_fp4 is not None else a,
             monolithic_direct_topk_input_scale
             if monolithic_direct_topk_input_scale is not None
             else sfa,
+            monolithic_direct_topk_source_input,
+            monolithic_direct_topk_input_rank_stride_fp4,
+            monolithic_direct_topk_input_scale_rank_stride_elements,
             monolithic_direct_topk_idx
             if monolithic_direct_topk_idx is not None
             else monolithic_control,
@@ -2214,7 +2222,11 @@ class BlockScaledMegaMoeFusionKernel:
         sfa_smem_layout_staged_l2: cute.Layout,
         epi_layout_l2: cute.Layout,
         monolithic_direct_topk_input: cute.Tensor,
+        monolithic_direct_topk_input_fp4: cute.Tensor,
         monolithic_direct_topk_input_scale: cute.Tensor,
+        monolithic_direct_topk_source_input: cutlass.Constexpr,
+        monolithic_direct_topk_input_rank_stride_fp4: cutlass.Constexpr,
+        monolithic_direct_topk_input_scale_rank_stride_elements: cutlass.Constexpr,
         monolithic_direct_topk_idx: cute.Tensor,
         monolithic_direct_topk_scales: cute.Tensor,
         monolithic_direct_topk_token_counts: cute.Tensor,
@@ -3212,39 +3224,46 @@ class BlockScaledMegaMoeFusionKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         if cutlass.const_expr(monolithic_direct_topk_materialize):
-            flat_input_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
-            flat_input_items = (
-                combine_output_ep_size
-                * combine_output_max_num_tokens_per_rank
-                * (monolithic_hidden_size // 2)
-            )
-            while flat_input_linear_idx < flat_input_items:
-                token_row = flat_input_linear_idx // (monolithic_hidden_size // 2)
-                hidden_byte_idx = flat_input_linear_idx - token_row * (monolithic_hidden_size // 2)
-                source_rank = token_row // combine_output_max_num_tokens_per_rank
-                source_token_idx = token_row - source_rank * combine_output_max_num_tokens_per_rank
-                mA_bytes[token_row, hidden_byte_idx, 0] = monolithic_direct_topk_input[
-                    source_rank, source_token_idx, hidden_byte_idx, 0
-                ]
-                flat_input_linear_idx = flat_input_linear_idx + stage_grid_stride
-
-            flat_sf_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
-            flat_sf_items = (
-                combine_output_ep_size
-                * combine_output_max_num_tokens_per_rank
-                * (monolithic_hidden_size // self.sf_vec_size)
-            )
-            while flat_sf_linear_idx < flat_sf_items:
-                token_row = flat_sf_linear_idx // (monolithic_hidden_size // self.sf_vec_size)
-                sf_idx = flat_sf_linear_idx - token_row * (
-                    monolithic_hidden_size // self.sf_vec_size
+            if cutlass.const_expr(not monolithic_direct_topk_source_input):
+                flat_input_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
+                flat_input_items = (
+                    combine_output_ep_size
+                    * combine_output_max_num_tokens_per_rank
+                    * (monolithic_hidden_size // 2)
                 )
-                source_rank = token_row // combine_output_max_num_tokens_per_rank
-                source_token_idx = token_row - source_rank * combine_output_max_num_tokens_per_rank
-                mSFA_mkl[token_row, sf_idx, 0] = monolithic_direct_topk_input_scale[
-                    source_rank, source_token_idx, sf_idx, 0
-                ]
-                flat_sf_linear_idx = flat_sf_linear_idx + stage_grid_stride
+                while flat_input_linear_idx < flat_input_items:
+                    token_row = flat_input_linear_idx // (monolithic_hidden_size // 2)
+                    hidden_byte_idx = flat_input_linear_idx - token_row * (
+                        monolithic_hidden_size // 2
+                    )
+                    source_rank = token_row // combine_output_max_num_tokens_per_rank
+                    source_token_idx = (
+                        token_row - source_rank * combine_output_max_num_tokens_per_rank
+                    )
+                    mA_bytes[token_row, hidden_byte_idx, 0] = monolithic_direct_topk_input[
+                        source_rank, source_token_idx, hidden_byte_idx, 0
+                    ]
+                    flat_input_linear_idx = flat_input_linear_idx + stage_grid_stride
+
+                flat_sf_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
+                flat_sf_items = (
+                    combine_output_ep_size
+                    * combine_output_max_num_tokens_per_rank
+                    * (monolithic_hidden_size // self.sf_vec_size)
+                )
+                while flat_sf_linear_idx < flat_sf_items:
+                    token_row = flat_sf_linear_idx // (monolithic_hidden_size // self.sf_vec_size)
+                    sf_idx = flat_sf_linear_idx - token_row * (
+                        monolithic_hidden_size // self.sf_vec_size
+                    )
+                    source_rank = token_row // combine_output_max_num_tokens_per_rank
+                    source_token_idx = (
+                        token_row - source_rank * combine_output_max_num_tokens_per_rank
+                    )
+                    mSFA_mkl[token_row, sf_idx, 0] = monolithic_direct_topk_input_scale[
+                        source_rank, source_token_idx, sf_idx, 0
+                    ]
+                    flat_sf_linear_idx = flat_sf_linear_idx + stage_grid_stride
 
             # Grid-parallel monolithic mode absorbs the old M5 direct-topk
             # materialization boundary here. CTAs first count local routes,
@@ -3453,7 +3472,14 @@ class BlockScaledMegaMoeFusionKernel:
                         token_row = (
                             source_rank * combine_output_max_num_tokens_per_rank + source_token_idx
                         )
-                        token_id_mapping_tensor[pool_slot] = token_row
+                        if cutlass.const_expr(monolithic_direct_topk_source_input):
+                            token_id_mapping_tensor[pool_slot] = cutlass.Int32(source_rank) * (
+                                cutlass.Int32(monolithic_direct_topk_input_rank_stride_fp4)
+                            ) + cutlass.Int32(source_token_idx) * cutlass.Int32(
+                                monolithic_hidden_size
+                            )
+                        else:
+                            token_id_mapping_tensor[pool_slot] = token_row
                         permuted_idx_to_expanded_idx[pool_slot] = combine_row
                         token_final_scales[(combine_row, 0)] = monolithic_direct_topk_scales[
                             source_rank, source_token_idx, source_topk_idx
@@ -3951,6 +3977,24 @@ class BlockScaledMegaMoeFusionKernel:
                         else cutlass.Boolean(0)
                     )
                     relative_sfa_token_offset = sfa_token_offset_tensor[0]
+                    direct_sfa_source_offset = relative_sfa_token_offset
+                    if cutlass.const_expr(monolithic_direct_topk_source_input):
+                        direct_sfa_source_rank = relative_sfa_token_offset // cutlass.Int32(
+                            monolithic_direct_topk_input_rank_stride_fp4
+                        )
+                        direct_sfa_source_token_fp4_offset = relative_sfa_token_offset - (
+                            direct_sfa_source_rank
+                            * cutlass.Int32(monolithic_direct_topk_input_rank_stride_fp4)
+                        )
+                        direct_sfa_source_token = (
+                            direct_sfa_source_token_fp4_offset
+                            // cutlass.Int32(monolithic_hidden_size)
+                        )
+                        direct_sfa_source_offset = direct_sfa_source_rank * cutlass.Int32(
+                            monolithic_direct_topk_input_scale_rank_stride_elements
+                        ) + direct_sfa_source_token * cutlass.Int32(
+                            monolithic_hidden_size // self.sf_vec_size
+                        )
 
                     tAgA = gA_mkl[(None, None, 0, None, 0)]
                     A_gmem_thread_offset = cute.assume((tidx_in_warpgroup % 8) * 32, divby=32)
@@ -4014,6 +4058,20 @@ class BlockScaledMegaMoeFusionKernel:
                             )
                             A_gmem_slice_offset = cute.assume(A_gmem_slice_offset, divby=32)
                             tAgA_slice_ptr = tAgA_ktile.iterator + A_gmem_slice_offset
+                            if cutlass.const_expr(monolithic_direct_topk_source_input):
+                                direct_a_k_offset = (
+                                    a_producer_state.count * self.cta_tile_shape_mnk[2]
+                                )
+                                direct_a_slice_offset = cute.assume(
+                                    a_token_offset_tensor[i]
+                                    + cutlass.Int32(direct_a_k_offset)
+                                    + A_gmem_thread_offset,
+                                    divby=32,
+                                )
+                                tAgA_slice_ptr = (
+                                    monolithic_direct_topk_input_fp4.iterator
+                                    + direct_a_slice_offset
+                                )
                             tAgA_slice = cute.make_tensor(
                                 tAgA_slice_ptr, layout=cute.make_layout((32,))
                             )
@@ -4039,6 +4097,16 @@ class BlockScaledMegaMoeFusionKernel:
                             #
                             swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
                             tAgSFA_slice_ptr = tAgSFA_ktile.iterator + 4 * swizzled_iterator
+                            if cutlass.const_expr(monolithic_direct_topk_source_input):
+                                direct_sfa_k_offset = (
+                                    a_producer_state.count * self.cta_tile_shape_mnk_sfa[2]
+                                )
+                                tAgSFA_slice_ptr = (
+                                    monolithic_direct_topk_input_scale.iterator
+                                    + direct_sfa_source_offset
+                                    + cutlass.Int32(direct_sfa_k_offset)
+                                    + 4 * swizzled_iterator
+                                )
                             tAgSFA_slice = cute.make_tensor(
                                 tAgSFA_slice_ptr, layout=cute.make_layout((4,))
                             )
@@ -7464,6 +7532,7 @@ class BlockScaledMegaMoeFusionKernel:
         global_sf_ptr: cute.Pointer,
         # --- Optional monolithic direct-topk materialization inputs ---
         monolithic_direct_topk_input_ptr: cute.Pointer,
+        monolithic_direct_topk_input_fp4_ptr: cute.Pointer,
         monolithic_direct_topk_input_scale_ptr: cute.Pointer,
         monolithic_direct_topk_idx_ptr: cute.Pointer,
         monolithic_direct_topk_scales_ptr: cute.Pointer,
@@ -7499,6 +7568,7 @@ class BlockScaledMegaMoeFusionKernel:
         monolithic_direct_topk_input_rank_stride_elements: cutlass.Constexpr = 0,
         monolithic_direct_topk_input_scale_rank_stride_elements: cutlass.Constexpr = 0,
         monolithic_direct_topk_idx_rank_stride_elements: cutlass.Constexpr = 0,
+        monolithic_direct_topk_source_input: cutlass.Constexpr = False,
         monolithic_direct_topk_scales_rank_stride_elements: cutlass.Constexpr = 0,
         monolithic_direct_topk_local_expert_offset: cutlass.Constexpr = 0,
         monolithic_direct_topk_num_local_experts: cutlass.Constexpr = 0,
@@ -7720,6 +7790,13 @@ class BlockScaledMegaMoeFusionKernel:
                 stride=(direct_topk_input_rank_stride, k // 2, 1, 1),
             ),
         )
+        monolithic_direct_topk_input_fp4 = cute.make_tensor(
+            monolithic_direct_topk_input_fp4_ptr,
+            layout=cute.make_layout(
+                (combine_output_ep_size, direct_topk_max_tokens, k, 1),
+                stride=(direct_topk_input_rank_stride * 2, k, 1, 1),
+            ),
+        )
         monolithic_direct_topk_input_scale = cute.make_tensor(
             monolithic_direct_topk_input_scale_ptr,
             layout=cute.make_layout(
@@ -7823,8 +7900,14 @@ class BlockScaledMegaMoeFusionKernel:
             monolithic_local_tokens=monolithic_local_tokens,
             monolithic_grid_sync_blocks=monolithic_grid_sync_blocks,
             monolithic_direct_topk_materialize=monolithic_direct_topk_materialize,
+            monolithic_direct_topk_source_input=monolithic_direct_topk_source_input,
             monolithic_direct_topk_input=monolithic_direct_topk_input,
+            monolithic_direct_topk_input_fp4=monolithic_direct_topk_input_fp4,
             monolithic_direct_topk_input_scale=monolithic_direct_topk_input_scale,
+            monolithic_direct_topk_input_rank_stride_fp4=direct_topk_input_rank_stride * 2,
+            monolithic_direct_topk_input_scale_rank_stride_elements=(
+                direct_topk_input_scale_rank_stride
+            ),
             monolithic_direct_topk_idx=monolithic_direct_topk_idx,
             monolithic_direct_topk_scales=monolithic_direct_topk_scales,
             monolithic_direct_topk_token_counts=monolithic_direct_topk_token_counts,
