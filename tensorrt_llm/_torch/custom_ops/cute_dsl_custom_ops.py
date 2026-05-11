@@ -4865,7 +4865,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch.int32,
             direct_topk_input.device,
         )
-        num_non_exiting_tiles.zero_()
         token_final_scales = _use_scratch_tensor(
             "monolithic_token_final_scales",
             monolithic_token_final_scales,
