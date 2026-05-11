@@ -546,7 +546,7 @@ class BlockScaledMegaMoeFusionKernel:
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
-        self.occupancy = 1
+        self.occupancy = 2 if enable_linear2 else 1
         self.epilog_warp_id = (0, 1, 2, 3)
         self.ldgsts_a_warp_id = (
             4,
