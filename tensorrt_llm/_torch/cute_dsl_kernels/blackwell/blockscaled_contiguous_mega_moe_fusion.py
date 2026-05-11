@@ -521,6 +521,8 @@ class BlockScaledMegaMoeFusionKernel:
         # Linear2 configuration is stored here so the fused path can be
         # configured without changing the Linear1-only entry point.
         self.enable_linear2 = enable_linear2
+        # Probe path: load FC2 pool activations through TMA instead of LDGSTS.
+        self.use_tma_pool_a_l2 = enable_linear2
         self.b_tensor_l_sizes_l2 = b_tensor_l_sizes_l2
         # Linear2 epilogue shape constants are populated only when
         # ``enable_linear2=True`` in ``__call__``. The Linear1-only path keeps
@@ -1425,8 +1427,11 @@ class BlockScaledMegaMoeFusionKernel:
         tma_tensors_b_l2 = None
         tma_atoms_sfb_l2 = None
         tma_tensors_sfb_l2 = None
+        tma_atom_pool_a_l2 = None
+        tma_tensor_pool_a_l2 = None
         tma_atom_pool_sfa_l2 = None
         tma_tensor_pool_sfa_l2 = None
+        self.num_tma_pool_a_load_bytes = 0
         self.num_tma_sfa_pool_load_bytes = 0
         tma_atom_out = None
         tma_tensor_out = None
@@ -1475,6 +1480,22 @@ class BlockScaledMegaMoeFusionKernel:
             b_l2_copy_size = cute.size_in_bytes(self.b_dtype, b_l2_smem_layout)
             sfb_l2_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_l2_smem_layout)
             self.num_tma_load_bytes_l2 = (b_l2_copy_size + sfb_l2_copy_size) * atom_thr_size
+            pool_a_l2_op = sm100_utils.cluster_shape_to_tma_atom_A(
+                self.cluster_shape_mn, self.tiled_mma_l2.thr_id
+            )
+            pool_a_l2_smem_layout = cute.slice_(self.a_smem_layout_staged_l2, (None, None, None, 0))
+            pool_a_l2_source = pool_tensor if pool_tensor is not None else a
+            tma_atom_pool_a_l2, tma_tensor_pool_a_l2 = cute.nvgpu.make_tiled_tma_atom_A(
+                pool_a_l2_op,
+                pool_a_l2_source,
+                pool_a_l2_smem_layout,
+                self.cta_tile_shape_mnk_l2,
+                self.tiled_mma_l2,
+                self.cluster_layout_vmnk_l2.shape,
+            )
+            pool_a_copy_size = cute.size_in_bytes(self.a_dtype, pool_a_l2_smem_layout)
+            self.num_tma_pool_a_load_bytes = pool_a_copy_size * atom_thr_size
+
             pool_sfa_l2_op = sm100_utils.cluster_shape_to_tma_atom_A(
                 self.cluster_shape_mn, self.tiled_mma_l2.thr_id
             )
@@ -1859,6 +1880,8 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_b_l2 = tma_tensors_b_l2
             kernel_tma_atoms_sfb_l2 = tma_atoms_sfb_l2
             kernel_tma_tensors_sfb_l2 = tma_tensors_sfb_l2
+            kernel_tma_atom_pool_a_l2 = tma_atom_pool_a_l2
+            kernel_tma_tensor_pool_a_l2 = tma_tensor_pool_a_l2
             kernel_tma_atom_pool_sfa_l2 = tma_atom_pool_sfa_l2
             kernel_tma_tensor_pool_sfa_l2 = tma_tensor_pool_sfa_l2
             kernel_tma_atom_out = tma_atom_out
@@ -1892,6 +1915,8 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_b_l2 = tma_tensors_b
             kernel_tma_atoms_sfb_l2 = tma_atoms_sfb
             kernel_tma_tensors_sfb_l2 = tma_tensors_sfb
+            kernel_tma_atom_pool_a_l2 = tma_atoms_b[0]
+            kernel_tma_tensor_pool_a_l2 = a
             kernel_tma_atom_pool_sfa_l2 = tma_atoms_sfb[0]
             kernel_tma_tensor_pool_sfa_l2 = sfa
             kernel_tma_atom_out = tma_atom_c
@@ -1992,6 +2017,8 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_b_l2,
             kernel_tma_atoms_sfb_l2,
             kernel_tma_tensors_sfb_l2,
+            kernel_tma_atom_pool_a_l2,
+            kernel_tma_tensor_pool_a_l2,
             kernel_tma_atom_pool_sfa_l2,
             kernel_tma_tensor_pool_sfa_l2,
             kernel_tma_atom_out,
@@ -2170,6 +2197,8 @@ class BlockScaledMegaMoeFusionKernel:
         mB_l2_nkl_tuple: Tuple[cute.Tensor, ...],
         tma_atoms_sfb_l2: Tuple[cute.CopyAtom, ...],
         mSFB_l2_nkl_tuple: Tuple[cute.Tensor, ...],
+        tma_atom_pool_a_l2: cute.CopyAtom,
+        mPoolA_l2_mkl: cute.Tensor,
         tma_atom_pool_sfa_l2: cute.CopyAtom,
         mPoolSFA_l2_mkl: cute.Tensor,
         tma_atom_out: cute.CopyAtom,
@@ -2278,6 +2307,7 @@ class BlockScaledMegaMoeFusionKernel:
                 if cutlass.const_expr(self.num_b_tensors >= 4):
                     cpasync.prefetch_descriptor(tma_atoms_b_l2[3])
                     cpasync.prefetch_descriptor(tma_atoms_sfb_l2[3])
+                cpasync.prefetch_descriptor(tma_atom_pool_a_l2)
                 cpasync.prefetch_descriptor(tma_atom_pool_sfa_l2)
                 cpasync.prefetch_descriptor(tma_atom_out)
                 # prefetch FC1 epilogue pool-store TMA
@@ -2339,13 +2369,17 @@ class BlockScaledMegaMoeFusionKernel:
         )
         a_pipeline_l2 = a_pipeline_l1
         if cutlass.const_expr(self.enable_linear2):
-            a_pipeline_l2 = PipelineCpAsyncUmma.create(
+            a_pool_pipeline_producer_group_l2 = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            a_pool_pipeline_consumer_group_l2 = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_mcast_ctas_a_l2
+            )
+            a_pipeline_l2 = pipeline.PipelineTmaUmma.create(
                 barrier_storage=storage.a_pool_mbar_ptr.data_ptr(),
                 num_stages=self.num_ab_stage_l2,
-                producer_group=a_pipeline_producer_group,
-                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                producer_group=a_pool_pipeline_producer_group_l2,
+                consumer_group=a_pool_pipeline_consumer_group_l2,
+                tx_count=self.num_tma_pool_a_load_bytes,
                 cta_layout_vmnk=cluster_layout_vmnk_l2,
-                defer_sync=True,
             )
         a_pipeline = a_pipeline_l1
 
@@ -2537,6 +2571,7 @@ class BlockScaledMegaMoeFusionKernel:
         # the symbols are always defined but DCE-elided.
         b_l2_full_mcast_mask = b_full_mcast_mask
         sfb_l2_full_mcast_mask = sfb_full_mcast_mask
+        pool_a_l2_full_mcast_mask = None
         sfa_pool_l2_full_mcast_mask = None
         if cutlass.const_expr(self.enable_linear2):
             if cutlass.const_expr(self.is_b_mcast_l2 or use_2cta_instrs):
@@ -2551,11 +2586,12 @@ class BlockScaledMegaMoeFusionKernel:
                     mcast_mode=1,
                 )
             if cutlass.const_expr(self.is_a_mcast_l2 or use_2cta_instrs):
-                sfa_pool_l2_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                pool_a_l2_full_mcast_mask = cpasync.create_tma_multicast_mask(
                     cluster_layout_vmnk_l2,
                     block_in_cluster_coord_vmnk_l2,
                     mcast_mode=2,
                 )
+                sfa_pool_l2_full_mcast_mask = pool_a_l2_full_mcast_mask
 
         #
         # Local_tile partition global tensors
@@ -2797,6 +2833,8 @@ class BlockScaledMegaMoeFusionKernel:
         tBgSFB_l2_3 = None
         tBsB_l2 = None
         tBsSFB_l2 = None
+        tAsA_pool_tma = None
+        tAgA_pool_tma = None
         tAsSFA_pool_tma = None
         tAgSFA_pool_tma = None
         k_tile_cnt_l2 = cutlass.Int32(0)
@@ -2859,6 +2897,7 @@ class BlockScaledMegaMoeFusionKernel:
             if cutlass.const_expr(self.num_b_tensors >= 4):
                 tCgB_l2_3 = thr_mma_l2.partition_B(gB_l2_nkl_3)
             tCgSFB_l2_0 = thr_mma_sfb_l2.partition_B(gSFB_l2_nkl_0)
+            tCgPoolA_l2 = thr_mma_l2.partition_A(gPool_mkl)
             tCgPoolSFA_l2 = thr_mma_l2.partition_A(gPoolSFC_mkl)
             gOut_mnl = cute.local_tile(
                 mOut_mnl,
@@ -2899,9 +2938,20 @@ class BlockScaledMegaMoeFusionKernel:
             tBsSFB_l2 = cute.filter_zeros(tBsSFB_l2)
             tBgSFB_l2_0 = cute.filter_zeros(tBgSFB_l2_0)
 
-            sfa_pool_cta_layout_l2 = cute.make_layout(
+            pool_a_cta_layout_l2 = cute.make_layout(
                 cute.slice_(cluster_layout_vmnk_l2, (0, 0, None, 0)).shape
             )
+            tAsA_pool_tma, tAgA_pool_tma = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_pool_a_l2,
+                block_in_cluster_coord_vmnk_l2[2],
+                pool_a_cta_layout_l2,
+                cute.group_modes(sA_pool, 0, 3),
+                cute.group_modes(tCgPoolA_l2, 0, 3),
+            )
+            tAsA_pool_tma = cute.filter_zeros(tAsA_pool_tma)
+            tAgA_pool_tma = cute.filter_zeros(tAgA_pool_tma)
+
+            sfa_pool_cta_layout_l2 = pool_a_cta_layout_l2
             tAsSFA_pool_tma, tAgSFA_pool_tma = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_pool_sfa_l2,
                 block_in_cluster_coord_vmnk_l2[2],
@@ -3807,7 +3857,7 @@ class BlockScaledMegaMoeFusionKernel:
                     # ``sA_pool`` / ``sSFA_pool``. The inner const_expr
                     # guard is the const_expr gate for the FC1 compile path.
                     # ------------------------------------------------------
-                    if cutlass.const_expr(self.enable_linear2):
+                    if cutlass.const_expr(self.enable_linear2 and not self.use_tma_pool_a_l2):
                         sA_pool_tiled = cute.make_tensor(
                             sA_pool.iterator,
                             layout=cute.make_layout(
@@ -4084,7 +4134,7 @@ class BlockScaledMegaMoeFusionKernel:
             #
             # Wait A pipeline buffer empty
             #
-            if cutlass.const_expr(self.enable_linear2):
+            if cutlass.const_expr(self.enable_linear2 and not self.use_tma_pool_a_l2):
                 a_pipeline_l2.producer_tail(a_producer_state_l2)
             a_pipeline.producer_tail(a_producer_state)
 
@@ -4232,9 +4282,13 @@ class BlockScaledMegaMoeFusionKernel:
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
             b_producer_state_l2 = b_producer_state
+            a_pool_producer_state_l2 = b_producer_state_l2
             sfa_pool_producer_state_l2 = b_producer_state_l2
             if cutlass.const_expr(self.enable_linear2):
                 b_producer_state_l2 = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage_l2
+                )
+                a_pool_producer_state_l2 = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_ab_stage_l2
                 )
                 sfa_pool_producer_state_l2 = pipeline.make_pipeline_state(
@@ -4312,6 +4366,12 @@ class BlockScaledMegaMoeFusionKernel:
                             peek_ab_empty_status = b_pipeline_l2.producer_try_acquire(
                                 b_producer_state_l2
                             )
+                        a_pool_producer_state_l2.reset_count()
+                        peek_a_pool_empty_status_l2 = cutlass.Boolean(1)
+                        if a_pool_producer_state_l2.count < k_tile_cnt_l2:
+                            peek_a_pool_empty_status_l2 = a_pipeline_l2.producer_try_acquire(
+                                a_pool_producer_state_l2
+                            )
                         sfa_pool_producer_state_l2.reset_count()
                         peek_sfa_pool_empty_status = cutlass.Boolean(1)
                         if sfa_pool_producer_state_l2.count < k_tile_cnt_l2:
@@ -4325,18 +4385,30 @@ class BlockScaledMegaMoeFusionKernel:
                             b_pipeline_l2.producer_acquire(
                                 b_producer_state_l2, peek_ab_empty_status
                             )
+                            a_pipeline_l2.producer_acquire(
+                                a_pool_producer_state_l2, peek_a_pool_empty_status_l2
+                            )
                             sfa_pool_pipeline_l2.producer_acquire(
                                 sfa_pool_producer_state_l2, peek_sfa_pool_empty_status
                             )
                             tBsB_l2_pipe = tBsB_l2[(None, b_producer_state_l2.index)]
                             tBsSFB_l2_pipe = tBsSFB_l2[(None, b_producer_state_l2.index)]
+                            tAsA_pool_tma_pipe = tAsA_pool_tma[
+                                (None, a_pool_producer_state_l2.index)
+                            ]
                             tAsSFA_pool_tma_pipe = tAsSFA_pool_tma[
                                 (None, sfa_pool_producer_state_l2.index)
                             ]
                             tma_bar_l2 = b_pipeline_l2.producer_get_barrier(b_producer_state_l2)
+                            tma_bar_a_pool_l2 = a_pipeline_l2.producer_get_barrier(
+                                a_pool_producer_state_l2
+                            )
                             tma_bar_sfa_pool_l2 = sfa_pool_pipeline_l2.producer_get_barrier(
                                 sfa_pool_producer_state_l2
                             )
+                            tAgA_pool_l2_slice = tAgA_pool_tma[
+                                (None, mma_tile_coord_mnl[0], None, 0)
+                            ]
                             tAgSFA_pool_l2_slice = tAgSFA_pool_tma[
                                 (None, mma_tile_coord_mnl[0], None, 0)
                             ]
@@ -4658,6 +4730,13 @@ class BlockScaledMegaMoeFusionKernel:
                                 )
 
                             cute.copy(
+                                tma_atom_pool_a_l2,
+                                tAgA_pool_l2_slice[(None, a_pool_producer_state_l2.count)],
+                                tAsA_pool_tma_pipe,
+                                tma_bar_ptr=tma_bar_a_pool_l2,
+                                mcast_mask=pool_a_l2_full_mcast_mask,
+                            )
+                            cute.copy(
                                 tma_atom_pool_sfa_l2,
                                 tAgSFA_pool_l2_slice[(None, sfa_pool_producer_state_l2.count)],
                                 tAsSFA_pool_tma_pipe,
@@ -4666,11 +4745,17 @@ class BlockScaledMegaMoeFusionKernel:
                             )
 
                             b_producer_state_l2.advance()
+                            a_pool_producer_state_l2.advance()
                             sfa_pool_producer_state_l2.advance()
                             peek_ab_empty_status = cutlass.Boolean(1)
                             if b_producer_state_l2.count < k_tile_cnt_l2:
                                 peek_ab_empty_status = b_pipeline_l2.producer_try_acquire(
                                     b_producer_state_l2
+                                )
+                            peek_a_pool_empty_status_l2 = cutlass.Boolean(1)
+                            if a_pool_producer_state_l2.count < k_tile_cnt_l2:
+                                peek_a_pool_empty_status_l2 = a_pipeline_l2.producer_try_acquire(
+                                    a_pool_producer_state_l2
                                 )
                             peek_sfa_pool_empty_status = cutlass.Boolean(1)
                             if sfa_pool_producer_state_l2.count < k_tile_cnt_l2:
@@ -4970,6 +5055,7 @@ class BlockScaledMegaMoeFusionKernel:
             # Wait A/B buffer empty
             #
             if cutlass.const_expr(self.enable_linear2):
+                a_pipeline_l2.producer_tail(a_pool_producer_state_l2)
                 sfa_pool_pipeline_l2.producer_tail(sfa_pool_producer_state_l2)
                 b_pipeline_l2.producer_tail(b_producer_state_l2)
             b_pipeline.producer_tail(b_producer_state)
