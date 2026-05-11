@@ -547,17 +547,17 @@ class BlockScaledMegaMoeFusionKernel:
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         self.occupancy = 1
-        self.epilog_warp_id = (0, 1, 2, 3, 4, 5, 6, 7)
+        self.epilog_warp_id = (0, 1, 2, 3)
         self.ldgsts_a_warp_id = (
-            8,
-            9,
-            10,
-            11,
+            4,
+            5,
+            6,
+            7,
         )
-        self.mma_warp_id = 12
-        self.tma_b_warp_id = 13
-        self.sched_warp_id = 14
-        self.sync_transform_warp_id = 15
+        self.mma_warp_id = 8
+        self.tma_b_warp_id = 9
+        self.sched_warp_id = 10
+        self.sync_transform_warp_id = 11
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
