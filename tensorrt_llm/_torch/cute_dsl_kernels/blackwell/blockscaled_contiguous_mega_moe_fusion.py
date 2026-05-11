@@ -3162,7 +3162,7 @@ class BlockScaledMegaMoeFusionKernel:
                     st_release_sys_u64(consumer_epoch_ptr, cutlass.Uint64(0))
                     st_release_sys_u64(consumer_flag_ptr, cutlass.Uint64(0))
 
-                    for ready_rank in range(combine_output_ep_size):
+                    for ready_rank in cutlass.range_constexpr(combine_output_ep_size):
                         peer_magic_ptr = cute.domain_offset(
                             (ready_rank, 0), monolithic_control
                         ).iterator
@@ -6538,7 +6538,7 @@ class BlockScaledMegaMoeFusionKernel:
                     st_release_sys_u64(epoch_ptr, expected_epoch)
                     st_release_sys_u64(flag_ptr, cutlass.Uint64(1))
 
-                for ready_rank in range(combine_output_ep_size):
+                for ready_rank in cutlass.range_constexpr(combine_output_ep_size):
                     peer_epoch_ptr = cute.domain_offset(
                         (ready_rank, 8), monolithic_control
                     ).iterator
@@ -6562,7 +6562,7 @@ class BlockScaledMegaMoeFusionKernel:
                 token_idx = linear_idx // monolithic_hidden_size
                 hidden_idx = linear_idx - token_idx * monolithic_hidden_size
                 accum = cutlass.Float32(0.0)
-                for topk_idx in range(combine_output_top_k):
+                for topk_idx in cutlass.range_constexpr(combine_output_top_k):
                     accum = accum + out_tensor[
                         monolithic_local_rank, topk_idx, token_idx, hidden_idx
                     ].to(cutlass.Float32)
