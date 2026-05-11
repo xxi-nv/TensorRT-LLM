@@ -1053,9 +1053,12 @@ class BlockScaledMegaMoeFusionKernel:
                 self.sf_vec_size,
                 self.num_ab_stage_l2,
             )
-            # FC2 direct-combine copies TMEM accumulators to registers and scatters
-            # directly to global memory; there is no C SMEM/TMA-store path to lay out.
-            # Keep ``num_c_stage_l2`` from ``_compute_stages`` as a stage-budget input.
+            self.c_smem_layout_staged_l2 = sm100_utils.make_smem_layout_epi(
+                self.l2_out_dtype,
+                self.l2_output_layout,
+                self.epi_tile,
+                self.num_c_stage_l2,
+            )
 
             # L1 and L2 keep their separately computed AB stage counts. Both
             # non-2CTA and 2CTA paths create phase-specific L2 A pipeline and
@@ -1425,6 +1428,8 @@ class BlockScaledMegaMoeFusionKernel:
         tma_atom_pool_sfa_l2 = None
         tma_tensor_pool_sfa_l2 = None
         self.num_tma_sfa_pool_load_bytes = 0
+        tma_atom_out = None
+        tma_tensor_out = None
         # pool store atoms start as ``None``; populated
         # inside the enable_linear2 block below.
         tma_atom_pool_store = None
@@ -1541,8 +1546,17 @@ class BlockScaledMegaMoeFusionKernel:
             tma_atoms_sfb_l2 = tuple(tma_atoms_sfb_l2_list)  # noqa: F841
             tma_tensors_sfb_l2 = tuple(tma_tensors_sfb_l2_list)  # noqa: F841
 
-            # FC2 direct-combine does not TMA-store C. The final-output tensor is
-            # threaded separately as a layout carrier for TMEM->register partitioning.
+            # TMA store for the Linear2 BF16 output tensor. FC2 scatters at
+            # the full (M, N) tile granularity (no SwiGLU halving), so we
+            # slice ``c_smem_layout_staged_l2`` with the same epi_tile used
+            # for FC1.
+            epi_smem_layout_l2 = cute.slice_(self.c_smem_layout_staged_l2, (None, None, 0))
+            tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                out,
+                epi_smem_layout_l2,
+                self.epi_tile,
+            )
 
             # FC1 epilogue HBM pool store TMA atom. Shares
             # the FC1 ``epi_smem_layout`` (``sC`` staging) because the FC1
@@ -1829,10 +1843,13 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_sfb_l2 = tma_tensors_sfb_l2
             kernel_tma_atom_pool_sfa_l2 = tma_atom_pool_sfa_l2
             kernel_tma_tensor_pool_sfa_l2 = tma_tensor_pool_sfa_l2
+            kernel_tma_atom_out = tma_atom_out
+            kernel_tma_tensor_out = tma_tensor_out
             kernel_cluster_layout_vmnk_l2 = self.cluster_layout_vmnk_l2
             kernel_cluster_layout_sfb_vmnk_l2 = self.cluster_layout_sfb_vmnk_l2
             kernel_b_smem_layout_staged_l2 = self.b_smem_layout_staged_l2
             kernel_sfb_smem_layout_staged_l2 = self.sfb_smem_layout_staged_l2
+            kernel_c_smem_layout_staged_l2 = self.c_smem_layout_staged_l2
             # pool store TMA atom built above; drives the
             # FC1 epilogue S2G stream to the permuted HBM pool.
             kernel_tma_atom_pool_store = tma_atom_pool_store
@@ -1859,10 +1876,13 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_sfb_l2 = tma_tensors_sfb
             kernel_tma_atom_pool_sfa_l2 = tma_atoms_sfb[0]
             kernel_tma_tensor_pool_sfa_l2 = sfa
+            kernel_tma_atom_out = tma_atom_c
+            kernel_tma_tensor_out = tma_tensor_c
             kernel_cluster_layout_vmnk_l2 = self.cluster_layout_vmnk
             kernel_cluster_layout_sfb_vmnk_l2 = self.cluster_layout_sfb_vmnk
             kernel_b_smem_layout_staged_l2 = self.b_smem_layout_staged
             kernel_sfb_smem_layout_staged_l2 = self.sfb_smem_layout_staged
+            kernel_c_smem_layout_staged_l2 = self.c_smem_layout_staged
             # Linear1-only path reuses the FC1 ``tma_atom_c`` /
             # ``tma_tensor_c`` to keep the kernel signature uniformly
             # typed; the device-side epilogue picks FC1 vs pool via the
@@ -1882,8 +1902,6 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_a_smem_layout_staged_l2 = self.a_smem_layout_staged
             kernel_sfa_smem_layout_staged_l2 = self.sfa_smem_layout_staged
             kernel_epi_layout_l2 = cute.make_layout(shape=(1,), stride=(1,))
-
-        kernel_m_out_mnl = out if out is not None else c
 
         # ------------------------------------------------------------------
         # HBM pool tensors threaded into the device kernel.
@@ -1958,11 +1976,13 @@ class BlockScaledMegaMoeFusionKernel:
             kernel_tma_tensors_sfb_l2,
             kernel_tma_atom_pool_sfa_l2,
             kernel_tma_tensor_pool_sfa_l2,
-            kernel_m_out_mnl,
+            kernel_tma_atom_out,
+            kernel_tma_tensor_out,
             kernel_cluster_layout_vmnk_l2,
             kernel_cluster_layout_sfb_vmnk_l2,
             kernel_b_smem_layout_staged_l2,
             kernel_sfb_smem_layout_staged_l2,
+            kernel_c_smem_layout_staged_l2,
             # HBM pool hand-off tensors for the FC2
             # LDGSTS-A phase. Linear1-only path reuses ``a``/``sfa``; gated
             # device-side via ``cutlass.const_expr(self.enable_linear2)``.
@@ -2134,11 +2154,13 @@ class BlockScaledMegaMoeFusionKernel:
         mSFB_l2_nkl_tuple: Tuple[cute.Tensor, ...],
         tma_atom_pool_sfa_l2: cute.CopyAtom,
         mPoolSFA_l2_mkl: cute.Tensor,
+        tma_atom_out: cute.CopyAtom,
         mOut_mnl: cute.Tensor,
         cluster_layout_vmnk_l2: cute.Layout,
         cluster_layout_sfb_vmnk_l2: cute.Layout,
         b_smem_layout_staged_l2: cute.ComposedLayout,
         sfb_smem_layout_staged_l2: cute.Layout,
+        c_smem_layout_staged_l2: Union[cute.Layout, cute.ComposedLayout, None],
         # FC1 -> FC2 activation hand-off pool tensors.
         # Reads are gated on ``cutlass.const_expr(self.enable_linear2)`` in
         # the LDGSTS-A warp body below so the Linear1-only path never touches
@@ -2239,6 +2261,7 @@ class BlockScaledMegaMoeFusionKernel:
                     cpasync.prefetch_descriptor(tma_atoms_b_l2[3])
                     cpasync.prefetch_descriptor(tma_atoms_sfb_l2[3])
                 cpasync.prefetch_descriptor(tma_atom_pool_sfa_l2)
+                cpasync.prefetch_descriptor(tma_atom_out)
                 # prefetch FC1 epilogue pool-store TMA
                 # descriptor so the first L1-phase epilogue S2G stream to
                 # the HBM pool does not pay a cold-start stall. DCE'd on
