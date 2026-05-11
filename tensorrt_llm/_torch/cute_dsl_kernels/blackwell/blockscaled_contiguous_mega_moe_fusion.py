@@ -6254,8 +6254,10 @@ class BlockScaledMegaMoeFusionKernel:
 
                         tile_m_start = tile_info[0] * self.cta_tile_shape_mnk_l2[0]
                         permuted_row = tile_m_start + epi_tidx
-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                         is_valid_row = permuted_row < tile_info[4]
+                        expanded_idx = cutlass.Int32(0)
+                        if is_valid_row:
+                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
 
                         # Overwrite alpha_val with the topk-weighted factor for
                         # the current (token, topk) slot. Following DeepGEMM
@@ -6301,8 +6303,9 @@ class BlockScaledMegaMoeFusionKernel:
                             if cutlass.const_expr(self.overlapping_accum_l2):
                                 if reverse_subtile:
                                     real_subtile_idx = subtile_cnt_l2 - 1 - subtile_idx
-                            tTR_tAcc_l2_mn = tTR_tAcc_l2[(None, None, None, real_subtile_idx)]
-                            cute.copy(tiled_copy_t2r_l2, tTR_tAcc_l2_mn, tTR_rAcc_l2)
+                            if is_valid_row:
+                                tTR_tAcc_l2_mn = tTR_tAcc_l2[(None, None, None, real_subtile_idx)]
+                                cute.copy(tiled_copy_t2r_l2, tTR_tAcc_l2_mn, tTR_rAcc_l2)
 
                             if cutlass.const_expr(self.overlapping_accum_l2):
                                 if subtile_idx == self.iter_acc_early_release_in_epilogue_l2:
@@ -6311,11 +6314,11 @@ class BlockScaledMegaMoeFusionKernel:
                                         acc_pipeline_l2.consumer_release(acc_consumer_state_l2)
                                     acc_consumer_state_l2.advance()
 
-                            acc_vec_l2 = tTR_rAcc_l2.load()
-                            acc_vec_final_l2 = alpha_val_l2 * acc_vec_l2
-                            tTR_rC_l2.store(acc_vec_final_l2.to(self.l2_out_dtype))
-
                             if is_valid_row:
+                                acc_vec_l2 = tTR_rAcc_l2.load()
+                                acc_vec_final_l2 = alpha_val_l2 * acc_vec_l2
+                                tTR_rC_l2.store(acc_vec_final_l2.to(self.l2_out_dtype))
+
                                 rOut_epi = cute.make_tensor(tTR_rC_l2.iterator, epi_layout_l2)
                                 base_coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_l2[
                                     1
