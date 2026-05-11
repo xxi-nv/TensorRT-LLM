@@ -591,9 +591,6 @@ class BlockScaledMegaMoeFusionKernel:
         )
         self.threads_wo_sched = self.threads_per_warp * self.warps_wo_sched
 
-        self.num_regs_uniform_warps = 64
-        self.num_regs_sched_warps = 64
-
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
@@ -2253,7 +2250,6 @@ class BlockScaledMegaMoeFusionKernel:
         # Prefetch tma desc
         #
         if warp_idx == self.tma_b_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             # Prefetch TMA descriptors for all B tensors using const_expr conditions
             cpasync.prefetch_descriptor(tma_atoms_b[0])
             cpasync.prefetch_descriptor(tma_atoms_sfb[0])
@@ -3489,7 +3485,6 @@ class BlockScaledMegaMoeFusionKernel:
         # Specialized Schedule Warp
         #
         if warp_idx == self.sched_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
@@ -3693,7 +3688,6 @@ class BlockScaledMegaMoeFusionKernel:
         # with gather/permutation capability enabled by token_id_mapping
         #
         if warp_idx <= self.ldgsts_a_warp_id[-1] and warp_idx >= self.ldgsts_a_warp_id[0]:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Setup LDGSTS copy atoms for A and SFA
             # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix (32 elements per thread)
@@ -4099,7 +4093,6 @@ class BlockScaledMegaMoeFusionKernel:
         # This warp serve as sync transformation for A and SFA
         #
         if warp_idx == self.sync_transform_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             if cutlass.const_expr(self.use_2cta_instrs):
                 #
                 # Persistent tile scheduling loop
