@@ -1213,7 +1213,15 @@ void megaMoeStageDispatchInputs(uint8_t const* input, int64_t const inputBytes, 
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    bool const useVectorCopy = false;
+    int32_t constexpr kBytesPerVector = sizeof(ElemCopyType);
+    auto const isAlignedForVectorCopy
+        = [](void const* ptr) { return reinterpret_cast<std::uintptr_t>(ptr) % sizeof(ElemCopyType) == 0; };
+    bool const useVectorCopy = inputBytes % kBytesPerVector == 0 && inputSfBytes % kBytesPerVector == 0
+        && topKIdxBytes % kBytesPerVector == 0 && topKScalesBytes % kBytesPerVector == 0
+        && isAlignedForVectorCopy(input) && isAlignedForVectorCopy(inputSf) && isAlignedForVectorCopy(topKIdx)
+        && isAlignedForVectorCopy(topKScales) && isAlignedForVectorCopy(inputBuffer)
+        && isAlignedForVectorCopy(inputSfBuffer) && isAlignedForVectorCopy(topKIdxBuffer)
+        && isAlignedForVectorCopy(topKScalesBuffer);
     cudaLaunchKernelEx(&config, kernel, input, inputBytes, inputSf, inputSfBytes, topKIdx, topKIdxBytes, topKScales,
         topKScalesBytes, inputBuffer, inputSfBuffer, topKIdxBuffer, topKScalesBuffer, useVectorCopy);
 }
@@ -1331,8 +1339,15 @@ void megaMoeM5BuildDirectInputRouteFromRankedTopK(uint8_t const* input, int64_t 
     copyConfig.stream = stream;
     copyConfig.numAttrs = 1;
     copyConfig.attrs = attrs;
-    bool const useVectorInputCopy = false;
-    bool const useVectorInputSfCopy = false;
+    int32_t constexpr kBytesPerVector = sizeof(ElemCopyType);
+    auto const isAlignedForVectorCopy
+        = [](void const* ptr) { return reinterpret_cast<std::uintptr_t>(ptr) % sizeof(ElemCopyType) == 0; };
+    bool const useVectorInputCopy = hiddenPackedSize % kBytesPerVector == 0 && inputRankStride % kBytesPerVector == 0
+        && inputTokenStride % kBytesPerVector == 0 && isAlignedForVectorCopy(input)
+        && isAlignedForVectorCopy(directInput);
+    bool const useVectorInputSfCopy = sfHiddenSize % kBytesPerVector == 0 && inputSfRankStride % kBytesPerVector == 0
+        && inputSfTokenStride % kBytesPerVector == 0 && isAlignedForVectorCopy(inputSf)
+        && isAlignedForVectorCopy(directInputSf);
     cudaLaunchKernelEx(&copyConfig, copyCountKernel, input, inputRankStride, inputTokenStride, inputSf,
         inputSfRankStride, inputSfTokenStride, directInput, directInputSf, topKIdx, topKIdxRankStride,
         topKIdxTokenStride, tokenCounts, expertRouteOffsets, epSize, localRank, numExpertsPerRank, hiddenPackedSize,
