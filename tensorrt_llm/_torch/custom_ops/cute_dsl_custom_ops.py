@@ -3519,6 +3519,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_direct_topk_num_local_experts = int(
                 kwargs.get("monolithic_direct_topk_num_local_experts",
                            self.num_local_experts))
+            fc2_n_tile = int(kwargs.get("fc2_n_tile", 128))
+            if fc2_n_tile not in (64, 128, 256):
+                raise ValueError("fc2_n_tile must be one of 64, 128, or 256")
             if monolithic_control_rank_stride_elements == 0:
                 monolithic_control_rank_stride_elements = (
                     monolithic_control.stride(0)
@@ -3853,10 +3856,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
                 raster_along_m = False
-            # FC2 shares the tile M with FC1 (``tile_size``); FC2 N defaults
-            # to 128 as a safe starting tactic. A dedicated L2 autotune
-            # dimension can be added once the fused path is shipped.
-            mma_tiler_mn_l2 = (self.tile_size, 128)
+            # FC2 shares the tile M with FC1 (``tile_size``); expose the
+            # N dimension as a private benchmark-time knob because FC2 has a
+            # different output width and scheduling pressure than FC1.
+            mma_tiler_mn_l2 = (self.tile_size, fc2_n_tile)
 
             cache_key = (
                 self.scaling_vector_size, self.tile_size, self.top_k,
@@ -4318,6 +4321,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_scales: Optional[torch.Tensor] = None,
+        fc2_n_tile: int = 128,
     ) -> None:
         l2_arrival_mask.zero_()
         runner = Sm100BlockScaledMegaMoeBlackwellRunner(
@@ -4420,6 +4424,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if monolithic_direct_topk_scales is not None else 0),
             monolithic_direct_topk_local_expert_offset=local_expert_offset,
             monolithic_direct_topk_num_local_experts=num_local_experts,
+            fc2_n_tile=fc2_n_tile,
         )
 
     @torch.library.custom_op("trtllm::cute_dsl_nvfp4_mega_moe_blackwell",
@@ -4729,6 +4734,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_pool_tensor: Optional[torch.Tensor] = None,
         monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
         monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+        fc2_n_tile: int = 128,
     ) -> None:
         """Monolithic MegaMoE direct top-k dispatch + FC1/FC2 + M6 reduce.
 
@@ -4949,6 +4955,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_direct_topk_local_idx=monolithic_direct_topk_local_idx,
             monolithic_direct_topk_local_scales=
             monolithic_direct_topk_local_scales,
+            fc2_n_tile=fc2_n_tile,
         )
 
     @torch.library.register_fake(
@@ -5000,6 +5007,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_pool_tensor: Optional[torch.Tensor] = None,
         monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
         monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+        fc2_n_tile: int = 128,
     ) -> None:
         return None
 

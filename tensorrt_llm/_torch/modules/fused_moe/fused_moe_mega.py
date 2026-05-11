@@ -257,6 +257,9 @@ class MegaMoE(MoE):
         self.tile_size = self._select_full_fusion_tile_size(
             extra_attrs, self._full_fusion_deepgemm_tile_heuristic
         )
+        self._full_fusion_fc2_n_tile = int(extra_attrs.get("megamoe_full_fusion_fc2_n_tile", 128))
+        if self._full_fusion_fc2_n_tile not in (64, 128, 256):
+            raise ValueError("megamoe_full_fusion_fc2_n_tile must be one of 64, 128, or 256")
         self._full_fusion_fallback_diagnostics: dict[str, _FullFusionFallbackDiagnostic] = {}
         self._full_fusion_runtime_gate = self._disabled_full_fusion_runtime_gate(
             "full-fusion runtime gate disabled"
@@ -570,6 +573,7 @@ class MegaMoE(MoE):
             "output_path_ready": output_path_ready,
             "planned_layout": getattr(plan, "layout", None),
             "tile_size": getattr(self, "tile_size", None),
+            "fc2_n_tile": getattr(self, "_full_fusion_fc2_n_tile", None),
             "deepgemm_tile_heuristic": getattr(self, "_full_fusion_deepgemm_tile_heuristic", None),
             "pre_dispatch_used": bool(
                 getattr(self, "_full_fusion_pre_dispatch_output_path_used", False)
@@ -1308,6 +1312,7 @@ class MegaMoE(MoE):
                     monolithic_pool_tensor,
                     monolithic_pool_sf_tensor,
                     monolithic_l2_arrival_mask,
+                    self._full_fusion_fc2_n_tile,
                 )
         except (RuntimeError, ValueError) as exc:
             return None, f"CUTEDSL monolithic direct-topk reduce failed: {exc}"
@@ -5025,6 +5030,7 @@ class MegaMoE(MoE):
                 monolithic_local_rank=in_kernel_local_rank,
                 monolithic_local_tokens=in_kernel_local_tokens,
                 monolithic_epoch=in_kernel_epoch,
+                fc2_n_tile=self._full_fusion_fc2_n_tile,
             )
             return
 
