@@ -2724,9 +2724,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.top_k = top_k
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
-            if tile_size not in [128, 256]:
+            if tile_size not in [64, 128, 256]:
                 raise ValueError(
-                    f"Tile size {tile_size} is not supported, it only supports 128 and 256."
+                    f"Tile size {tile_size} is not supported, it only supports 64, 128, and 256 in the MegaMoE probe."
                 )
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
@@ -2737,9 +2737,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
-            if self.tile_size not in (128, 256):
+            if self.tile_size not in (64, 128, 256):
                 raise ValueError(
-                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 64, 128, and 256 in the MegaMoE probe, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -2772,7 +2772,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
-            cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
+            cluster_shape_mn_candidates = [(max(self.tile_size // 128, 1), 1)]
             # TODO: Add raster_along_m=True if we find it more performant in some cases.
             raster_along_m_candidates = [False]
 
@@ -2984,7 +2984,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
                 mma_tiler_mn = (self.tile_size, 128)
-                cluster_shape_mn = (self.tile_size // 128, 1)
+                cluster_shape_mn = (max(self.tile_size // 128, 1), 1)
                 raster_along_m = False
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
@@ -3851,7 +3851,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
                 mma_tiler_mn = (self.tile_size, 128)
-                cluster_shape_mn = (self.tile_size // 128, 1)
+                cluster_shape_mn = (max(self.tile_size // 128, 1), 1)
                 raster_along_m = False
             # FC2 shares the tile M with FC1 (``tile_size``); FC2 N defaults
             # to 128 as a safe starting tactic. A dedicated L2 autotune

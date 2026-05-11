@@ -7141,7 +7141,7 @@ class BlockScaledMegaMoeFusionKernel:
         is_valid = True
 
         # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in (128, 256):
+        if mma_tiler_mn[0] not in (64, 128, 256):
             is_valid = False
         # Skip invalid mma tile n
         # SwiGlu Fusion requires even epi_tile counts,
@@ -7150,7 +7150,7 @@ class BlockScaledMegaMoeFusionKernel:
             is_valid = False
 
         # Skip illegal cluster shape
-        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
+        if (mma_tiler_mn[0] // cluster_shape_mn[0]) not in (64, 128):
             is_valid = False
 
         if (

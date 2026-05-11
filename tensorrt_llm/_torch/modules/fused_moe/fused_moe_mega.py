@@ -187,8 +187,8 @@ class MegaMoE(MoE):
             "deepgemm_store_block_m": store_block_m,
             "compatible_cutedsl_tile_size": compatible_tile_size,
             "note": (
-                "CuTeDSL MegaMoE currently supports tile_size 128/256; "
-                "DeepGEMM 16/32/64/96/192 need a deeper tiler/layout port."
+                "CuTeDSL MegaMoE defaults to tile_size 128/256; "
+                "tile_size 64 is currently a private structural probe for sparse expert occupancy."
             ),
         }
 
@@ -197,9 +197,9 @@ class MegaMoE(MoE):
         override = extra_attrs.get("megamoe_full_fusion_tile_size")
         if override is not None:
             tile_size = int(override)
-            if tile_size not in (128, 256):
+            if tile_size not in (64, 128, 256):
                 raise ValueError(
-                    "megamoe_full_fusion_tile_size must be 128 or 256 for the current CuTeDSL kernel"
+                    "megamoe_full_fusion_tile_size must be 64, 128, or 256 for the current CuTeDSL probe"
                 )
             return tile_size
         if bool(extra_attrs.get("megamoe_enable_deepgemm_tile_heuristic", False)):
