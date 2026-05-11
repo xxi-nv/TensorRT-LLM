@@ -208,16 +208,25 @@ class MegaMoE(MoE):
         return cls._DEFAULT_TILE_SIZE
 
     @classmethod
+    def _should_prefer_full_fusion_direct_input_route(
+        cls, extra_attrs: dict, heuristic: dict[str, object]
+    ) -> tuple[bool, float]:
+        expected = float(heuristic.get("expected_tokens_per_expert", 0.0))
+        return (
+            bool(extra_attrs.get("megamoe_enable_deepgemm_tile_heuristic", False))
+            and expected <= cls._FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT,
+            expected,
+        )
+
+    @classmethod
     def _select_full_fusion_monolithic_direct_topk_reduce(
         cls,
         extra_attrs: dict,
         heuristic: dict[str, object],
     ) -> tuple[bool, dict[str, object]]:
         override = extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_reduce")
-        expected = float(heuristic.get("expected_tokens_per_expert", 0.0))
-        use_direct_route = (
-            bool(extra_attrs.get("megamoe_enable_deepgemm_tile_heuristic", False))
-            and expected <= cls._FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT
+        use_direct_route, expected = cls._should_prefer_full_fusion_direct_input_route(
+            extra_attrs, heuristic
         )
         if use_direct_route:
             selected = False
@@ -228,6 +237,35 @@ class MegaMoE(MoE):
         else:
             selected = bool(override)
             reason = "explicit_override"
+        return selected, {
+            "requested": override,
+            "selected": selected,
+            "reason": reason,
+            "expected_tokens_per_expert": expected,
+            "direct_input_route_threshold": (
+                cls._FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT
+            ),
+        }
+
+    @classmethod
+    def _select_full_fusion_cutedsl_stage_dispatch_inputs(
+        cls,
+        extra_attrs: dict,
+        heuristic: dict[str, object],
+    ) -> tuple[bool, dict[str, object]]:
+        override = extra_attrs.get("megamoe_enable_full_fusion_cutedsl_stage_dispatch_inputs")
+        use_direct_route, expected = cls._should_prefer_full_fusion_direct_input_route(
+            extra_attrs, heuristic
+        )
+        if override is not None:
+            selected = bool(override)
+            reason = "explicit_override"
+        elif use_direct_route:
+            selected = True
+            reason = "low_expected_tokens_per_expert"
+        else:
+            selected = False
+            reason = "default_fused_stage"
         return selected, {
             "requested": override,
             "selected": selected,
@@ -376,8 +414,11 @@ class MegaMoE(MoE):
         self._full_fusion_monolithic_direct_topk_materialize_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_materialize", True)
         )
-        self._full_fusion_cutedsl_stage_dispatch_inputs_enabled = bool(
-            extra_attrs.get("megamoe_enable_full_fusion_cutedsl_stage_dispatch_inputs", False)
+        (
+            self._full_fusion_cutedsl_stage_dispatch_inputs_enabled,
+            self._full_fusion_cutedsl_stage_dispatch_inputs_selection,
+        ) = self._select_full_fusion_cutedsl_stage_dispatch_inputs(
+            extra_attrs, self._full_fusion_deepgemm_tile_heuristic
         )
         self._full_fusion_cutedsl_direct_input_route_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_cutedsl_direct_input_route", False)
@@ -618,6 +659,9 @@ class MegaMoE(MoE):
             "deepgemm_tile_heuristic": getattr(self, "_full_fusion_deepgemm_tile_heuristic", None),
             "monolithic_direct_topk_reduce_selection": getattr(
                 self, "_full_fusion_monolithic_direct_topk_reduce_selection", None
+            ),
+            "cutedsl_stage_dispatch_inputs_selection": getattr(
+                self, "_full_fusion_cutedsl_stage_dispatch_inputs_selection", None
             ),
             "pre_dispatch_used": bool(
                 getattr(self, "_full_fusion_pre_dispatch_output_path_used", False)
