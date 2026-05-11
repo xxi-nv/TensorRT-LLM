@@ -3301,36 +3301,55 @@ class BlockScaledMegaMoeFusionKernel:
                     observed_phase = ld_acquire_sys_u32(grid_sync_phase_ptr)
             self.cta_sync_barrier.arrive_and_wait()
 
+            lane_idx = tidx % self.threads_per_warp
             flat_route_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
+            warp_route_base_idx = flat_route_idx - lane_idx
             total_route_items = (
                 combine_output_ep_size
                 * combine_output_max_num_tokens_per_rank
                 * combine_output_top_k
             )
-            while flat_route_idx < total_route_items:
-                route_token_linear_idx = flat_route_idx // combine_output_top_k
-                source_topk_idx = flat_route_idx - route_token_linear_idx * combine_output_top_k
-                source_rank = route_token_linear_idx // combine_output_max_num_tokens_per_rank
-                source_token_idx = (
-                    route_token_linear_idx - source_rank * combine_output_max_num_tokens_per_rank
-                )
-                source_token_count = monolithic_direct_topk_token_counts[source_rank]
-                if source_token_idx < source_token_count:
-                    selected_expert = monolithic_direct_topk_idx[
-                        source_rank, source_token_idx, source_topk_idx
-                    ]
-                    local_expert_dynamic = selected_expert - cutlass.Int64(
-                        monolithic_direct_topk_local_expert_offset
+            while warp_route_base_idx < total_route_items:
+                flat_route_idx = warp_route_base_idx + lane_idx
+                route_is_local = cutlass.Boolean(False)
+                local_expert_i32 = cutlass.Int32(-1)
+                if flat_route_idx < total_route_items:
+                    route_token_linear_idx = flat_route_idx // combine_output_top_k
+                    source_topk_idx = flat_route_idx - route_token_linear_idx * combine_output_top_k
+                    source_rank = route_token_linear_idx // combine_output_max_num_tokens_per_rank
+                    source_token_idx = (
+                        route_token_linear_idx
+                        - source_rank * combine_output_max_num_tokens_per_rank
                     )
-                    if (local_expert_dynamic >= cutlass.Int64(0)) and (
-                        local_expert_dynamic
-                        < cutlass.Int64(monolithic_direct_topk_num_local_experts)
-                    ):
-                        local_expert_i32 = cutlass.Int32(local_expert_dynamic)
-                        atomic_add_release_sys_u32(
-                            route_count_base_ptr + local_expert_i32, cutlass.Uint32(1)
+                    source_token_count = monolithic_direct_topk_token_counts[source_rank]
+                    if source_token_idx < source_token_count:
+                        selected_expert = monolithic_direct_topk_idx[
+                            source_rank, source_token_idx, source_topk_idx
+                        ]
+                        local_expert_dynamic = selected_expert - cutlass.Int64(
+                            monolithic_direct_topk_local_expert_offset
                         )
-                flat_route_idx = flat_route_idx + stage_grid_stride
+                        if (local_expert_dynamic >= cutlass.Int64(0)) and (
+                            local_expert_dynamic
+                            < cutlass.Int64(monolithic_direct_topk_num_local_experts)
+                        ):
+                            route_is_local = cutlass.Boolean(True)
+                            local_expert_i32 = cutlass.Int32(local_expert_dynamic)
+
+                for local_expert_idx in cutlass.range_constexpr(
+                    monolithic_direct_topk_num_local_experts
+                ):
+                    route_matches_expert = route_is_local and (
+                        local_expert_i32 == cutlass.Int32(local_expert_idx)
+                    )
+                    route_mask = cute.arch.vote_ballot_sync(route_matches_expert)
+                    warp_route_count = cute.arch.popc(route_mask)
+                    if (lane_idx == 0) and (warp_route_count > 0):
+                        atomic_add_release_sys_u32(
+                            route_count_base_ptr + local_expert_idx,
+                            cutlass.Uint32(warp_route_count),
+                        )
+                warp_route_base_idx = warp_route_base_idx + stage_grid_stride
 
             # Phase 4: route counts are complete before block0 writes prefix metadata.
             fence_acq_rel_gpu()
@@ -3415,36 +3434,63 @@ class BlockScaledMegaMoeFusionKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
             flat_route_fill_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
-            while flat_route_fill_idx < total_route_items:
-                route_token_linear_idx = flat_route_fill_idx // combine_output_top_k
-                source_topk_idx = (
-                    flat_route_fill_idx - route_token_linear_idx * combine_output_top_k
-                )
-                source_rank = route_token_linear_idx // combine_output_max_num_tokens_per_rank
-                source_token_idx = (
-                    route_token_linear_idx - source_rank * combine_output_max_num_tokens_per_rank
-                )
-                source_token_count = monolithic_direct_topk_token_counts[source_rank]
-                if source_token_idx < source_token_count:
-                    selected_expert = monolithic_direct_topk_idx[
-                        source_rank, source_token_idx, source_topk_idx
-                    ]
-                    local_expert_dynamic = selected_expert - cutlass.Int64(
-                        monolithic_direct_topk_local_expert_offset
+            warp_route_fill_base_idx = flat_route_fill_idx - lane_idx
+            while warp_route_fill_base_idx < total_route_items:
+                flat_route_fill_idx = warp_route_fill_base_idx + lane_idx
+                source_rank = cutlass.Int32(0)
+                source_topk_idx = cutlass.Int32(0)
+                source_token_idx = cutlass.Int32(0)
+                route_is_local = cutlass.Boolean(False)
+                local_expert_i32 = cutlass.Int32(-1)
+                if flat_route_fill_idx < total_route_items:
+                    route_token_linear_idx = flat_route_fill_idx // combine_output_top_k
+                    source_topk_idx = (
+                        flat_route_fill_idx - route_token_linear_idx * combine_output_top_k
                     )
-                    if (local_expert_dynamic >= cutlass.Int64(0)) and (
-                        local_expert_dynamic
-                        < cutlass.Int64(monolithic_direct_topk_num_local_experts)
-                    ):
-                        local_expert_i32 = cutlass.Int32(local_expert_dynamic)
-                        route_ordinal = cutlass.Int32(
+                    source_rank = route_token_linear_idx // combine_output_max_num_tokens_per_rank
+                    source_token_idx = (
+                        route_token_linear_idx
+                        - source_rank * combine_output_max_num_tokens_per_rank
+                    )
+                    source_token_count = monolithic_direct_topk_token_counts[source_rank]
+                    if source_token_idx < source_token_count:
+                        selected_expert = monolithic_direct_topk_idx[
+                            source_rank, source_token_idx, source_topk_idx
+                        ]
+                        local_expert_dynamic = selected_expert - cutlass.Int64(
+                            monolithic_direct_topk_local_expert_offset
+                        )
+                        if (local_expert_dynamic >= cutlass.Int64(0)) and (
+                            local_expert_dynamic
+                            < cutlass.Int64(monolithic_direct_topk_num_local_experts)
+                        ):
+                            route_is_local = cutlass.Boolean(True)
+                            local_expert_i32 = cutlass.Int32(local_expert_dynamic)
+
+                for local_expert_idx in cutlass.range_constexpr(
+                    monolithic_direct_topk_num_local_experts
+                ):
+                    route_matches_expert = route_is_local and (
+                        local_expert_i32 == cutlass.Int32(local_expert_idx)
+                    )
+                    route_mask = cute.arch.vote_ballot_sync(route_matches_expert)
+                    warp_route_count = cute.arch.popc(route_mask)
+                    warp_route_base = cutlass.Int32(0)
+                    if (lane_idx == 0) and (warp_route_count > 0):
+                        warp_route_base = cutlass.Int32(
                             atomic_add_release_sys_u32(
-                                route_cursor_base_ptr + local_expert_i32,
-                                cutlass.Uint32(1),
+                                route_cursor_base_ptr + local_expert_idx,
+                                cutlass.Uint32(warp_route_count),
                             )
                         )
+                    warp_route_base = cute.arch.shuffle_sync(
+                        warp_route_base, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+                    )
+                    lane_prefix_mask = route_mask & ((cutlass.Int32(1) << lane_idx) - 1)
+                    route_ordinal = warp_route_base + cute.arch.popc(lane_prefix_mask)
+                    if route_matches_expert:
                         pool_start = cutlass.Int32(
-                            ld_acquire_sys_u64(route_base_base_ptr + local_expert_i32)
+                            ld_acquire_sys_u64(route_base_base_ptr + local_expert_idx)
                         )
                         pool_slot = pool_start + route_ordinal
                         combine_row = (
@@ -3458,7 +3504,7 @@ class BlockScaledMegaMoeFusionKernel:
                         token_final_scales[(combine_row, 0)] = monolithic_direct_topk_scales[
                             source_rank, source_token_idx, source_topk_idx
                         ]
-                flat_route_fill_idx = flat_route_fill_idx + stage_grid_stride
+                warp_route_fill_base_idx = warp_route_fill_base_idx + stage_grid_stride
 
             # Phase 6: all route mappings are materialized before persistent FC1/FC2 scheduling.
             fence_acq_rel_gpu()
