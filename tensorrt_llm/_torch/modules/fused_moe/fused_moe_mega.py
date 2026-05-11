@@ -130,6 +130,7 @@ class MegaMoE(MoE):
     _FULL_FUSION_M6_READY_FLAG = 1
     _FULL_FUSION_M5_SYNC_TIMEOUT_S = 1.0
     _FULL_FUSION_M5_SYNC_POLL_INTERVAL_S = 0.0001
+    _FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT = 32.5
 
     @classmethod
     def can_implement(
@@ -205,6 +206,37 @@ class MegaMoE(MoE):
         if bool(extra_attrs.get("megamoe_enable_deepgemm_tile_heuristic", False)):
             return int(heuristic["compatible_cutedsl_tile_size"])
         return cls._DEFAULT_TILE_SIZE
+
+    @classmethod
+    def _select_full_fusion_monolithic_direct_topk_reduce(
+        cls,
+        extra_attrs: dict,
+        heuristic: dict[str, object],
+    ) -> tuple[bool, dict[str, object]]:
+        override = extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_reduce")
+        expected = float(heuristic.get("expected_tokens_per_expert", 0.0))
+        use_direct_route = (
+            bool(extra_attrs.get("megamoe_enable_deepgemm_tile_heuristic", False))
+            and expected <= cls._FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT
+        )
+        if use_direct_route:
+            selected = False
+            reason = "low_expected_tokens_per_expert"
+        elif override is None:
+            selected = False
+            reason = "default_direct_input_route"
+        else:
+            selected = bool(override)
+            reason = "explicit_override"
+        return selected, {
+            "requested": override,
+            "selected": selected,
+            "reason": reason,
+            "expected_tokens_per_expert": expected,
+            "direct_input_route_threshold": (
+                cls._FULL_FUSION_DIRECT_INPUT_ROUTE_MAX_EXPECTED_TOKENS_PER_EXPERT
+            ),
+        }
 
     def __init__(
         self,
@@ -332,8 +364,11 @@ class MegaMoE(MoE):
                 output_path_requested,
             )
         )
-        self._full_fusion_monolithic_direct_topk_reduce_enabled = bool(
-            extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_reduce", False)
+        (
+            self._full_fusion_monolithic_direct_topk_reduce_enabled,
+            self._full_fusion_monolithic_direct_topk_reduce_selection,
+        ) = self._select_full_fusion_monolithic_direct_topk_reduce(
+            extra_attrs, self._full_fusion_deepgemm_tile_heuristic
         )
         self._full_fusion_monolithic_direct_topk_stage_inputs_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_stage_inputs", True)
@@ -581,6 +616,9 @@ class MegaMoE(MoE):
             "planned_layout": getattr(plan, "layout", None),
             "tile_size": getattr(self, "tile_size", None),
             "deepgemm_tile_heuristic": getattr(self, "_full_fusion_deepgemm_tile_heuristic", None),
+            "monolithic_direct_topk_reduce_selection": getattr(
+                self, "_full_fusion_monolithic_direct_topk_reduce_selection", None
+            ),
             "pre_dispatch_used": bool(
                 getattr(self, "_full_fusion_pre_dispatch_output_path_used", False)
             ),
