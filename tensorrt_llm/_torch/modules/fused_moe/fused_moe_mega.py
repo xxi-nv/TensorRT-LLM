@@ -5060,6 +5060,18 @@ class MegaMoE(MoE):
         combine_output_rank_stride_elements = (
             output.stride(0) if direct_combine_buffer_output else 0
         )
+        direct_combine_linear_output = False
+        if direct_combine_buffer_output:
+            required_output_elements_per_rank = (
+                combine_output_top_k * combine_output_max_num_tokens_per_rank * self.hidden_size
+            )
+            direct_combine_linear_output = (
+                not direct_combine_atomic_output
+                and not direct_combine_token_major_output
+                and output.dim() == 2
+                and output.size(1) == required_output_elements_per_rank
+                and combine_output_rank_stride_elements == required_output_elements_per_rank
+            )
 
         in_kernel_reduce_output = (
             in_kernel_final_output is not None or in_kernel_control is not None
@@ -5108,6 +5120,7 @@ class MegaMoE(MoE):
                 direct_combine_buffer_output,
                 direct_combine_atomic_output,
                 direct_combine_token_major_output,
+                direct_combine_linear_output,
                 combine_output_ep_size,
                 combine_output_top_k,
                 combine_output_max_num_tokens_per_rank,
