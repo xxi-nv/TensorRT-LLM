@@ -6523,11 +6523,16 @@ class BlockScaledMegaMoeFusionKernel:
                 expected_epoch = ld_acquire_sys_u64(expected_epoch_ptr)
 
             # Publish this rank's FC2 stores only after the local grid barrier,
-            # then wait for peer ranks entirely on device. Unlike the previous
-            # Python ready-flag probe, this never polls through host-visible
-            # stream synchronization.
+            # then wait for peer ranks entirely on device. Only block0 performs
+            # the cross-rank polling and releases local CTAs through the phase
+            # word; otherwise every CTA spins on the same peer flags.
             fence_acq_rel_sys()
+            peer_ready_phase = cutlass.Uint32(8)
+            peer_ready_phase_u64 = cutlass.Uint64(8)
             if tidx == 0:
+                grid_sync_phase_ptr = cute.domain_offset(
+                    (monolithic_local_rank, 7), monolithic_control
+                ).iterator
                 if monolithic_linear_block_idx == 0:
                     epoch_ptr = cute.domain_offset(
                         (monolithic_local_rank, 8), monolithic_control
@@ -6538,16 +6543,23 @@ class BlockScaledMegaMoeFusionKernel:
                     st_release_sys_u64(epoch_ptr, expected_epoch)
                     st_release_sys_u64(flag_ptr, cutlass.Uint64(1))
 
-                for ready_rank in range(combine_output_ep_size):
-                    peer_epoch_ptr = cute.domain_offset(
-                        (ready_rank, 8), monolithic_control
-                    ).iterator
-                    peer_flag_ptr = cute.domain_offset((ready_rank, 9), monolithic_control).iterator
-                    peer_epoch = cutlass.Uint64(0)
-                    peer_flag = cutlass.Uint64(0)
-                    while peer_epoch != expected_epoch or peer_flag != cutlass.Uint64(1):
-                        peer_epoch = ld_acquire_sys_u64(peer_epoch_ptr)
-                        peer_flag = ld_acquire_sys_u64(peer_flag_ptr)
+                    for ready_rank in range(combine_output_ep_size):
+                        peer_epoch_ptr = cute.domain_offset(
+                            (ready_rank, 8), monolithic_control
+                        ).iterator
+                        peer_flag_ptr = cute.domain_offset(
+                            (ready_rank, 9), monolithic_control
+                        ).iterator
+                        peer_epoch = cutlass.Uint64(0)
+                        peer_flag = cutlass.Uint64(0)
+                        while peer_epoch != expected_epoch or peer_flag != cutlass.Uint64(1):
+                            peer_epoch = ld_acquire_sys_u64(peer_epoch_ptr)
+                            peer_flag = ld_acquire_sys_u64(peer_flag_ptr)
+                    st_release_sys_u64(grid_sync_phase_ptr, peer_ready_phase_u64)
+                else:
+                    observed_phase = ld_acquire_sys_u32(grid_sync_phase_ptr)
+                    while observed_phase < peer_ready_phase:
+                        observed_phase = ld_acquire_sys_u32(grid_sync_phase_ptr)
 
             self.cta_sync_barrier.arrive_and_wait()
 
