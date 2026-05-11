@@ -1101,7 +1101,6 @@ class BlockScaledMegaMoeFusionKernel:
         sfb_l2: Optional[Union[cute.Tensor, Tuple[cute.Tensor, ...]]] = None,
         out: Optional[cute.Tensor] = None,
         scatter_out: Optional[cute.Tensor] = None,
-        scatter_out_linear: Optional[cute.Tensor] = None,
         alpha_l2: Optional[Union[cute.Tensor, Tuple[cute.Tensor, ...]]] = None,
         permuted_idx_to_expanded_idx: Optional[cute.Tensor] = None,
         token_final_scales: Optional[cute.Tensor] = None,
@@ -1111,7 +1110,6 @@ class BlockScaledMegaMoeFusionKernel:
         direct_combine_output: cutlass.Constexpr = False,
         direct_combine_atomic_output: cutlass.Constexpr = False,
         direct_combine_token_major_output: cutlass.Constexpr = False,
-        direct_combine_linear_output: cutlass.Constexpr = False,
         combine_output_ep_size: cutlass.Constexpr = 1,
         combine_output_top_k: cutlass.Constexpr = 1,
         combine_output_max_num_tokens_per_rank: cutlass.Constexpr = 0,
@@ -1940,9 +1938,6 @@ class BlockScaledMegaMoeFusionKernel:
             l2_arrival_mask if l2_arrival_mask is not None else num_non_exiting_tiles
         )
         kernel_out_tensor = scatter_out if scatter_out is not None else out
-        kernel_scatter_out_linear = (
-            scatter_out_linear if scatter_out_linear is not None else kernel_out_tensor
-        )
         kernel_monolithic_final_output = (
             monolithic_final_output if monolithic_final_output is not None else kernel_out_tensor
         )
@@ -1980,7 +1975,6 @@ class BlockScaledMegaMoeFusionKernel:
             permuted_idx_to_expanded_idx,
             token_final_scales,
             kernel_out_tensor,
-            kernel_scatter_out_linear,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -2061,7 +2055,6 @@ class BlockScaledMegaMoeFusionKernel:
             direct_combine_output,
             direct_combine_atomic_output,
             direct_combine_token_major_output,
-            direct_combine_linear_output,
             combine_output_ep_size,
             combine_output_top_k,
             combine_output_max_num_tokens_per_rank,
@@ -2157,7 +2150,6 @@ class BlockScaledMegaMoeFusionKernel:
         permuted_idx_to_expanded_idx: Optional[cute.Tensor],
         token_final_scales: Optional[cute.Tensor],
         out_tensor: Optional[cute.Tensor],
-        scatter_out_linear: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2236,7 +2228,6 @@ class BlockScaledMegaMoeFusionKernel:
         direct_combine_output: cutlass.Constexpr,
         direct_combine_atomic_output: cutlass.Constexpr,
         direct_combine_token_major_output: cutlass.Constexpr,
-        direct_combine_linear_output: cutlass.Constexpr,
         combine_output_ep_size: cutlass.Constexpr,
         combine_output_top_k: cutlass.Constexpr,
         combine_output_max_num_tokens_per_rank: cutlass.Constexpr,
@@ -6370,24 +6361,7 @@ class BlockScaledMegaMoeFusionKernel:
                                                 - output_topk_idx
                                                 * combine_output_max_num_tokens_per_rank
                                             )
-                                        if cutlass.const_expr(direct_combine_linear_output):
-                                            scatter_out_flat = cute.domain_offset(
-                                                (expanded_idx, 0, 0), scatter_out_linear
-                                            )
-                                            for index in cutlass.range(
-                                                self.epi_loop_size_l2, unroll_full=True
-                                            ):
-                                                coord_n = (
-                                                    base_coord_n + index * self.element_offset_l2
-                                                )
-                                                scatter_out_offset = cute.domain_offset(
-                                                    (0, coord_n, 0), scatter_out_flat
-                                                )
-                                                rOut_epi_packed = rOut_epi[index, None, None]
-                                                vectorized_store_bf16x8(
-                                                    rOut_epi_packed, scatter_out_offset
-                                                )
-                                        elif cutlass.const_expr(direct_combine_atomic_output):
+                                        if cutlass.const_expr(direct_combine_atomic_output):
                                             atomic_token_row = expanded_idx // combine_output_top_k
                                             atomic_output_rank = (
                                                 atomic_token_row
@@ -7524,7 +7498,6 @@ class BlockScaledMegaMoeFusionKernel:
         direct_combine_output: cutlass.Constexpr = False,
         direct_combine_atomic_output: cutlass.Constexpr = False,
         direct_combine_token_major_output: cutlass.Constexpr = False,
-        direct_combine_linear_output: cutlass.Constexpr = False,
         combine_output_ep_size: cutlass.Constexpr = 1,
         combine_output_top_k: cutlass.Constexpr = 1,
         combine_output_max_num_tokens_per_rank: cutlass.Constexpr = 0,
@@ -7680,20 +7653,7 @@ class BlockScaledMegaMoeFusionKernel:
             ),
         )
         scatter_out = out
-        scatter_out_linear = out
         if cutlass.const_expr(direct_combine_output):
-            if cutlass.const_expr(direct_combine_linear_output):
-                combine_output_rows = (
-                    combine_output_ep_size
-                    * combine_output_top_k
-                    * combine_output_max_num_tokens_per_rank
-                )
-                scatter_out_linear = cute.make_tensor(
-                    out_ptr,
-                    layout=cute.make_ordered_layout(
-                        (combine_output_rows, combine_output_hidden_size, 1), order=(1, 0, 2)
-                    ),
-                )
             if cutlass.const_expr(direct_combine_token_major_output):
                 scatter_out = cute.make_tensor(
                     out_ptr,
@@ -7855,7 +7815,6 @@ class BlockScaledMegaMoeFusionKernel:
             sfb_l2=tuple(b_sf_l2_tuple),
             out=out,
             scatter_out=scatter_out,
-            scatter_out_linear=scatter_out_linear,
             alpha_l2=tuple(alpha_l2_tuple),
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
@@ -7865,7 +7824,6 @@ class BlockScaledMegaMoeFusionKernel:
             direct_combine_output=direct_combine_output,
             direct_combine_atomic_output=direct_combine_atomic_output,
             direct_combine_token_major_output=direct_combine_token_major_output,
-            direct_combine_linear_output=direct_combine_linear_output,
             combine_output_ep_size=combine_output_ep_size,
             combine_output_top_k=combine_output_top_k,
             combine_output_max_num_tokens_per_rank=combine_output_max_num_tokens_per_rank,

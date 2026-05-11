@@ -3474,14 +3474,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kwargs.get("direct_combine_atomic_output", False))
             direct_combine_token_major_output = bool(
                 kwargs.get("direct_combine_token_major_output", False))
-            direct_combine_linear_output = bool(
-                kwargs.get("direct_combine_linear_output", False))
-            if direct_combine_linear_output and (
-                    not direct_combine_output or direct_combine_atomic_output
-                    or direct_combine_token_major_output):
-                raise ValueError(
-                    "direct_combine_linear_output requires non-atomic "
-                    "non-token-major direct_combine_output")
             if direct_combine_atomic_output and not direct_combine_output:
                 raise ValueError(
                     "direct_combine_atomic_output requires direct_combine_output"
@@ -3670,9 +3662,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if combine_output_rank_stride_elements == 0:
                     combine_output_rank_stride_elements = output.stride(0)
                 assert output.stride(0) == combine_output_rank_stride_elements
-                if direct_combine_linear_output:
-                    assert output.size(1) == required_output_elements_per_rank
-                    assert combine_output_rank_stride_elements == required_output_elements_per_rank
                 if monolithic_reduce_output:
                     assert 0 <= monolithic_local_rank < combine_output_ep_size
                     assert 0 <= monolithic_local_tokens <= combine_output_max_num_tokens_per_rank
@@ -3874,9 +3863,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn, mma_tiler_mn_l2, cluster_shape_mn, raster_along_m,
                 b_tensor_l_sizes, b_tensor_l_sizes_l2, n_l2,
                 direct_combine_output, direct_combine_atomic_output,
-                direct_combine_token_major_output, direct_combine_linear_output,
-                combine_output_ep_size, combine_output_top_k,
-                combine_output_max_num_tokens_per_rank,
+                direct_combine_token_major_output, combine_output_ep_size,
+                combine_output_top_k, combine_output_max_num_tokens_per_rank,
                 combine_output_rank_stride_elements, monolithic_reduce_output,
                 monolithic_control_rank_stride_elements, monolithic_local_rank,
                 monolithic_direct_topk_materialize,
@@ -3956,7 +3944,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     direct_combine_atomic_output=direct_combine_atomic_output,
                     direct_combine_token_major_output=
                     direct_combine_token_major_output,
-                    direct_combine_linear_output=direct_combine_linear_output,
                     combine_output_ep_size=combine_output_ep_size,
                     combine_output_top_k=combine_output_top_k,
                     combine_output_max_num_tokens_per_rank=(
@@ -4310,7 +4297,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         direct_combine_output: bool,
         direct_combine_atomic_output: bool,
         direct_combine_token_major_output: bool,
-        direct_combine_linear_output: bool,
         combine_output_ep_size: int,
         combine_output_top_k: int,
         combine_output_max_num_tokens_per_rank: int,
@@ -4404,7 +4390,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             direct_combine_output=direct_combine_output,
             direct_combine_atomic_output=direct_combine_atomic_output,
             direct_combine_token_major_output=direct_combine_token_major_output,
-            direct_combine_linear_output=direct_combine_linear_output,
             combine_output_ep_size=combine_output_ep_size,
             combine_output_top_k=combine_output_top_k,
             combine_output_max_num_tokens_per_rank=
@@ -4532,7 +4517,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             direct_combine_output,
             direct_combine_atomic_output,
             direct_combine_token_major_output,
-            False,
             combine_output_ep_size,
             combine_output_top_k,
             combine_output_max_num_tokens_per_rank,
