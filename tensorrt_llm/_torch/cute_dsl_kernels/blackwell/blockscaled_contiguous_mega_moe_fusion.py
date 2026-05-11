@@ -6563,9 +6563,14 @@ class BlockScaledMegaMoeFusionKernel:
                 hidden_idx = linear_idx - token_idx * monolithic_hidden_size
                 accum = cutlass.Float32(0.0)
                 for topk_idx in range(combine_output_top_k):
-                    accum = accum + out_tensor[
-                        monolithic_local_rank, topk_idx, token_idx, hidden_idx
-                    ].to(cutlass.Float32)
+                    if cutlass.const_expr(direct_combine_token_major_output):
+                        accum = accum + out_tensor[
+                            monolithic_local_rank, token_idx, topk_idx, hidden_idx
+                        ].to(cutlass.Float32)
+                    else:
+                        accum = accum + out_tensor[
+                            monolithic_local_rank, topk_idx, token_idx, hidden_idx
+                        ].to(cutlass.Float32)
                 monolithic_final_output[token_idx, hidden_idx, 0] = accum.to(cutlass.BFloat16)
                 linear_idx = linear_idx + output_stride
 
@@ -7525,7 +7530,8 @@ class BlockScaledMegaMoeFusionKernel:
             * Pool-SF layout mirrors FC1 C-SF
             * Final output layout is ``(orig_m, n_l2, 1)`` BF16 by default
             * Direct combine output layout is rank-strided
-              ``(ep_size, top_k, max_tokens, n_l2)`` BF16
+              ``(ep_size, top_k, max_tokens, n_l2)`` BF16 by default, or
+              ``(ep_size, max_tokens, top_k, n_l2)`` BF16 for token-major output
             * ``token_final_scales`` is indexed as ``(token_idx, topk_idx)``
         """
         scale_k = k // scaling_vector_size

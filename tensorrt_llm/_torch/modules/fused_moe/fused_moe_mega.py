@@ -332,6 +332,12 @@ class MegaMoE(MoE):
                 output_path_requested,
             )
         )
+        self._full_fusion_direct_buffer_token_major_output_enabled = bool(
+            extra_attrs.get(
+                "megamoe_enable_full_fusion_direct_buffer_token_major_output",
+                direct_m6_default,
+            )
+        )
         self._full_fusion_monolithic_direct_topk_reduce_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_monolithic_direct_topk_reduce", False)
         )
@@ -532,6 +538,9 @@ class MegaMoE(MoE):
             "direct_input_route+in_kernel_direct_buffer",
             "direct_input_route_cutedsl+in_kernel_direct_buffer",
             "monolithic_direct_topk+in_kernel_direct_buffer",
+            "direct_input_route+in_kernel_direct_buffer_token_major",
+            "direct_input_route_cutedsl+in_kernel_direct_buffer_token_major",
+            "monolithic_direct_topk+in_kernel_direct_buffer_token_major",
         }
 
     @property
@@ -590,6 +599,9 @@ class MegaMoE(MoE):
             ),
             "m6_combine_reduce_kernel": getattr(
                 self, "_full_fusion_m6_combine_reduce_kernel", None
+            ),
+            "m6_route_output_token_major": bool(
+                getattr(self, "_full_fusion_m6_route_output_token_major", False)
             ),
             "m6_combine_reduce_cta_plan": getattr(
                 self, "_full_fusion_m6_combine_reduce_cta_plan", None
@@ -1189,6 +1201,9 @@ class MegaMoE(MoE):
         direct_input = views["direct_input"]
         direct_input_sf = views["direct_input_sf"]
         combine_buffer_output = views["combine_buffer_output"]
+        direct_combine_token_major_output = bool(
+            getattr(self, "_full_fusion_direct_buffer_token_major_output_enabled", False)
+        )
 
         scratch = self._get_full_fusion_direct_input_route_scratch(config, device)
         token_counts_tensor = scratch["token_counts"]
@@ -1288,6 +1303,7 @@ class MegaMoE(MoE):
                     config.top_k,
                     config.max_num_tokens_per_rank,
                     combine_buffer_output.stride(0),
+                    direct_combine_token_major_output,
                     local_rank,
                     local_num_tokens,
                     producer_epoch,
@@ -1322,8 +1338,12 @@ class MegaMoE(MoE):
             config.ep_size * config.top_k * config.max_num_tokens_per_rank
         )
         self._full_fusion_m6_route_output_active_rows = None
-        self._full_fusion_m6_route_output_token_major = False
-        self._full_fusion_m6_combine_reduce_kernel = "in_kernel_direct_buffer"
+        self._full_fusion_m6_route_output_token_major = direct_combine_token_major_output
+        self._full_fusion_m6_combine_reduce_kernel = (
+            "in_kernel_direct_buffer_token_major"
+            if direct_combine_token_major_output
+            else "in_kernel_direct_buffer"
+        )
         self._full_fusion_m6_combine_reduce_cta_plan = None
         self._full_fusion_pre_dispatch_output_path_used = True
         self._full_fusion_output_path_used = True
@@ -1504,12 +1524,15 @@ class MegaMoE(MoE):
         self._full_fusion_m5_dispatch_materialize_kernel = (
             "direct_input_route_cutedsl" if use_cutedsl_direct_route else "direct_input_route"
         )
+        direct_combine_token_major_output = bool(
+            getattr(self, "_full_fusion_direct_buffer_token_major_output_enabled", False)
+        )
         self._full_fusion_m6_route_output_layout = (
             _FULL_FUSION_M6_ROUTE_OUTPUT_LAYOUT_COMBINE_BUFFER
         )
         self._full_fusion_m6_route_output_layout_rows = combine_layout_rows
         self._full_fusion_m6_route_output_active_rows = None
-        self._full_fusion_m6_route_output_token_major = False
+        self._full_fusion_m6_route_output_token_major = direct_combine_token_major_output
 
         use_in_kernel_reduce = bool(
             getattr(self, "_full_fusion_in_kernel_direct_buffer_reduce_enabled", False)
@@ -1546,7 +1569,7 @@ class MegaMoE(MoE):
                     config.max_num_tokens_per_rank,
                 ),
                 direct_combine_atomic_output=False,
-                direct_combine_token_major_output=False,
+                direct_combine_token_major_output=direct_combine_token_major_output,
                 in_kernel_final_output=in_kernel_output,
                 in_kernel_control=in_kernel_control,
                 in_kernel_local_rank=local_rank,
@@ -1555,7 +1578,11 @@ class MegaMoE(MoE):
             )
 
         if use_in_kernel_reduce:
-            self._full_fusion_m6_combine_reduce_kernel = "in_kernel_direct_buffer"
+            self._full_fusion_m6_combine_reduce_kernel = (
+                "in_kernel_direct_buffer_token_major"
+                if direct_combine_token_major_output
+                else "in_kernel_direct_buffer"
+            )
             self._full_fusion_m6_combine_reduce_cta_plan = None
             self._full_fusion_pre_dispatch_output_path_used = True
             self._full_fusion_output_path_used = True
