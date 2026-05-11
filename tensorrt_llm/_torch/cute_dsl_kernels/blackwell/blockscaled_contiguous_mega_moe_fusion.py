@@ -457,6 +457,7 @@ class BlockScaledMegaMoeFusionKernel:
         enable_linear2: bool = False,
         b_tensor_l_sizes_l2: Optional[Tuple[int, ...]] = None,
         mma_tiler_mn_l2: Optional[Tuple[int, int]] = None,
+        num_experts_per_wave: Optional[int] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -512,6 +513,10 @@ class BlockScaledMegaMoeFusionKernel:
             behind ``cutlass.const_expr(self.enable_linear2)`` gates on the
             device side and DCE on the Linear1-only path.
         :type mma_tiler_mn_l2: Optional[Tuple[int, int]]
+        :param num_experts_per_wave: Optional expert wave size for the fused
+            Linear1/Linear2 scheduler. When unset, preserves the existing
+            heuristic. Experimental private perf knob.
+        :type num_experts_per_wave: Optional[int]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -644,11 +649,19 @@ class BlockScaledMegaMoeFusionKernel:
         self.total_num_experts = (
             self.b_tensor_l_offsets[self.num_b_tensors] if b_tensor_l_sizes is not None else 1
         )
-        self.num_experts_per_wave = (
-            self._select_num_experts_per_wave(self.total_num_experts)
-            if enable_linear2
-            else self.total_num_experts
-        )
+        if enable_linear2:
+            if num_experts_per_wave is None:
+                self.num_experts_per_wave = self._select_num_experts_per_wave(
+                    self.total_num_experts
+                )
+            else:
+                if num_experts_per_wave <= 0 or self.total_num_experts % num_experts_per_wave != 0:
+                    raise ValueError(
+                        "num_experts_per_wave must be a positive divisor of total_num_experts"
+                    )
+                self.num_experts_per_wave = int(num_experts_per_wave)
+        else:
+            self.num_experts_per_wave = self.total_num_experts
 
         # combine body dereferences ``self.b_tensor_l_offsets_l2[...]`` to
         # pick the correct FC2 alpha from ``alpha_l2_tuple``; without this

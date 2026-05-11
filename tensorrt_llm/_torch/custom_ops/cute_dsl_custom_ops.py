@@ -3519,6 +3519,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_direct_topk_num_local_experts = int(
                 kwargs.get("monolithic_direct_topk_num_local_experts",
                            self.num_local_experts))
+            num_experts_per_wave = int(kwargs.get("num_experts_per_wave", 0))
             if monolithic_control_rank_stride_elements == 0:
                 monolithic_control_rank_stride_elements = (
                     monolithic_control.stride(0)
@@ -3874,7 +3875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 monolithic_direct_topk_scales_rank_stride_elements,
                 monolithic_direct_topk_stage_inputs,
                 monolithic_direct_topk_local_expert_offset,
-                monolithic_direct_topk_num_local_experts)
+                monolithic_direct_topk_num_local_experts, num_experts_per_wave)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -3888,6 +3889,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     enable_linear2=True,
                     b_tensor_l_sizes_l2=b_tensor_l_sizes_l2,
                     mma_tiler_mn_l2=mma_tiler_mn_l2,
+                    num_experts_per_wave=(num_experts_per_wave if
+                                          num_experts_per_wave > 0 else None),
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4318,6 +4321,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_direct_topk_local_input_scale: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_idx: Optional[torch.Tensor] = None,
         monolithic_direct_topk_local_scales: Optional[torch.Tensor] = None,
+        num_experts_per_wave: int = 0,
     ) -> None:
         l2_arrival_mask.zero_()
         runner = Sm100BlockScaledMegaMoeBlackwellRunner(
@@ -4420,6 +4424,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if monolithic_direct_topk_scales is not None else 0),
             monolithic_direct_topk_local_expert_offset=local_expert_offset,
             monolithic_direct_topk_num_local_experts=num_local_experts,
+            num_experts_per_wave=num_experts_per_wave,
         )
 
     @torch.library.custom_op("trtllm::cute_dsl_nvfp4_mega_moe_blackwell",
@@ -4729,6 +4734,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_pool_tensor: Optional[torch.Tensor] = None,
         monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
         monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+        num_experts_per_wave: int = 0,
     ) -> None:
         """Monolithic MegaMoE direct top-k dispatch + FC1/FC2 + M6 reduce.
 
@@ -4949,6 +4955,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             monolithic_direct_topk_local_idx=monolithic_direct_topk_local_idx,
             monolithic_direct_topk_local_scales=
             monolithic_direct_topk_local_scales,
+            num_experts_per_wave=num_experts_per_wave,
         )
 
     @torch.library.register_fake(
@@ -5000,6 +5007,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         monolithic_pool_tensor: Optional[torch.Tensor] = None,
         monolithic_pool_sf_tensor: Optional[torch.Tensor] = None,
         monolithic_l2_arrival_mask: Optional[torch.Tensor] = None,
+        num_experts_per_wave: int = 0,
     ) -> None:
         return None
 
