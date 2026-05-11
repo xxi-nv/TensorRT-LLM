@@ -347,6 +347,16 @@ class MegaMoE(MoE):
         self._full_fusion_cutedsl_direct_input_route_enabled = bool(
             extra_attrs.get("megamoe_enable_full_fusion_cutedsl_direct_input_route", False)
         )
+        self._full_fusion_cuda_graph_replay_enabled = bool(
+            extra_attrs.get("megamoe_enable_full_fusion_cuda_graph_replay", False)
+        )
+        self._full_fusion_cuda_graph_replay_cache = None
+        self._full_fusion_cuda_graph_replay_status: dict[str, object] = {
+            "enabled": self._full_fusion_cuda_graph_replay_enabled,
+            "captured": False,
+            "used": False,
+            "fallback_reason": None,
+        }
         global_moe_ep_group = (
             self.mapping.world_size == self.mapping.moe_ep_size
             and self.mapping.pp_size == 1
@@ -626,6 +636,7 @@ class MegaMoE(MoE):
             "combine_push_fallback_reason": getattr(
                 self, "_full_fusion_combine_push_fallback_reason", None
             ),
+            "cuda_graph_replay": dict(getattr(self, "_full_fusion_cuda_graph_replay_status", {})),
             "diagnostics": MegaMoE._full_fusion_fallback_diagnostics_snapshot(self),
         }
 
@@ -6144,7 +6155,167 @@ class MegaMoE(MoE):
     # ------------------------------------------------------------------
     # The fused forward — single entry point, cuteDSL kernels only
     # ------------------------------------------------------------------
+    def _make_full_fusion_cuda_graph_key(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool,
+        output_dtype: Optional[torch.dtype],
+        all_rank_num_tokens: Optional[List[int]],
+        use_dp_padding: Optional[bool],
+    ) -> tuple[object, ...]:
+        token_counts = (
+            None if all_rank_num_tokens is None else tuple(int(v) for v in all_rank_num_tokens)
+        )
+        gate = getattr(self, "_full_fusion_runtime_gate", None)
+        return (
+            x.device.type,
+            x.device.index,
+            tuple(x.shape),
+            x.stride(),
+            x.dtype,
+            tuple(router_logits.shape),
+            router_logits.stride(),
+            router_logits.dtype,
+            do_finalize,
+            output_dtype,
+            token_counts,
+            use_dp_padding,
+            self.tile_size,
+            bool(getattr(gate, "use_full_fusion", False)),
+        )
+
+    def _try_full_fusion_cuda_graph_replay(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool,
+        output_dtype: Optional[torch.dtype],
+        all_rank_num_tokens: Optional[List[int]],
+        use_dp_padding: Optional[bool],
+        **kwargs,
+    ) -> torch.Tensor | None:
+        status = {
+            "enabled": bool(getattr(self, "_full_fusion_cuda_graph_replay_enabled", False)),
+            "captured": False,
+            "used": False,
+            "fallback_reason": None,
+        }
+        if not status["enabled"]:
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+        if kwargs:
+            status["fallback_reason"] = "cuda graph replay does not support extra forward kwargs"
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+        if not do_finalize:
+            status["fallback_reason"] = "cuda graph replay requires do_finalize=True"
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+        if isinstance(x, Fp4QuantizedTensor):
+            status["fallback_reason"] = "cuda graph replay requires bf16 tensor input"
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+        if not (x.is_cuda and router_logits.is_cuda):
+            status["fallback_reason"] = "cuda graph replay requires CUDA tensors"
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+        if x.requires_grad or router_logits.requires_grad or torch.is_grad_enabled():
+            status["fallback_reason"] = "cuda graph replay requires gradients to be disabled"
+            self._full_fusion_cuda_graph_replay_status = status
+            return None
+
+        key = self._make_full_fusion_cuda_graph_key(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+        cached = getattr(self, "_full_fusion_cuda_graph_replay_cache", None)
+        if cached is None or cached.get("key") != key:
+            try:
+                static_x = torch.empty_strided(
+                    tuple(x.shape), x.stride(), dtype=x.dtype, device=x.device
+                )
+                static_router_logits = torch.empty_strided(
+                    tuple(router_logits.shape),
+                    router_logits.stride(),
+                    dtype=router_logits.dtype,
+                    device=router_logits.device,
+                )
+                static_x.copy_(x)
+                static_router_logits.copy_(router_logits)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_output = self._forward_impl_uncaptured(
+                        static_x,
+                        static_router_logits,
+                        do_finalize=do_finalize,
+                        output_dtype=output_dtype,
+                        all_rank_num_tokens=all_rank_num_tokens,
+                        use_dp_padding=use_dp_padding,
+                    )
+                graph.replay()
+                torch.cuda.synchronize()
+            except (RuntimeError, ValueError) as exc:
+                self._full_fusion_cuda_graph_replay_cache = None
+                status["fallback_reason"] = f"cuda graph capture failed: {exc}"
+                self._full_fusion_cuda_graph_replay_status = status
+                return None
+            cached = {
+                "key": key,
+                "graph": graph,
+                "x": static_x,
+                "router_logits": static_router_logits,
+                "output": static_output,
+            }
+            self._full_fusion_cuda_graph_replay_cache = cached
+
+        cached["x"].copy_(x)
+        cached["router_logits"].copy_(router_logits)
+        cached["graph"].replay()
+        status.update({"captured": True, "used": True})
+        self._full_fusion_cuda_graph_replay_status = status
+        return cached["output"]
+
     def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        graph_output = self._try_full_fusion_cuda_graph_replay(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )
+        if graph_output is not None:
+            return graph_output
+        return self._forward_impl_uncaptured(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )
+
+    def _forward_impl_uncaptured(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
