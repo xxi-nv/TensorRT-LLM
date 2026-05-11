@@ -622,6 +622,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
+        use_direct_output_zero = (self.use_fused_finalize
+                                  and not enable_alltoall
+                                  and moe_output.size(0) <= 1)
         if self.use_fused_finalize:
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(
@@ -653,17 +656,22 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             with torch.cuda.stream(
                     self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
                 self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(
-                    input=moe_output,
-                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                    num_non_exiting_tiles=num_non_exiting_tiles,
-                    tile_tokens_dim=tile_size,
-                    top_k=effective_top_k,
-                    ep_size=self.mapping.moe_ep_size,
-                    enable_alltoall=enable_alltoall,
-                )
+                if use_direct_output_zero:
+                    moe_output.zero_()
+                else:
+                    torch.ops.trtllm.moe_output_memset_inplace(
+                        input=moe_output,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=
+                        permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        tile_tokens_dim=tile_size,
+                        top_k=effective_top_k,
+                        ep_size=self.mapping.moe_ep_size,
+                        enable_alltoall=enable_alltoall,
+                    )
                 self.event_dict[EventType.MoeOutputMemset].record()
             self.event_dict[EventType.MoeOutputMemset].wait()
 
