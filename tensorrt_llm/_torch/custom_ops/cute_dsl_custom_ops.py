@@ -2198,6 +2198,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_blkred=use_blkred,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
+                    output_store_first=self.output_store_first,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()

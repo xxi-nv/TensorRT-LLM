@@ -213,6 +213,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         use_blkred: bool = False,
         raster_along_m: bool = False,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+        output_store_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -248,6 +249,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Block reduce configuration
         self.use_blkred = use_blkred
+        self.output_store_first = output_store_first
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
