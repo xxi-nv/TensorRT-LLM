@@ -60,12 +60,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import cloudpickle
 import torch
 import torch.distributed as dist
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from torch.autograd import DeviceType
+
+# ``cloudpickle`` and ``mpi4py.futures.MPIPoolExecutor`` are only used in the
+# self-spawning launcher path (single ``python3 bench_moe.py`` invocation that
+# pops up its own MPI pool). When started under external mpirun/srun they are
+# never touched, so import them lazily inside ``main()`` to avoid hard
+# dependencies on container images that ship only the minimal mpi4py.
 
 # ``quantize_utils.py`` lives under ``tests/unittest/_torch/modules/moe/`` and
 # uses pytest-style relative imports such as ``from _torch.helpers import ...``;
@@ -1692,16 +1696,9 @@ def _spawn_worker_main(args_blob: bytes) -> List[Dict[str, Any]]:
 def main() -> None:
     args = parse_args()
 
-    # cloudpickle so MPIPoolExecutor can ship our worker function.
-    cloudpickle.register_pickle_by_value(sys.modules[__name__])
-    MPI.pickle.__init__(  # type: ignore[attr-defined]
-        cloudpickle.dumps,
-        cloudpickle.loads,
-        pickle.HIGHEST_PROTOCOL,
-    )
-
     external_world_size = mpi_world_size()
     if external_world_size > 1:
+        # Running under external mpirun/srun: no spawn pool, no cloudpickle.
         if args.world_size is not None and int(args.world_size) != external_world_size:
             raise ValueError(
                 f"--world_size ({args.world_size}) must match external MPI world size "
@@ -1710,6 +1707,17 @@ def main() -> None:
         os.environ.update(_WORKER_ENV)
         _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
         return
+
+    # Self-spawn launcher: pull in cloudpickle + MPIPoolExecutor only here.
+    import cloudpickle
+    from mpi4py.futures import MPIPoolExecutor
+
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    MPI.pickle.__init__(  # type: ignore[attr-defined]
+        cloudpickle.dumps,
+        cloudpickle.loads,
+        pickle.HIGHEST_PROTOCOL,
+    )
 
     world_size = int(args.world_size or 1)
     if world_size <= 0:
