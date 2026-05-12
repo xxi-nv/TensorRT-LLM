@@ -306,7 +306,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if isinstance(tactic, int) and tactic > 0:
             tile_size = tactic
         else:
-            tile_size = 128
+            num_tokens = inputs[0].size(0)
+            # Large token pools amortize tile-256 route/finalize overhead better.
+            tile_size = 256 if num_tokens >= 8192 else 128
         return self.forward_impl(*inputs,
                                  enable_alltoall=self.enable_alltoall,
                                  tile_size=tile_size)
