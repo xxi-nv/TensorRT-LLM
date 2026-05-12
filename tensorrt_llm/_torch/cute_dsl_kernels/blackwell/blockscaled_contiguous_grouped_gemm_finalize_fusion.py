@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -48,6 +48,7 @@ from .utils import (
     is_power_of_2,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
+    vectorized_store_bf16x8,
 )
 
 """
@@ -212,6 +213,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         use_blkred: bool = False,
         raster_along_m: bool = False,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+        output_store_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -247,6 +249,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Block reduce configuration
         self.use_blkred = use_blkred
+        self.output_store_first = output_store_first
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -502,6 +505,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        expanded_idx_to_permuted_idx: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -818,6 +822,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha_tuple,
+            expanded_idx_to_permuted_idx,
             permuted_idx_to_expanded_idx,
             token_final_scales,
             self.cluster_layout_vmnk,
@@ -903,6 +908,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
+        expanded_idx_to_permuted_idx: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
@@ -2034,6 +2040,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             token_idx = cutlass.Int32(0)
+            topk_idx = cutlass.Int32(0)
             token_scale = self.final_scale_dtype(0.0)
 
             # Get the first tile info
@@ -2119,11 +2126,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
+                is_first_local_route = cutlass.Boolean(False)
                 if is_valid_row:
                     token_idx = expanded_idx // topK
                     topk_idx = expanded_idx % topK
                     token_scale = token_final_scales[(token_idx, topk_idx)]
                     alpha_val = alpha_val * token_scale
+                    is_first_local_route = cutlass.Boolean(True)
+                    for prev_topk_idx in cutlass.range(topk_idx):
+                        if expanded_idx_to_permuted_idx[(token_idx, prev_topk_idx)] >= 0:
+                            is_first_local_route = cutlass.Boolean(False)
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
@@ -2181,9 +2193,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                 )
                                 if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                                     rOut_epi_packed = rOut_epi[index, None, None]
-                                    vectorized_atomic_add_bf16x8(
-                                        rOut_epi_packed, scatter_out_offset
-                                    )
+                                    if cutlass.const_expr(self.output_store_first):
+                                        if is_first_local_route:
+                                            vectorized_store_bf16x8(
+                                                rOut_epi_packed, scatter_out_offset
+                                            )
+                                        else:
+                                            vectorized_atomic_add_bf16x8(
+                                                rOut_epi_packed, scatter_out_offset
+                                            )
+                                    else:
+                                        vectorized_atomic_add_bf16x8(
+                                            rOut_epi_packed, scatter_out_offset
+                                        )
                                 elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
                                     rOut_epi_packed = rOut_epi[index, None]
                                     vectorized_atomic_add_fp32x2(
@@ -2792,6 +2814,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         alpha_ptr_tuple: Tuple[cute.Pointer, ...],
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
+        expanded_idx_to_permuted_idx_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
@@ -2894,6 +2917,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tile_idx_to_mn_limit = cute.make_tensor(
             tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
         )
+        expanded_idx_to_permuted_idx = cute.make_tensor(
+            expanded_idx_to_permuted_idx_ptr,
+            layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
+        )
         permuted_idx_to_expanded_idx = cute.make_tensor(
             permuted_idx_to_expanded_idx_ptr, layout=cute.make_layout((m,))
         )
@@ -2917,6 +2944,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tuple(alpha_tuple),
             max_active_clusters=max_active_clusters,
             stream=stream,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
             epilogue_op=epilogue_op,

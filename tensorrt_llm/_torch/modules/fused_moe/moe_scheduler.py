@@ -759,26 +759,39 @@ class ExternalCommMoEScheduler(MoEScheduler):
 class FusedCommMoEScheduler(MoEScheduler):
     """Fused-comm scheduler: backend's fused kernel owns the EP exchange.
 
-    Invariants (see MOE_SCHEDULER_DESIGN.md / mega_moe/CHUNKING_DESIGN.md):
+     Invariants (see MOE_SCHEDULER_DESIGN.md / mega_moe/CHUNKING_DESIGN.md):
 
-    1. Reject ``Fp4QuantizedTensor`` activation; backend.quantize_input
-       owns the BF16 -> FP8 conversion.
-    2. Ignore ``use_dp_padding`` (no host-side cross-rank shape alignment).
-    3. Use ``mapping.moe_ep_rank`` for local token count, not global rank.
-    4. Strip ADP padding before splitting tensors.
-    5. ``had_meta=False`` -> pass ``None`` per-chunk so inner falls back to
-       ``num_tokens=x.shape[0]`` (avoids IndexError on moe_ep_rank>0).
-    6. ``num_chunks = max(real_all_rank_num_tokens)`` (not the generic
-       ``calculate_num_chunks``; that one falls back to ``sum()`` for
-       ``comm is None`` and would diverge per rank).
-    7. Launch every chunk on every EP rank, including zero-token chunks,
-       so peers can cross the in-kernel NVLink barrier.
-    8. No external Communication.dispatch / Communication.combine.
-    9. No multi-stream chunk overlap.
+     1. Reject ``Fp4QuantizedTensor`` activation; backend.quantize_input
+        owns the BF16 -> backend-specific quantized payload conversion.
+        (DeepGemm: BF16 -> FP8 + packed-UE8M0 SF; CuteDSL NVFP4 mega: BF16
+        -> NVFP4 packed + per-token uint8 SF.)
+     2. Ignore ``use_dp_padding`` (no host-side cross-rank shape alignment).
+     3. Use ``mapping.moe_ep_rank`` for local token count, not global rank.
+     4. Strip ADP padding before splitting tensors.
+     5. ``had_meta=False`` -> pass ``None`` per-chunk so inner falls back to
+        ``num_tokens=x.shape[0]`` (avoids IndexError on moe_ep_rank>0).
+     6. ``num_chunks = max(real_all_rank_num_tokens)`` (not the generic
+        ``calculate_num_chunks``; that one falls back to ``sum()`` for
+        ``comm is None`` and would diverge per rank).
+     7. Launch every chunk on every EP rank, including zero-token chunks,
+        so peers can cross the in-kernel NVLink barrier.
+     8. No external Communication.dispatch / Communication.combine.
+     9. No multi-stream chunk overlap.
+    10. Zero-token chunks: caller uses ``moe.backend._empty_quantized_input(0)``
+        to materialize shape-correct placeholder ``(x_q, x_sf)`` matching the
+        backend's own quantize_input contract (FP8 vs NVFP4). Without this
+        hook the zero-token path would hardcode one backend's dtype and
+        silently mismatch the other.
+    11. ``run_moe(all_rank_num_tokens=...)``: per-chunk per-rank token
+        counts are forwarded as a kwarg so backends whose fused kernel
+        needs them (CuteDSL ``direct_topk_token_counts``) can read them.
+        Backends that don't (DeepGemm) absorb the kwarg via
+        ``**unused_kwargs``; this is an opt-in protocol, not a
+        requirement of the MoE base class.
 
-    ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
-    after this scheduler returns. The scheduler must not rotate
-    ``moe.repeat_idx``.
+     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
+     after this scheduler returns. The scheduler must not rotate
+     ``moe.repeat_idx``.
     """
 
     def forward(
@@ -1061,25 +1074,34 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
 
         # ----- quantize -----
+        # Backend-specific zero-token shape contract: DeepGemm needs
+        # (fp8_e4m3, int32 packed-UE8M0 SF, hidden//128 stride); CuteDSL
+        # NVFP4 mega needs (uint8 packed FP4x2, uint8 SF, hidden//16
+        # stride). Delegate so run_moe receives a tensor it can ``copy_``
+        # into its rank-strided NVLink slab without dtype reinterpret.
         if num_tokens > 0:
-            x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
+            x_q, x_sf = moe.backend.quantize_input(x_chunk_real)
         else:
-            device = x.device
-            x_fp8 = torch.empty((0, moe.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            # Packed-UE8M0 int32 SF: one int32 per 128 input elements per row,
-            # same stride contract as the non-empty runs for run_moe.
-            x_sf = torch.empty((0, moe.hidden_size // 128), dtype=torch.int32, device=device)
+            x_q, x_sf = moe.backend._empty_quantized_input(0, device=x.device)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
+        #
+        # ``all_rank_num_tokens`` is piped through as a kwarg so backends
+        # whose fused kernel needs per-rank counts (e.g. CuteDSL NVFP4
+        # mega's ``direct_topk_token_counts``) can read it. DeepGemm
+        # ignores it because its DG SymmBuffer carries the counts
+        # implicitly through dispatch metadata; backends declare a
+        # ``**unused_kwargs`` tail to absorb the field cleanly.
         out = moe.backend.run_moe(
-            x=x_fp8,
+            x=x_q,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
         )
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----

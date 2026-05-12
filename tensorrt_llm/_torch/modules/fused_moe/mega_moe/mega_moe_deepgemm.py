@@ -536,6 +536,37 @@ class MegaMoEDeepGemm(MoE):
         x_bf16 = x.to(torch.bfloat16).contiguous()
         return _quantize_bf16_to_fp8_ue8m0(x_bf16)
 
+    def _empty_quantized_input(
+        self, num_tokens: int, *, device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Placeholder for ``quantize_input`` output when ``num_tokens == 0``.
+
+        ``FusedCommMoEScheduler`` calls this for zero-token chunks so the
+        per-chunk path still hands ``run_moe`` shape-correct tensors
+        without invoking the BF16->FP8 quantizer on an empty input
+        (which raises on at least one of the three quant backends).
+
+        The contract must match ``quantize_input`` byte-for-byte:
+        ``x_fp8`` is ``torch.float8_e4m3fn (num_tokens, hidden_size)`` and
+        ``x_sf`` is packed-UE8M0 ``torch.int32 (num_tokens, hidden_size // 128)``
+        (4 u8 scales reinterpreted as one int32 per 128-element row, gran_k=32).
+        """
+        if device is None:
+            device = torch.device("cuda")
+        if num_tokens != 0:
+            raise NotImplementedError(
+                "MegaMoEDeepGemm._empty_quantized_input only supports the "
+                "zero-token placeholder shape used by FusedCommMoEScheduler; "
+                f"got num_tokens={num_tokens}. Use quantize_input(x) for "
+                "non-empty activations."
+            )
+        x_fp8 = torch.empty((0, self.hidden_size), dtype=torch.float8_e4m3fn, device=device)
+        # gran_k=32 means one u8 SF per 32-element K segment; the kernel
+        # consumes 4 u8 SFs packed into one int32, so the stride is
+        # hidden / 128 even though the SF storage is at hidden / 32 elements.
+        x_sf = torch.empty((0, self.hidden_size // 128), dtype=torch.int32, device=device)
+        return x_fp8, x_sf
+
     def run_moe(
         self,
         x: torch.Tensor,

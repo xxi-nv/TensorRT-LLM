@@ -2848,6 +2848,50 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 module, module.w3_w1_weight_scale.data[expert_idx])
 
 
+class NVFP4MegaMoECuteDSLMethod(NVFP4CuteDslFusedMoEMethod):
+    """NVFP4 quantization for the MegaMoE CuTeDSL full-fusion kernel.
+
+    The MegaMoE kernel ``torch.ops.trtllm.cute_dsl_nvfp4_mega_moe_blackwell``
+    fuses FC1 (gather + GEMM + SwiGLU + requantize) and FC2 (GEMM + scatter
+    + atomic-add combine) into a single launch. It reads the same NVFP4
+    weight tensors as the two-kernel ``CuteDslFusedMoE`` flow:
+
+    - ``w3_w1_weight``: NVFP4 packed (``float4_e2m1fn_x2``), gate/up
+      interleaved with ``group_size=64`` along ``dim=0`` (because the
+      kernel reads ``[up, gate]`` pairs from one expert slab).
+    - ``w3_w1_weight_scale``: swizzled NVFP4 block scales matching the
+      same gate/up interleave (so the FC1 GEMM consumes ``(weight, scale)``
+      tile-aligned).
+    - ``w2_weight`` / ``w2_weight_scale``: NVFP4 packed + swizzled scales
+      with no interleave (FC2 has no gate/up split).
+    - ``fc31_input_scale`` / ``fc2_input_scale``: FP32 per-tensor global
+      scaling factors used by the input quantize and the FC1 -> FC2
+      requantize step inside the kernel.
+    - ``fc31_alpha`` / ``fc31_scale_c`` (alias ``fc1_global``) and
+      ``fc2_global``: FP32 per-expert ``alpha`` tensors fed to the NVFP4
+      grouped-GEMM dequantize.
+
+    This layout is byte-identical to what ``NVFP4CuteDslFusedMoEMethod``
+    already produces, so we inherit its ``create_weights`` /
+    ``load_weights`` / ``process_weights_after_loading`` chain verbatim
+    and only narrow the contract by asserting the kernel's hard
+    requirements at ``process_weights_after_loading`` time. Calling
+    ``MegaMoECuteDSL`` with a non-gated activation would crash inside
+    the fused kernel (``interleave_linear_and_gate`` would be skipped
+    but the kernel still reads two consecutive ``[up, gate]`` rows per
+    output tile), so we reject that combination loudly here.
+    """
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        if not module.is_gated_activation:
+            raise ValueError(
+                "NVFP4MegaMoECuteDSLMethod requires gated activation "
+                "(SwiGLU). The mega_moe_blackwell kernel reads interleaved "
+                "[up, gate] weight rows; non-gated layout would silently "
+                "produce wrong math.")
+        super().process_weights_after_loading(module)
+
+
 class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn

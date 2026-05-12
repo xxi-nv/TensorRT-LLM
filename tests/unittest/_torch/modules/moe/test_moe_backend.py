@@ -64,9 +64,21 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 logger = logging.getLogger(__name__)
 
 
+_MEGAMOE_FUSED_COMM_BACKENDS = {
+    MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+}
+
+
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """MegaMoE backends resolve an EP ProcessGroup at construction time.
+
+    Both ``MegaMoEDeepGemm`` and ``MegaMoECuteDSL`` declare
+    ``scheduler_kind = MoESchedulerKind.FUSED_COMM`` and call
+    ``_resolve_ep_pg`` from ``__init__``; a missing torch.distributed
+    init would raise ``RuntimeError`` before any test assertion runs.
+    """
+    if backend_type not in _MEGAMOE_FUSED_COMM_BACKENDS:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -231,6 +243,7 @@ def run_backend_moe(
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
     - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
+    - MEGAMOE_CUTEDSL: token_final_scales=float32, x_sf supplied (NVFP4)
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -264,6 +277,11 @@ def run_backend_moe(
     elif backend_type == MoeBackendType.MEGAMOE:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
+    elif backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
+        # MegaMoECuteDSL shares the CuteDSL NVFP4 contract: int32 expert
+        # ids and float32 final scales, with x_sf supplied alongside x.
+        # ``run_moe`` then issues the fused mega op on the local rank.
+        pass
 
     return backend.run_moe(**args)
 
@@ -293,6 +311,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_CUTEDSL,
 ]
 
 # Data types to test

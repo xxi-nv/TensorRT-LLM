@@ -20,7 +20,7 @@ from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
-from .mega_moe import MegaMoEDeepGemm
+from .mega_moe import MegaMoECuteDSL, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
@@ -84,6 +84,45 @@ def get_moe_cls(
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
+    elif moe_backend.upper() == "MEGAMOE_CUTEDSL":
+        # MegaMoE (CuTeDSL): the SM100/SM103 ``cute_dsl_nvfp4_mega_moe_blackwell``
+        # fused FC1+SwiGLU+FC2+combine op. Same NVFP4 weight contract as
+        # ``CuteDslFusedMoE`` so the fallback chain looks identical:
+        # unsupported quant / wrong SM / missing op -> CutlassFusedMoE.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            logger.warning(
+                "MegaMoECuteDSL only supports NVFP4. "
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
+            return CutlassFusedMoE
+        pretrained = model_config.pretrained_config
+        pretrained_dtype = (getattr(pretrained, "torch_dtype", torch.bfloat16)
+                            if pretrained is not None else torch.bfloat16)
+        # Prefer ``moe_intermediate_size`` over ``intermediate_size`` so we
+        # match the value ``create_moe_backend`` actually feeds into the
+        # backend (see DeepSeek-V3 / Qwen MoE configs); falling back to
+        # ``intermediate_size`` only when MoE-specific size is absent.
+        pretrained_inter = None
+        if pretrained is not None:
+            pretrained_inter = getattr(pretrained, "moe_intermediate_size",
+                                       None)
+            if pretrained_inter is None:
+                pretrained_inter = getattr(pretrained, "intermediate_size",
+                                           None)
+        ok, reason = MegaMoECuteDSL.can_implement(
+            QuantAlgo.NVFP4,
+            dtype_activation=pretrained_dtype,
+            swiglu_gptoss_style=False,
+            hidden_size=getattr(pretrained, "hidden_size", None)
+            if pretrained is not None else None,
+            intermediate_size=pretrained_inter,
+        )
+        if not ok:
+            logger.warning(
+                f"MegaMoECuteDSL rejected current environment: {reason}. "
+                "Falling back to CutlassFusedMoE.")
+            return CutlassFusedMoE
+        return MegaMoECuteDSL
     elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
         # MegaMoE (DeepGEMM): DeepGEMM fp8_fp4_mega_moe fused kernel. Accepts
         # W4A8_MXFP4_MXFP8 MXFP4 weights (same byte layout as TRTLLMGen
@@ -209,6 +248,7 @@ def create_moe_backend(
             CuteDslFusedMoE,
             DeepGemmFusedMoE,
             DenseGEMMFusedMoE,
+            MegaMoECuteDSL,
             MegaMoEDeepGemm,
         )
         assert moe_cls in supported_load_balancer_backends, (
@@ -303,7 +343,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
-    elif moe_cls == CuteDslFusedMoE:
+    elif moe_cls in (CuteDslFusedMoE, MegaMoECuteDSL):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -463,9 +503,10 @@ def create_moe(
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
-    if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
+    if enable_configurable_moe or moe_cls in (CuteDslFusedMoE, MegaMoECuteDSL):
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm):
+                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoECuteDSL,
+                       MegaMoEDeepGemm):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

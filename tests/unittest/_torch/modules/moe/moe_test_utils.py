@@ -47,7 +47,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDSL, MegaMoEDeepGemm
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -66,6 +66,7 @@ class MoeBackendType(str, Enum):
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     MEGAMOE = "MEGAMOE_DEEPGEMM"
+    MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -77,6 +78,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDSL,
     }
     return backend_class_map[backend_type]
 
@@ -665,6 +667,72 @@ def should_skip_megamoe(
     return None
 
 
+def should_skip_megamoe_cutedsl(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    dtype: Optional[torch.dtype] = None,
+    model_config: "MoeModelConfig" = None,
+    swiglu_gptoss_style: bool = False,
+    routing_method_cls=None,
+) -> Optional[str]:
+    """Check MegaMoECuteDSL constraints for the generic MoE test matrix.
+
+    MegaMoECuteDSL is a FUSED_COMM backend (NVLink monolithic kernel
+    owns dispatch + GEMM1 + SwiGLU + GEMM2 + reduce end-to-end). It
+    inherits the FP4-intermediate accuracy limits that already gate
+    ``CuteDslFusedMoE`` for the same kernel family because the fused op
+    consumes the same FP4 intermediate layout across FC1/FC2.
+    """
+    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+        return None
+
+    if not torch.cuda.is_available():
+        return "MegaMoECuteDSL requires CUDA"
+
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"MegaMoECuteDSL only supports NVFP4 (got quant_algo={quant_algo})"
+
+    if dtype is not None and dtype != torch.bfloat16:
+        return f"MegaMoECuteDSL only supports bfloat16 activations (got dtype={dtype})"
+
+    if swiglu_gptoss_style:
+        return "MegaMoECuteDSL does not support swiglu_gptoss_style"
+
+    if model_config is not None:
+        # NVFP4 standard alignment: hidden_size and intermediate_size must be
+        # 128-aligned (block-scale group size).
+        if model_config.hidden_size % 128 != 0 or model_config.intermediate_size % 128 != 0:
+            return (
+                f"MegaMoECuteDSL NVFP4 requires 128-aligned sizes "
+                f"(got h={model_config.hidden_size}, "
+                f"i={model_config.intermediate_size})"
+            )
+
+        # Inherit the FP4-intermediate accuracy gating from the
+        # underlying CuteDSL FC1/FC2 path — see ``should_skip_cutedsl``.
+        # The fused mega op uses the same FP4 intermediate layout and the
+        # same approximate sigmoid/exp2 math, so the same large-K /
+        # Llama4-routing failure modes apply.
+        if model_config.intermediate_size >= 14336:
+            return (
+                f"[Design Limitation] MegaMoECuteDSL inherits "
+                f"CuteDslFusedMoE FP4 intermediate accuracy limits "
+                f"(intermediate_size={model_config.intermediate_size} >= 14336)."
+            )
+
+    if routing_method_cls is not None:
+        from tensorrt_llm._torch.modules.fused_moe import Llama4RenormalizeMoeRoutingMethod
+
+        if routing_method_cls == Llama4RenormalizeMoeRoutingMethod:
+            return (
+                "[Design Limitation] MegaMoECuteDSL inherits CuteDslFusedMoE "
+                "Llama4Renormalize routing accuracy issues (FP4 intermediate "
+                "errors amplified by non-normalized sigmoid weights)."
+            )
+
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -771,8 +839,14 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM and MEGAMOE do not support autotuner capture
-    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
+    # DEEPGEMM and MEGAMOE backends do not support autotuner capture.
+    # MEGAMOE_CUTEDSL also drops the AutoTuner runner — the fused mega op
+    # has no tile-size tactic to tune, so capture/replay would no-op.
+    if backend_type in (
+        MoeBackendType.DEEPGEMM,
+        MoeBackendType.MEGAMOE,
+        MoeBackendType.MEGAMOE_CUTEDSL,
+    ):
         return False
 
     if use_flashinfer:
@@ -847,6 +921,14 @@ def get_quick_skip_reason(
                 dtype=dtype,
                 model_config=model_config,
                 swiglu_gptoss_style=swiglu_gptoss_style,
+            ),
+            lambda: should_skip_megamoe_cutedsl(
+                backend_type,
+                quant_algo=quant_algo,
+                dtype=dtype,
+                model_config=model_config,
+                swiglu_gptoss_style=swiglu_gptoss_style,
+                routing_method_cls=routing_method_cls,
             ),
         ]
         for check in skip_checks:

@@ -6,6 +6,7 @@ from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
+from .mega_moe import MegaMoECuteDSL, MegaMoEDeepGemm
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
 from .quantization import FusedMoEQuantScalesFP8
@@ -34,6 +35,8 @@ __all__ = [
     "get_moe_cls",
     "Llama4RenormalizeMoeRoutingMethod",
     "LoadBalancedMoeRoutingMethod",
+    "MegaMoECuteDSL",
+    "MegaMoEDeepGemm",
     "moe_load_balancer_set_repeated_for_next_layer",
     "MoE",
     "MoeLoadBalancer",

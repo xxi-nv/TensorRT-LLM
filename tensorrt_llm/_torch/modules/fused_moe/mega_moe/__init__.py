@@ -12,14 +12,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MegaMoE — DeepGEMM ``fp8_fp4_mega_moe`` as a first-class MoE backend.
+"""MegaMoE — fused MoE kernels exposed as first-class MoE backends.
 
-Targets the W4A8_MXFP4_MXFP8 quant configuration already supported by
-``TRTLLMGenFusedMoE``. ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the
-DG-native weight tensors, scale conversion, and DeepGEMM weight transform.
+Two backends live here, one per kernel family:
+
+- :class:`MegaMoEDeepGemm` wraps DeepGEMM's W4A8_MXFP4_MXFP8
+  ``fp8_fp4_mega_moe`` (FUSED_COMM; the DG kernel owns its own NVLink
+  SymmBuffer dispatch + combine).
+  :class:`W4A8MXFP4MXFP8MegaMoEDeepGemmMethod` owns its weight tensors,
+  scale conversion, and DeepGEMM weight transform.
+
+- :class:`MegaMoECuteDSL` wraps the CuTeDSL NVFP4 SM100/SM103
+  ``cute_dsl_nvfp4_mega_moe_blackwell_monolithic_direct_topk_reduce`` op
+  (FUSED_COMM; the monolithic kernel owns dispatch + FC1 + SwiGLU +
+  FC2 + reduce across the EP world via NVLink symmetric memory).
+  :class:`NVFP4MegaMoECuteDSLMethod` owns the gate/up-interleaved NVFP4
+  weight layout that the fused kernel reads.
 """
 
-from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from ..quantization import NVFP4MegaMoECuteDSLMethod, W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from .mega_moe_cute_dsl import MegaMoECuteDSL
 from .mega_moe_deepgemm import MegaMoEDeepGemm
 
-__all__ = ["MegaMoEDeepGemm", "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod"]
+__all__ = [
+    "MegaMoECuteDSL",
+    "MegaMoEDeepGemm",
+    "NVFP4MegaMoECuteDSLMethod",
+    "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod",
+]

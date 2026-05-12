@@ -56,6 +56,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_deepgemm,
     should_skip_densegemm,
     should_skip_megamoe,
+    should_skip_megamoe_cutedsl,
     should_skip_multi_gpu,
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
@@ -126,9 +127,26 @@ def _get_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
+# MegaMoE backends (DeepGemm + CuteDSL) are FUSED_COMM: they resolve an
+# EP ProcessGroup at module construction time. Any test that instantiates
+# one of these backends must initialize ``torch.distributed`` first,
+# regardless of whether the test is single-rank or multi-rank.
+_MEGAMOE_FUSED_COMM_BACKEND_VALUES = {
+    MoeBackendType.MEGAMOE.value,
+    MoeBackendType.MEGAMOE_CUTEDSL.value,
+}
+
+
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if moe_backend != MoeBackendType.MEGAMOE.value:
+    """Initialize ``torch.distributed`` for MegaMoE FUSED_COMM backends.
+
+    Both ``MegaMoEDeepGemm`` and ``MegaMoECuteDSL`` resolve an EP
+    ProcessGroup at construction (``_resolve_ep_pg`` requires
+    ``dist.is_initialized()``), so the module-level helper must cover
+    both. Other backends do their comm via the scheduler at forward
+    time and don't need a process group here.
+    """
+    if moe_backend not in _MEGAMOE_FUSED_COMM_BACKEND_VALUES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -815,6 +833,7 @@ BACKEND_TYPES = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_CUTEDSL,
 ]
 
 # Data types to test
@@ -831,13 +850,14 @@ DTYPES = [
 CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
 ]
 
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
-    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(384, 8, 7168, 2048),  # Kimi-K2
     # === Boundary Tests: num_experts / top_k ===
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
@@ -893,6 +913,16 @@ COMM_METHODS = [
 MEGAMOE_DEEPGEMM_IGNORE_COMM_METHOD = "IGNORE"
 MEGAMOE_DEEPGEMM_COMM_METHODS = [MEGAMOE_DEEPGEMM_IGNORE_COMM_METHOD]
 MEGAMOE_DEEPGEMM_PARALLEL_MODES = ["DEP"] if IS_CI_MODE else ["DEP", "TEP"]
+
+# MegaMoECuteDSL is also FUSED_COMM (dispatch + GEMM1 + SwiGLU + GEMM2 +
+# reduce are owned by ``cute_dsl_nvfp4_mega_moe_blackwell_monolithic_*``
+# via NVLink symmetric memory). Use the same IGNORE sentinel so the
+# generic external comm matrix can't pollute coverage. ``moe_tp_size``
+# must stay 1 (validate_configurable_moe rejects > 1), so only DEP / TEP
+# parallel modes are valid.
+MEGAMOE_CUTEDSL_IGNORE_COMM_METHOD = "IGNORE"
+MEGAMOE_CUTEDSL_COMM_METHODS = [MEGAMOE_CUTEDSL_IGNORE_COMM_METHOD]
+MEGAMOE_CUTEDSL_PARALLEL_MODES = ["DEP"] if IS_CI_MODE else ["DEP", "TEP"]
 # SwiGLU parameters for swiglu_gptoss_style testing
 SWIGLU_ALPHAS = [1, 1.702]  # default, GPT-OSS (modeling_gpt_oss.py)
 SWIGLU_BETAS = [0, 1.0]  # default, GPT-OSS
@@ -1011,6 +1041,62 @@ def should_skip_MegaMoEDeepGemm(
     if routing_method_cls not in (RenormalizeMoeRoutingMethod, DeepSeekV3MoeRoutingMethod):
         return (
             "MegaMoEDeepGemm module multi-GPU coverage is limited to "
+            "Renormalize and DeepSeekV3 routing methods"
+        )
+
+    return None
+
+
+def should_skip_MegaMoECuteDSL(
+    parallel_mode: str,
+    comm_method: str,
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+    model_config: MoeModelConfig,
+    routing_method_cls,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Check MegaMoECuteDSL constraints for module-level multi-GPU tests.
+
+    MegaMoECuteDSL is FUSED_COMM: dispatch / GEMM1 / SwiGLU / GEMM2 /
+    reduce run inside one CuTeDSL monolithic kernel against NVLink
+    symmetric memory. It does not consume any external comm strategy
+    and validate_configurable_moe rejects ``moe_tp_size > 1`` and
+    dynamic EPLB, so this matrix is limited to ``IGNORE`` comm +
+    DEP / TEP modes (Attention DP / TP, MoE EP, ``moe_tp_size==1``).
+    """
+    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+        return None
+
+    if comm_method != MEGAMOE_CUTEDSL_IGNORE_COMM_METHOD:
+        return (
+            "MegaMoECuteDSL uses NVLink symmetric memory inside the fused "
+            "monolithic kernel; use "
+            f"comm={MEGAMOE_CUTEDSL_IGNORE_COMM_METHOD} instead of forcing "
+            f"{comm_method}."
+        )
+
+    if parallel_mode not in ("DEP", "TEP"):
+        return f"MegaMoECuteDSL requires moe_tp_size == 1 (got parallel_mode={parallel_mode})"
+
+    base_reason = should_skip_megamoe_cutedsl(
+        backend_type,
+        quant_algo=quant_algo,
+        dtype=dtype,
+        model_config=model_config,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        routing_method_cls=routing_method_cls,
+    )
+    if base_reason:
+        return base_reason
+
+    # Routing methods are decoded before the fused kernel, so multi-GPU
+    # module coverage can mirror the DeepGemm matrix (Renormalize for
+    # Mixtral-style + DeepSeekV3 for group-topk).
+    if routing_method_cls not in (RenormalizeMoeRoutingMethod, DeepSeekV3MoeRoutingMethod):
+        return (
+            "MegaMoECuteDSL module multi-GPU coverage is limited to "
             "Renormalize and DeepSeekV3 routing methods"
         )
 
@@ -1184,6 +1270,81 @@ def generate_megamoe_deepgemm_multi_gpu_test_params() -> List:
         ):
             if not skip_reason:
                 skip_reason = should_skip_MegaMoEDeepGemm(
+                    parallel_mode,
+                    comm_method,
+                    backend_type,
+                    quant_algo,
+                    dtype,
+                    model_config,
+                    routing_method_cls,
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf"),
+                )
+
+            if not skip_reason:
+                skip_reason = should_skip_multi_gpu(
+                    parallel_mode, model_config, world_size=4, comm_method=comm_method
+                )
+
+            if skip_reason:
+                continue
+
+            test_id = f"parallel={parallel_mode}-comm={comm_method}-{base_test_id}"
+            param_values = (
+                parallel_mode,
+                comm_method,
+                dtype,
+                backend_type.value,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+            )
+            params.append(create_test_param(param_values, test_id))
+
+    return params
+
+
+def generate_megamoe_cutedsl_multi_gpu_test_params() -> List:
+    """Generate focused MegaMoECuteDSL module multi-GPU coverage.
+
+    MegaMoECuteDSL is FUSED_COMM and rejects ``moe_tp_size > 1`` via
+    ``validate_configurable_moe``. Use the dedicated IGNORE comm
+    sentinel and DEP / TEP parallel modes (Attention DP / TP +
+    MoE EP, ``moe_tp_size==1``); mirror the DeepGemm runner's NVFP4
+    quant + Renormalize / DeepSeekV3 routing matrix.
+    """
+    params: List = []
+    seq_lens = [8] if IS_CI_MODE else SEQ_LENS
+
+    for parallel_mode, comm_method in product(
+        MEGAMOE_CUTEDSL_PARALLEL_MODES, MEGAMOE_CUTEDSL_COMM_METHODS
+    ):
+        for (
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],
+            MOE_MODEL_CONFIGS,
+            seq_lens,
+            [torch.bfloat16],
+            [MoeBackendType.MEGAMOE_CUTEDSL],
+            [QuantAlgo.NVFP4],
+            MULTI_GPU_ROUTING_METHODS,
+        ):
+            if not skip_reason:
+                skip_reason = should_skip_MegaMoECuteDSL(
                     parallel_mode,
                     comm_method,
                     backend_type,
@@ -1465,7 +1626,11 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
 # ============================================================================
 # MoE Multi-GPU Tests
 # ============================================================================
-# Pre-generate multi-GPU test parameters at module load time
+# Pre-generate multi-GPU test parameters at module load time.
+# MegaMoE backends (DeepGemm + CuteDSL) are FUSED_COMM and don't take
+# external comm methods or moe_tp_size > 1, so we strip them from the
+# generic external-comm matrix and instead emit dedicated runners that
+# enforce IGNORE comm + DEP / TEP parallel modes.
 MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     parallel_modes=PARALLEL_MODES,
     comm_methods=COMM_METHODS,
@@ -1473,11 +1638,16 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
-    backend_types=BACKEND_TYPES,
+    backend_types=[
+        b
+        for b in BACKEND_TYPES
+        if b not in (MoeBackendType.MEGAMOE, MoeBackendType.MEGAMOE_CUTEDSL)
+    ],
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
 )
 MULTI_GPU_TEST_PARAMS += generate_megamoe_deepgemm_multi_gpu_test_params()
+MULTI_GPU_TEST_PARAMS += generate_megamoe_cutedsl_multi_gpu_test_params()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
@@ -1827,7 +1997,23 @@ EPLB_TEST_PARAMS = (
         model_configs=EPLB_MODEL_CONFIGS,
         num_slots_list=EPLB_NUM_SLOTS_LIST,
         dtypes=DTYPES,
-        backend_types=[b for b in BACKEND_TYPES if b != MoeBackendType.MEGAMOE],
+        # MegaMoE backends use distinct EPLB/multi-GPU code paths
+        # (DeepGEMM SymmBuffer for MEGAMOE; MnnvlMemory monolithic
+        # workspace for MEGAMOE_CUTEDSL). Both declare scheduler_kind
+        # FUSED_COMM and need a torch.distributed-aware launcher.
+        #
+        # MEGAMOE has a dedicated dynamic-EPLB runner below
+        # (``generate_megamoe_deepgemm_eplb_test_params``). MEGAMOE_CUTEDSL
+        # explicitly rejects dynamic EPLB in ``validate_configurable_moe``
+        # (the fused kernel reads NVFP4 weights via in-kernel TMA
+        # descriptors that would race with EPLB migration), so it has
+        # no EPLB coverage by design — only static-EPLB module behavior
+        # is currently supported.
+        backend_types=[
+            b
+            for b in BACKEND_TYPES
+            if b not in (MoeBackendType.MEGAMOE, MoeBackendType.MEGAMOE_CUTEDSL)
+        ],
         quant_algos=QUANT_ALGOS,
         routing_methods=EPLB_ROUTING_METHODS,
     )

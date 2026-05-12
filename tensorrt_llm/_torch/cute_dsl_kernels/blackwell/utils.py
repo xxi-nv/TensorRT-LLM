@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -257,6 +257,28 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed,
 
 
 @dsl_user_op
+def vectorized_store_bf16x8(rOut_epi_packed,
+                            scatter_out_offset,
+                            loc=None,
+                            ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def vectorized_atomic_add_fp32x2(rOut_epi_packed,
                                  scatter_out_offset,
                                  loc=None,
@@ -304,6 +326,154 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
             loc=loc,
             ip=ip,
         )
+
+
+@dsl_user_op
+def fence_acq_rel_gpu(loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acq_rel.gpu;",
+        "",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def fence_acq_rel_sys(loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acq_rel.sys;",
+        "",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_or_release_gpu_u64(ptr: Pointer,
+                           val: cutlass.Uint64,
+                           loc=None,
+                           ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(loc=loc, ip=ip),
+         val.ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.or.b64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_gpu_u64(ptr: Pointer, loc=None, ip=None) -> cutlass.Uint64:
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [ptr.toint().ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u64 $0, [$1];",
+            "=l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        ))
+
+
+@dsl_user_op
+def red_add_release_sys_u32(ptr: Pointer,
+                            val: cutlass.Uint32,
+                            loc=None,
+                            ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(loc=loc, ip=ip),
+         val.ir_value(loc=loc, ip=ip)],
+        "red.release.sys.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_release_sys_u32(ptr: Pointer,
+                               val: cutlass.Uint32,
+                               loc=None,
+                               ip=None) -> cutlass.Uint32:
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                ptr.toint().ir_value(loc=loc, ip=ip),
+                val.ir_value(loc=loc, ip=ip)
+            ],
+            "atom.release.sys.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        ))
+
+
+@dsl_user_op
+def st_release_sys_u64(ptr: Pointer,
+                       val: cutlass.Uint64,
+                       loc=None,
+                       ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(loc=loc, ip=ip),
+         val.ir_value(loc=loc, ip=ip)],
+        "st.release.sys.global.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_sys_u64(ptr: Pointer, loc=None, ip=None) -> cutlass.Uint64:
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [ptr.toint().ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u64 $0, [$1];",
+            "=l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        ))
+
+
+@dsl_user_op
+def ld_acquire_sys_u32(ptr: Pointer, loc=None, ip=None) -> cutlass.Uint32:
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint().ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        ))
 
 
 @dsl_user_op
