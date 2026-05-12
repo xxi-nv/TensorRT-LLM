@@ -71,6 +71,15 @@ from torch.autograd import DeviceType
 # never touched, so import them lazily inside ``main()`` to avoid hard
 # dependencies on container images that ship only the minimal mpi4py.
 
+# When invoked as ``python tests/microbenchmarks/bench_moe.py`` (rather than
+# ``python -m`` or via pytest), Python sets ``sys.path[0]`` to the script's
+# directory (``tests/microbenchmarks/``), not the repo root. Adding the repo
+# root first makes ``import tensorrt_llm`` resolve to the in-tree checkout
+# without requiring an installed wheel or a manual ``PYTHONPATH``.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # ``quantize_utils.py`` lives under ``tests/unittest/_torch/modules/moe/`` and
 # uses pytest-style relative imports such as ``from _torch.helpers import ...``;
 # the project's ``tests/unittest/conftest.py`` puts ``tests/unittest`` on
