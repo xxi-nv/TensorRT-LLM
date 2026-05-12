@@ -624,15 +624,21 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
+        use_main_stream_output_zero = (self.use_fused_finalize
+                                       and not enable_alltoall
+                                       and 1 < moe_output.size(0) <= 512)
         use_direct_output_zero = (self.use_fused_finalize
                                   and not enable_alltoall
                                   and moe_output.size(0) <= 1)
         # Store-first finalize races with other route atomics across CTAs.
         use_output_store_first = False
         if self.use_fused_finalize:
-            self.event_dict[EventType.Main].record()
-            moe_output.record_stream(
-                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+            if use_main_stream_output_zero:
+                moe_output.zero_()
+            else:
+                self.event_dict[EventType.Main].record()
+                moe_output.record_stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
         # Fused gather + GEMM + activation + quantize for FC1.
         # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
@@ -657,30 +663,31 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         if self.use_fused_finalize:
-            with torch.cuda.stream(
-                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
-                self.event_dict[EventType.Main].wait()
-                if use_output_store_first:
-                    torch.ops.trtllm.cute_dsl_moe_output_zero_no_local_rows_inplace(
-                        moe_output, expanded_idx_to_permuted_idx)
-                elif use_direct_output_zero:
-                    moe_output.zero_()
-                else:
-                    torch.ops.trtllm.moe_output_memset_inplace(
-                        input=moe_output,
-                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                        expanded_idx_to_permuted_idx=
-                        expanded_idx_to_permuted_idx,
-                        permuted_idx_to_expanded_idx=
-                        permuted_idx_to_expanded_idx,
-                        num_non_exiting_tiles=num_non_exiting_tiles,
-                        tile_tokens_dim=tile_size,
-                        top_k=effective_top_k,
-                        ep_size=self.mapping.moe_ep_size,
-                        enable_alltoall=enable_alltoall,
-                    )
-                self.event_dict[EventType.MoeOutputMemset].record()
-            self.event_dict[EventType.MoeOutputMemset].wait()
+            if not use_main_stream_output_zero:
+                with torch.cuda.stream(
+                        self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                    self.event_dict[EventType.Main].wait()
+                    if use_output_store_first:
+                        torch.ops.trtllm.cute_dsl_moe_output_zero_no_local_rows_inplace(
+                            moe_output, expanded_idx_to_permuted_idx)
+                    elif use_direct_output_zero:
+                        moe_output.zero_()
+                    else:
+                        torch.ops.trtllm.moe_output_memset_inplace(
+                            input=moe_output,
+                            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                            expanded_idx_to_permuted_idx=
+                            expanded_idx_to_permuted_idx,
+                            permuted_idx_to_expanded_idx=
+                            permuted_idx_to_expanded_idx,
+                            num_non_exiting_tiles=num_non_exiting_tiles,
+                            tile_tokens_dim=tile_size,
+                            top_k=effective_top_k,
+                            ep_size=self.mapping.moe_ep_size,
+                            enable_alltoall=enable_alltoall,
+                        )
+                    self.event_dict[EventType.MoeOutputMemset].record()
+                self.event_dict[EventType.MoeOutputMemset].wait()
 
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
