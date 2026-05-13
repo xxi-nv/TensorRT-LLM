@@ -3057,8 +3057,21 @@ class BlockScaledMegaMoeFusionKernel:
         if cutlass.const_expr(monolithic_direct_topk_stage_inputs):
             # All CTAs stage this rank's direct-topk payload, then CTA0 publishes
             # the per-rank M5 ready words after a device-side grid barrier.
+            #
+            # The source tensors (monolithic_direct_topk_local_*) are sized to
+            # ``monolithic_local_tokens`` rows (the actual per-rank token count),
+            # NOT to ``combine_output_max_num_tokens_per_rank`` (the workspace
+            # upper bound). Bounding the staging loop by the latter overruns
+            # the source tensor by up to (max - local) * hidden bytes; with
+            # small local_tokens and large max_num_tokens the OOB read crosses
+            # an unmapped page boundary and faults with CUDA_ERROR_ILLEGAL_ADDRESS.
+            # Consumers later gate reads of the staged peer slot by
+            # ``monolithic_direct_topk_token_counts[peer]`` so leaving the
+            # padding region of the (max-sized) destination slab uninitialized
+            # is safe.
+            local_tokens_i32 = cutlass.Int32(monolithic_local_tokens)
             byte_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
-            max_input_bytes = combine_output_max_num_tokens_per_rank * (monolithic_hidden_size // 2)
+            max_input_bytes = local_tokens_i32 * (monolithic_hidden_size // 2)
             while byte_idx < max_input_bytes:
                 token_idx = byte_idx // (monolithic_hidden_size // 2)
                 hidden_byte_idx = byte_idx - token_idx * (monolithic_hidden_size // 2)
@@ -3069,7 +3082,7 @@ class BlockScaledMegaMoeFusionKernel:
 
             sf_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
             local_sf_size = monolithic_hidden_size // self.sf_vec_size
-            max_sf_items = combine_output_max_num_tokens_per_rank * local_sf_size
+            max_sf_items = local_tokens_i32 * local_sf_size
             while sf_linear_idx < max_sf_items:
                 token_idx = sf_linear_idx // local_sf_size
                 sf_idx = sf_linear_idx - token_idx * local_sf_size
@@ -3079,7 +3092,7 @@ class BlockScaledMegaMoeFusionKernel:
                 sf_linear_idx = sf_linear_idx + stage_grid_stride
 
             route_linear_idx = monolithic_linear_block_idx * self.threads_per_cta + tidx
-            max_route_items = combine_output_max_num_tokens_per_rank * combine_output_top_k
+            max_route_items = local_tokens_i32 * combine_output_top_k
             while route_linear_idx < max_route_items:
                 token_idx = route_linear_idx // combine_output_top_k
                 topk_idx = route_linear_idx - token_idx * combine_output_top_k

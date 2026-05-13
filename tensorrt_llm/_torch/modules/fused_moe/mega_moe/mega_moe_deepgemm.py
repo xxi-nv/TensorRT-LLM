@@ -582,7 +582,15 @@ class MegaMoEDeepGemm(MoE):
         ConfigurableMoE computes routing and calls ``quantize_input`` before
         invoking this method, so the backend receives the same FP8+SF+topk
         contract at this unified backend entry point.
+
+        ``FusedCommMoEScheduler`` always pipes ``all_rank_num_tokens`` as a
+        kwarg (per-chunk per-rank counts) so backends whose fused kernel
+        needs them (e.g. MegaMoECuteDSL) can read them. DeepGemm carries
+        the counts implicitly through its DG SymmBuffer, so we drop the
+        kwarg here. The strict assertion below still catches anything
+        else that slips through unintentionally.
         """
+        unused_kwargs.pop("all_rank_num_tokens", None)
         assert not unused_kwargs, (
             f"MegaMoEDeepGemm.run_moe got unexpected kwargs: {sorted(unused_kwargs)}"
         )

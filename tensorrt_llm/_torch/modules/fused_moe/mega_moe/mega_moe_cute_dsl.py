@@ -58,7 +58,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -348,6 +348,18 @@ class MegaMoECuteDSL(MoE):
         # control region every call; one wrap-around per ~2^63 calls is
         # safe to ignore.
         self._monolithic_epoch = 0
+
+        # Pre-allocated per-rank token-count buffers. Mirrors the
+        # MegaMoEDeepGemm SymmBuffer pattern: a stable ``(ep_size,)`` int32
+        # tensor pair (pinned-host source + device destination) updated via
+        # ``copy_`` each call. Going through ``torch.tensor(list, device=)``
+        # instead would do a fresh CUDA allocation per call, which CUDA
+        # Graph capture forbids (it shows up as
+        # ``cudaErrorStreamCaptureInvalidated`` / ``Offset increment outside
+        # graph capture``). Allocation is deferred to ``run_moe`` so it
+        # picks up the same device the rest of the workspace uses.
+        self._token_counts_cpu: Optional[torch.Tensor] = None
+        self._token_counts_gpu: Optional[torch.Tensor] = None
 
         # Weight tensors are owned by the quant method (mirrors the
         # MegaMoEDeepGemm pattern).
@@ -847,13 +859,38 @@ class MegaMoECuteDSL(MoE):
         monolithic_output = nv["monolithic_output"]
         monolithic_control = nv["monolithic_control"]
 
-        # Per-rank int32 token counts on device. Allocated per-call (tiny
-        # tensor, ~ep_size * 4 bytes) to keep ``run_moe`` capture-friendly:
-        # caching on ``self`` would make a CUDA graph reuse a stale tensor
-        # across captures. ``torch.tensor`` on CUDA does a host-to-device
-        # copy each call; that's cheap (ep_size <= O(64)) and acceptable
-        # outside graphs.
-        token_counts_tensor = torch.tensor(counts, dtype=torch.int32, device=device)
+        # Per-rank int32 token counts on device. We mirror the
+        # MegaMoEDeepGemm pattern (see ``mega_moe_deepgemm.py:_symm_buffer``):
+        # a single instance-level ``(ep_size,)`` device tensor backed by a
+        # pinned-host source, updated via ``copy_`` each call so the
+        # allocations are stable across CUDA Graph captures and replays.
+        # The earlier ``torch.tensor(counts, device=...)`` form did a fresh
+        # CUDA malloc per call which the graph captor cannot record (it
+        # raises ``cudaErrorStreamCaptureInvalidated`` / ``Offset increment
+        # outside graph capture``). Replays read whatever value was last
+        # written into the pinned-host buffer, which is the standard
+        # dynamic-input CUDA Graph idiom.
+        if self._token_counts_cpu is None:
+            # ``device='cpu'`` must be explicit: at run_moe time the caller
+            # is inside a ``with torch.device(f'cuda:{rank}')`` context,
+            # and ``pin_memory=...`` without an explicit device tries to
+            # pin a CUDA allocation, which raises "Only dense CPU tensors
+            # can be pinned". ``prefer_pinned()`` is the project-wide
+            # gate that disables pinning under Confidential Compute (see
+            # tensorrt_llm/_utils.py), enforced by the pinned-memory
+            # policy pre-commit hook.
+            self._token_counts_cpu = torch.empty(
+                (self.ep_size,),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            self._token_counts_gpu = torch.empty((self.ep_size,), dtype=torch.int32, device=device)
+        cpu_buf = self._token_counts_cpu
+        for i, c in enumerate(counts):
+            cpu_buf[i] = c
+        self._token_counts_gpu.copy_(cpu_buf, non_blocking=True)
+        token_counts_tensor = self._token_counts_gpu
 
         # Local-staging tensors handed to the kernel. The kernel copies
         # them into ``direct_topk_*`` rank-r slot internally (because we
