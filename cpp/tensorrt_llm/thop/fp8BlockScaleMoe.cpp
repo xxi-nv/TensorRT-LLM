@@ -35,6 +35,7 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
+using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::isKnownInvalidBlockScaleMoeTactic;
 
 at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
@@ -374,6 +375,10 @@ public:
                 = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
             {
+                if (isKnownInvalidBlockScaleMoeTactic(tileN, cfg))
+                {
+                    continue;
+                }
                 tactics.push_back({tileN, cfg});
             }
         }

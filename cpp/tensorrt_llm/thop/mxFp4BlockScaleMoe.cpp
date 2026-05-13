@@ -33,6 +33,7 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
+using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::isKnownInvalidBlockScaleMoeTactic;
 
 torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
@@ -529,6 +530,10 @@ public:
                 topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
             for (auto cfg : config_indices_per_runner)
             {
+                if (isKnownInvalidBlockScaleMoeTactic(tileN, cfg))
+                {
+                    continue;
+                }
                 tactics.push_back({tileN, cfg});
             }
         }
@@ -622,6 +627,10 @@ public:
                 topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
             for (auto cfg : config_indices_per_runner)
             {
+                if (isKnownInvalidBlockScaleMoeTactic(tileN, cfg))
+                {
+                    continue;
+                }
                 tactics.push_back({tileN, cfg});
             }
         }

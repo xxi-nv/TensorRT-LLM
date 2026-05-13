@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,6 +59,13 @@ inline std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& suppor
     }
 
     return selected_tile_nums;
+}
+
+inline bool isKnownInvalidBlockScaleMoeTactic(int32_t tileTokensDim, int64_t configIndex)
+{
+    // On B300 (SM103), tactic [32, 5] can trigger an illegal memory access in
+    // TRTLLM-Gen block-scale MoE. Do not expose it to the autotuner.
+    return tensorrt_llm::common::getSMVersion() == 103 && tileTokensDim == 32 && configIndex == 5;
 }
 
 namespace Routing
