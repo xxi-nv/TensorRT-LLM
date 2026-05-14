@@ -354,14 +354,17 @@ def _run_one_config(cfg):
             torch.cuda.synchronize()
 
         with torch.inference_mode():
-            k_full = fused_moe.forward(
+            k_full_raw = fused_moe.forward(
                 x,
                 router_logits,
                 all_rank_num_tokens=[seq_len],
             )
             torch.cuda.synchronize()
-
-    k_full = k_full.detach()
+            # Clone INSIDE the create_moe context manager so we own the
+            # storage. create_moe.__exit__ may release NVSHMEM / workspace
+            # buffers that back the returned tensor.
+            k_full = k_full_raw.detach().clone()
+            del k_full_raw
     print(
         f"K_full stats: abs_max={k_full.abs().max().item():.6f}, "
         f"abs_mean={k_full.abs().mean().item():.6f}, "
