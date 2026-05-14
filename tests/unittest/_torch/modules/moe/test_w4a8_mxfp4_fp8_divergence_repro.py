@@ -17,8 +17,10 @@ tests/unittest/_torch/modules/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``.
 from __future__ import annotations
 
 import copy
+import os
 import pickle
 import sys
+import tempfile
 from typing import Callable, Dict
 
 import cloudpickle
@@ -30,6 +32,7 @@ from _torch.modules.moe.quantize_utils import MXFP4FP8RefGatedMLPFusedMoE, get_t
 from mpi4py import MPI
 from transformers.configuration_utils import PretrainedConfig
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
@@ -341,6 +344,15 @@ def _run_one_config(cfg):
         fused_moe.load_weights([weights])
         fused_moe.post_load_weights()
         fused_moe.cuda("cuda:0")
+
+        cache_path = os.path.join(tempfile.gettempdir(), "moe_repro_autotuner_cache.json")
+        # Production tests always run an autotune pass before the simple
+        # accuracy check; without it, the kernel uses an untuned default
+        # tactic that can produce ~600x-magnitude-off output.
+        with torch.inference_mode(), autotune(cache_path=cache_path):
+            _ = fused_moe.forward(x, router_logits, all_rank_num_tokens=[seq_len])
+            torch.cuda.synchronize()
+
         with torch.inference_mode():
             k_full = fused_moe.forward(
                 x,
