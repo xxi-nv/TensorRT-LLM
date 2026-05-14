@@ -1856,7 +1856,36 @@ def main() -> None:
         _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
         return
 
-    # Self-spawn launcher: pull in cloudpickle + MPIPoolExecutor only here.
+    world_size = int(args.world_size or 1)
+    if world_size <= 0:
+        raise ValueError("--world_size must be > 0")
+
+    # Single-rank fast path: there is nothing to spawn, and on some sites
+    # MPI_Comm_Spawn is disabled under srun/pmix containers. Run the worker
+    # inline so single-rank cases (design §11 case 1/2/4/5) do not require
+    # cloudpickle or a spawn-capable PMIx layer.
+    if world_size == 1:
+        if mpi_rank() == 0:
+            print(
+                json.dumps(
+                    {
+                        "bench": "bench_moe",
+                        "launcher": "inline_single_rank",
+                        "world_size": 1,
+                        "model": args.model,
+                        "backend": args.backend,
+                        "num_tokens": list(map(int, args.num_tokens)),
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+        os.environ.update(_WORKER_ENV)
+        args.world_size = 1
+        _run_benchmark_worker_under_current_mpi(args, launcher="inline_single_rank")
+        return
+
+    # Multi-rank self-spawn launcher: pull in cloudpickle + MPIPoolExecutor only here.
     import cloudpickle
     from mpi4py.futures import MPIPoolExecutor
 
@@ -1866,10 +1895,6 @@ def main() -> None:
         cloudpickle.loads,
         pickle.HIGHEST_PROTOCOL,
     )
-
-    world_size = int(args.world_size or 1)
-    if world_size <= 0:
-        raise ValueError("--world_size must be > 0")
 
     if mpi_rank() == 0:
         print(
