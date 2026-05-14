@@ -31,15 +31,16 @@ python tests/microbenchmarks/bench_moe.py \
     --world_size 1 --model qwen1.5_moe --backend CUTLASS \
     --num_tokens 16 64 --no_cuda_graph
 
-# Multi-rank winner selection (CUDA graph)
+# Multi-rank winner selection (CUDA graph is the default; pass --no_cuda_graph
+# to fall back to eager timing, e.g. for dynamic EPLB).
 python tests/microbenchmarks/bench_moe.py \
     --world_size 4 --parallel_mode DEP --model deepseek_v3 \
-    --backend best --num_tokens 64 256 --cuda_graph
+    --backend best --num_tokens 64 256
 
 # mpirun (multi-node)
 mpirun -n 8 python tests/microbenchmarks/bench_moe.py \
     --model deepseek_v3 --backend best --num_tokens 64 256 \
-    --parallel_mode DEP --cuda_graph
+    --parallel_mode DEP
 ```
 """
 
@@ -91,6 +92,7 @@ if str(_TESTS_UNITTEST_DIR) not in sys.path:
 from _torch.modules.moe.moe_test_utils import (  # noqa: E402
     MoeBackendType,
     MoeModelConfig,
+    get_backend_class,
     resolve_deepseek_group_config,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params  # noqa: E402
@@ -190,6 +192,31 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         QuantAlgo.FP8_BLOCK_SCALES,
         DeepSeekV3MoeRoutingMethod,
     ),
+    # DeepSeek-V4-Pro: 1.6T total / 49B activated. MoE config sourced from
+    # https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/raw/main/config.json
+    # (n_routed_experts=384, num_experts_per_tok=6, hidden_size=7168,
+    # moe_intermediate_size=3072, topk_method="noaux_tc").
+    # quant_algo intentionally left None: pass --quant on the CLI to pin the
+    # mode (e.g. FP8_BLOCK_SCALES); the released checkpoint mixes FP4 experts
+    # with FP8 elsewhere which has no single QuantAlgo match.
+    "deepseek_v4_pro": ModelProfile(
+        "deepseek_v4_pro",
+        MoeModelConfig(384, 6, 7168, 3072),
+        None,
+        RenormalizeMoeRoutingMethod,
+    ),
+    # DeepSeek-V4-Flash: 284B total / 13B activated. MoE config sourced from
+    # https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/raw/main/config.json
+    # and matches the unit-test annotation in
+    # tests/unittest/_torch/modules/moe/test_moe_backend.py:322
+    # (DeepSeek-V4-Flash = MoeModelConfig(256, 6, 4096, 2048)).
+    # quant_algo intentionally left None: pass --quant on the CLI.
+    "deepseek_v4_flash": ModelProfile(
+        "deepseek_v4_flash",
+        MoeModelConfig(256, 6, 4096, 2048),
+        None,
+        RenormalizeMoeRoutingMethod,
+    ),
     "mixtral_8x7b": ModelProfile(
         "mixtral_8x7b",
         MoeModelConfig(8, 2, 4096, 14336),
@@ -210,6 +237,34 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
 
 # All ConfigurableMoE-eligible backends.
 _ALL_BACKENDS = [b.value for b in MoeBackendType]
+
+
+def _check_backend_can_implement(
+    backend_str: str,
+    quant_algo: Optional[QuantAlgo],
+    dtype_activation: torch.dtype,
+    swiglu_gptoss_style: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Resolve ``backend_str`` to its MoE class and forward to ``can_implement``.
+
+    Returns ``(False, reason)`` on every failure mode so callers can format a
+    single, uniform error message regardless of whether the backend name was
+    unknown, the class lookup failed, or the backend itself reported that the
+    requested ``(quant_algo, dtype, swiglu_gptoss_style)`` triple is unsupported
+    on the current hardware.
+    """
+    try:
+        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
+    except (KeyError, ValueError) as exc:
+        return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    try:
+        return backend_cls.can_implement(
+            quant_algo=quant_algo,
+            dtype_activation=dtype_activation,
+            swiglu_gptoss_style=swiglu_gptoss_style,
+        )
+    except Exception as exc:
+        return False, (f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1211,9 +1266,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--routing_method",
         type=lambda s: str(s).upper(),
-        default=None,
+        default="RENORMALIZE",
         choices=sorted(_ROUTING_METHODS),
-        help="Routing method (overrides profile default).",
+        help=(
+            "Routing method. Defaults to RENORMALIZE for every model; pass "
+            "DEEPSEEK_V3 / MINIMAX_M2 / etc. to switch grouped or sigmoid "
+            "routing for the same model profile."
+        ),
     )
 
     parser.add_argument(
@@ -1242,9 +1301,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         type=lambda s: str(s).upper(),
-        default="best",
+        default="BEST",
         choices=_ALL_BACKENDS + ["BEST"],
-        help="Backend to bench. ``best`` scans all and reports the winner per num_tokens.",
+        help=(
+            "Backend to bench. With ``BEST`` (default) every backend is "
+            "pre-checked via ``can_implement``; unsupported backends are "
+            "skipped, runnable ones are timed, and the fastest is reported "
+            "per num_tokens with unsupported / failed backends surfaced as "
+            "``time_us=None`` plus a skip_reason. A specific backend value "
+            "(CUTLASS, TRTLLM, ...) errors out immediately when "
+            "``can_implement`` rejects the configuration."
+        ),
     )
 
     parser.add_argument(
@@ -1261,17 +1328,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--cuda_graph",
-        dest="cuda_graph",
-        action="store_true",
-        default=True,
-        help="Capture timed region into a CUDA graph (default ON).",
-    )
-    parser.add_argument(
         "--no_cuda_graph",
         dest="cuda_graph",
         action="store_false",
-        help="Disable CUDA-Graph capture; use eager timing.",
+        default=True,
+        help=(
+            "Disable CUDA-Graph capture and use eager timing. CUDA-Graph "
+            "capture is ON by default; pass this flag to opt out (required "
+            "for dynamic EPLB)."
+        ),
     )
 
     parser.add_argument("--warmup", type=int, default=1)
@@ -1391,8 +1456,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.cuda_graph and args.enable_eplb and int(args.layer_updates_per_iter) > 0:
         raise ValueError(
-            "Dynamic EPLB (layer_updates_per_iter > 0) is incompatible with --cuda_graph. "
-            "Pass --no_cuda_graph for dynamic EPLB."
+            "Dynamic EPLB (layer_updates_per_iter > 0) is incompatible with "
+            "the default CUDA-Graph timing path; pass --no_cuda_graph to "
+            "enable eager timing for dynamic EPLB runs."
         )
     if any(t < 0 for t in args.num_tokens):
         raise ValueError("--num_tokens entries must be >= 0")
@@ -1429,12 +1495,55 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     routing_logits_dtype = (
         torch.float32 if profile.routing_method_cls is DeepSeekV3MoeRoutingMethod else act_dtype
     )
+    # Mirror the swiglu_gptoss_style derivation from ``_build_moe_module`` so
+    # the pre-flight ``can_implement`` check evaluates the same triple that the
+    # actual MoE construction will use later.
+    swiglu_gptoss_style = (
+        profile.swiglu_alpha != 1.0
+        or profile.swiglu_beta != 0.0
+        or profile.swiglu_limit != float("inf")
+    )
 
     mapping = _build_mapping(args, world_size)
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()
 
-    backends_to_run = _ALL_BACKENDS if args.backend == "BEST" else [args.backend]
+    # Pre-flight ``can_implement`` gate: every requested backend must report
+    # support for ``(quant_algo, act_dtype, swiglu_gptoss_style)`` before we
+    # spend the construction / autotune cost. The explicit branch matters:
+    #   * fixed backend  -> raise so the user gets a clear, immediate error;
+    #   * --backend BEST -> filter out unsupported backends, but remember them
+    #                       so they still appear in the final ranking with a
+    #                       ``None`` time and a skip reason.
+    unsupported_backends: Dict[str, str] = {}
+    if args.backend == "BEST":
+        backends_to_run: List[str] = []
+        for candidate in _ALL_BACKENDS:
+            ok, skip_reason = _check_backend_can_implement(
+                candidate, profile.quant_algo, act_dtype, swiglu_gptoss_style
+            )
+            if ok:
+                backends_to_run.append(candidate)
+            else:
+                unsupported_backends[candidate] = skip_reason or "unsupported"
+                _maybe_print_rank0(
+                    "[bench_moe] BEST: skipping backend "
+                    f"{candidate!r} (can_implement=False): {skip_reason}"
+                )
+        if not backends_to_run:
+            raise RuntimeError(
+                "No MoE backend can implement this configuration: "
+                + ", ".join(f"{b}: {r}" for b, r in unsupported_backends.items())
+            )
+    else:
+        ok, skip_reason = _check_backend_can_implement(
+            args.backend, profile.quant_algo, act_dtype, swiglu_gptoss_style
+        )
+        if not ok:
+            raise RuntimeError(
+                f"--backend {args.backend!r} cannot implement this configuration: {skip_reason}"
+            )
+        backends_to_run = [args.backend]
 
     max_global_tokens = max(args.num_tokens) if args.num_tokens else 0
     max_local_tokens = max(
@@ -1482,8 +1591,18 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
     iter_stats = bool(args.iter_stats)
     all_results: List[Dict[str, Any]] = []
-    # winners[total_tokens] -> list of (backend, mean_us)
-    winners: Dict[int, List[Tuple[str, float]]] = {t: [] for t in args.num_tokens}
+    # ``case_outcome[(backend, total_tokens)]`` holds the slowest-rank-mean in
+    # microseconds for successful runs, or ``None`` when the backend could not
+    # produce a timing for that token count (unsupported, build failure,
+    # silent fallback to another backend, or runtime exception in the timed
+    # phase). Tracking ``None`` makes every backend visible in the final BEST
+    # ranking instead of silently dropping it.
+    case_outcome: Dict[Tuple[str, int], Optional[float]] = {}
+    skip_reasons: Dict[Tuple[str, int], str] = {}
+    for skipped_backend, skip_reason_text in unsupported_backends.items():
+        for total_tokens in args.num_tokens:
+            case_outcome[(skipped_backend, total_tokens)] = None
+            skip_reasons[(skipped_backend, total_tokens)] = skip_reason_text
 
     try:
         for backend in backends_to_run:
@@ -1517,18 +1636,21 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                         device=device,
                     )
                 except Exception as exc:
-                    _maybe_print_rank0(
-                        f"[bench_moe] Skipping {case_label}: build error: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    reason = f"build error: {type(exc).__name__}: {exc}"
+                    _maybe_print_rank0(f"[bench_moe] Skipping {case_label}: {reason}")
+                    case_outcome[(backend, total_tokens)] = None
+                    skip_reasons[(backend, total_tokens)] = reason
                     continue
 
                 actual_backend = _backend_name_from_module(moe)
                 if actual_backend != backend.upper():
-                    _maybe_print_rank0(
-                        f"[bench_moe] Skipping {case_label}: requested backend {backend!r} "
-                        f"fell back to {actual_backend!r}; not ranking under requested name."
+                    reason = (
+                        f"requested backend {backend!r} fell back to "
+                        f"{actual_backend!r}; not ranking under requested name."
                     )
+                    _maybe_print_rank0(f"[bench_moe] Skipping {case_label}: {reason}")
+                    case_outcome[(backend, total_tokens)] = None
+                    skip_reasons[(backend, total_tokens)] = reason
                     try:
                         moe.destroy()
                     except Exception:
@@ -1592,11 +1714,13 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                                     eplb=moe_load_balancer,
                                 )
                         except Exception as exc:
+                            reason = f"timed phase error: {type(exc).__name__}: {exc}"
                             _maybe_print_rank0(
-                                f"[bench_moe] Skipping {case_label}: timed phase error: "
-                                f"{type(exc).__name__}: {exc}\n"
+                                f"[bench_moe] Skipping {case_label}: {reason}\n"
                                 f"{traceback.format_exc()}"
                             )
+                            case_outcome[(backend, total_tokens)] = None
+                            skip_reasons[(backend, total_tokens)] = reason
                             continue
 
                     per_rank_stats = _gather_per_rank(fwd_times_us, iter_stats=iter_stats)
@@ -1624,7 +1748,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                             else:
                                 rank_means = list(per_rank_stats.values())
                             score = max(rank_means) if rank_means else 0.0
-                            winners.setdefault(total_tokens, []).append((backend, score))
+                            case_outcome[(backend, total_tokens)] = float(score)
 
                 finally:
                     if moe is not None:
@@ -1644,17 +1768,32 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             else:
                 os.environ["TRTLLM_FORCE_COMM_METHOD"] = prev_force_comm
 
-    # Emit best-backend ranking when requested.
+    # Emit best-backend ranking when requested. Every candidate backend is
+    # surfaced for each ``num_tokens``: successful timings sort ascending,
+    # unsupported / failed backends sort to the tail with ``time_us=None`` and
+    # the collected ``skip_reason`` so the operator can see *why* a backend
+    # was excluded instead of guessing from missing rows.
     if rank == 0 and args.backend == "BEST":
-        for total_tokens, scored in winners.items():
-            if not scored:
-                continue
-            ranking = sorted(scored, key=lambda p: p[1])
-            best_backend = ranking[0][0]
-            entry = {
+        for total_tokens in args.num_tokens:
+            per_backend: List[Tuple[str, Optional[float]]] = [
+                (b, case_outcome.get((b, total_tokens))) for b in _ALL_BACKENDS
+            ]
+            ranking = sorted(
+                per_backend,
+                key=lambda p: (p[1] is None, p[1] if p[1] is not None else 0.0),
+            )
+            best_backend = next((b for b, v in ranking if v is not None), None)
+            entry: Dict[str, Any] = {
                 "num_tokens": int(total_tokens),
                 "best_backend": best_backend,
-                "ranking": [[b, float(s)] for b, s in ranking],
+                "ranking": [
+                    {
+                        "backend": b,
+                        "time_us": (float(v) if v is not None else None),
+                        "skip_reason": skip_reasons.get((b, total_tokens)),
+                    }
+                    for b, v in ranking
+                ],
             }
             print(json.dumps(entry, indent=2), flush=True)
             all_results.append(entry)
