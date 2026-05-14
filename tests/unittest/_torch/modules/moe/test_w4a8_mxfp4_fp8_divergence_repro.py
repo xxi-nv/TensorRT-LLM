@@ -60,22 +60,28 @@ SWIGLU_ALPHA = 1.702
 SWIGLU_BETA = 1.0
 SWIGLU_LIMIT = 7.0
 
-FAILING_CFG = dict(
-    label="FAILING_e60_k4_h2048_i1408",
+FAILING_CFG_GPTOSS = dict(
+    label="FAILING_e60_k4_h2048_i1408_gptoss",
     num_experts=60,
     top_k=4,
     hidden_size=2048,
     intermediate_size=1408,
     seq_len=1,
+    swiglu_gptoss_style=True,
 )
 
-PASSING_CFG = dict(
-    label="PASSING_e256_k8_h2048_i2048",
-    num_experts=256,
-    top_k=8,
+# Same shape as FAILING_CFG_GPTOSS but default SwiGLU (alpha=1, beta=0,
+# limit=inf). Production already verified this path passes - if the kernel
+# produces a magnitude here that agrees with the ref, the divergence we see
+# above is specific to the gpt-oss SwiGLU activation, not to e60/i1408.
+FAILING_CFG_DEFAULT = dict(
+    label="CONTROL_e60_k4_h2048_i1408_default_swiglu",
+    num_experts=60,
+    top_k=4,
     hidden_size=2048,
-    intermediate_size=2048,
+    intermediate_size=1408,
     seq_len=1,
+    swiglu_gptoss_style=False,
 )
 
 
@@ -138,17 +144,20 @@ class VariantRef(MXFP4FP8RefGatedMLPFusedMoE):
         super().__init__(*args, **kwargs)
         self._skip_fc1_roundtrip = skip_fc1_roundtrip
         self._skip_fc2_roundtrip = skip_fc2_roundtrip
-        # Replace each expert's activation with our configurable variant.
-        swiglu_fn = _build_swiglu_fn(
-            alpha=SWIGLU_ALPHA,
-            beta=SWIGLU_BETA,
-            limit=SWIGLU_LIMIT,
-            gate_clamp=gate_clamp,
-            value_clamp=value_clamp,
-            add_beta=add_beta,
-        )
-        for expert in self.experts:
-            expert.activation = swiglu_fn
+        # Only override activation for gpt-oss SwiGLU; for the default
+        # SwiGLU (alpha=1, beta=0, limit=inf) the parent already wired up
+        # F.silu, which is the correct semantic equivalent.
+        if self.swiglu_gptoss_style:
+            swiglu_fn = _build_swiglu_fn(
+                alpha=SWIGLU_ALPHA,
+                beta=SWIGLU_BETA,
+                limit=SWIGLU_LIMIT,
+                gate_clamp=gate_clamp,
+                value_clamp=value_clamp,
+                add_beta=add_beta,
+            )
+            for expert in self.experts:
+                expert.activation = swiglu_fn
 
     def forward(
         self,
@@ -297,6 +306,7 @@ def _run_one_config(cfg):
     num_experts = cfg["num_experts"]
     intermediate_size = cfg["intermediate_size"]
     top_k = cfg["top_k"]
+    use_gptoss_swiglu = cfg.get("swiglu_gptoss_style", True)
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -310,11 +320,11 @@ def _run_one_config(cfg):
         intermediate_size=intermediate_size,
         hidden_size=hidden_size,
         quant_config=quant_config,
-        bias=True,
-        swiglu_gptoss_style=True,
-        swiglu_alpha=SWIGLU_ALPHA,
-        swiglu_beta=SWIGLU_BETA,
-        swiglu_limit=SWIGLU_LIMIT,
+        bias=use_gptoss_swiglu,
+        swiglu_gptoss_style=use_gptoss_swiglu,
+        swiglu_alpha=SWIGLU_ALPHA if use_gptoss_swiglu else None,
+        swiglu_beta=SWIGLU_BETA if use_gptoss_swiglu else None,
+        swiglu_limit=SWIGLU_LIMIT if use_gptoss_swiglu else None,
         num_local_experts=num_experts,
     )
     weights = quantize_util.create_weights(**quant_kwargs)
@@ -325,20 +335,24 @@ def _run_one_config(cfg):
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
     print(f"\n========== {label} ==========")
+    swiglu_desc = (
+        f"gpt-oss alpha={SWIGLU_ALPHA} beta={SWIGLU_BETA} limit={SWIGLU_LIMIT}"
+        if use_gptoss_swiglu
+        else "default (alpha=1, beta=0, limit=inf)"
+    )
     print(
         f"Config: e{num_experts}_k{top_k}_h{hidden_size}_i{intermediate_size} "
-        f"seq={seq_len}, gpt-oss alpha={SWIGLU_ALPHA} beta={SWIGLU_BETA} "
-        f"limit={SWIGLU_LIMIT}"
+        f"seq={seq_len}, swiglu={swiglu_desc}"
     )
 
     with create_moe(
         routing_method=routing_method,
         reduce_results=True,
         model_config=model_cfg,
-        bias=True,
-        swiglu_alpha=swiglu_tensors["swiglu_alpha"],
-        swiglu_beta=swiglu_tensors["swiglu_beta"],
-        swiglu_limit=swiglu_tensors["swiglu_limit"],
+        bias=use_gptoss_swiglu,
+        swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
+        swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
+        swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
         weight_loading_mode=MoEWeightLoadingMode.VANILLA,
     ) as fused_moe:
         fused_moe.load_weights([weights])
@@ -391,7 +405,10 @@ def _run_one_config(cfg):
     print()
 
     print("  -- Variant vs K_full --")
-    for variant_name, variant_kwargs in VARIANTS.items():
+    # Skip non-trivial variants in default-swiglu mode (they would be
+    # identical to V0 since the swiglu override is gated).
+    iter_variants = VARIANTS if use_gptoss_swiglu else {"V0_baseline": dict()}
+    for variant_name, variant_kwargs in iter_variants.items():
         this_weights = {k: v.clone() for k, v in variant_weights.items()}
         ref = _build_variant_ref(cfg, quantize_util, routing_method, variant_kwargs)
         ref.moe_tp_size = 1
@@ -410,7 +427,7 @@ def _run_one_config(cfg):
 def test_w4a8_mxfp4_fp8_divergence_repro():
     torch.cuda.set_device(0)
     with torch.device("cuda:0"):
-        for cfg in (FAILING_CFG, PASSING_CFG):
+        for cfg in (FAILING_CFG_GPTOSS, FAILING_CFG_DEFAULT):
             _run_one_config(cfg)
 
     print(
