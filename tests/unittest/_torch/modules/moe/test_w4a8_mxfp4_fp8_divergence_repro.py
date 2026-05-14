@@ -46,17 +46,34 @@ MPI.pickle.__init__(
 
 
 # ---------------------------------------------------------------------------
-# Failing single-GPU case parameters (from Phase A failures, smallest seq).
+# Cases:
+#   - FAILING_CFG: smallest module-level failing case from Phase A.
+#   - PASSING_CFG: known-good gpt-oss config to sanity-check the reproducer.
+# Magnitudes between fused-kernel and ref should agree for PASSING_CFG; any
+# >100x ratio on FAILING_CFG alone implicates the kernel itself.
 # ---------------------------------------------------------------------------
-NUM_EXPERTS = 60
-TOP_K = 4
-HIDDEN_SIZE = 2048
-INTERMEDIATE_SIZE = 1408
-SEQ_LEN = 1
 DTYPE = torch.bfloat16
 SWIGLU_ALPHA = 1.702
 SWIGLU_BETA = 1.0
 SWIGLU_LIMIT = 7.0
+
+FAILING_CFG = dict(
+    label="FAILING_e60_k4_h2048_i1408",
+    num_experts=60,
+    top_k=4,
+    hidden_size=2048,
+    intermediate_size=1408,
+    seq_len=1,
+)
+
+PASSING_CFG = dict(
+    label="PASSING_e256_k8_h2048_i2048",
+    num_experts=256,
+    top_k=8,
+    hidden_size=2048,
+    intermediate_size=2048,
+    seq_len=1,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -197,15 +214,15 @@ VARIANTS: Dict[str, Dict[str, object]] = {
 # ---------------------------------------------------------------------------
 
 
-def _build_routing_method() -> RenormalizeMoeRoutingMethod:
-    return RenormalizeMoeRoutingMethod(top_k=TOP_K, force_enable_pytorch_op=True)
+def _build_routing_method(cfg) -> RenormalizeMoeRoutingMethod:
+    return RenormalizeMoeRoutingMethod(top_k=cfg["top_k"], force_enable_pytorch_op=True)
 
 
-def _build_model_config(quant_config) -> ModelConfig:
+def _build_model_config(cfg, quant_config) -> ModelConfig:
     pretrained_config = PretrainedConfig()
-    pretrained_config.num_experts = NUM_EXPERTS
-    pretrained_config.hidden_size = HIDDEN_SIZE
-    pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+    pretrained_config.num_experts = cfg["num_experts"]
+    pretrained_config.hidden_size = cfg["hidden_size"]
+    pretrained_config.intermediate_size = cfg["intermediate_size"]
     pretrained_config.torch_dtype = DTYPE
     return ModelConfig(
         pretrained_config=pretrained_config,
@@ -214,7 +231,7 @@ def _build_model_config(quant_config) -> ModelConfig:
         moe_backend="TRTLLM",
         moe_disable_finalize_fusion=False,
         moe_load_balancer=None,
-        max_num_tokens=max(256, SEQ_LEN),
+        max_num_tokens=max(256, cfg["seq_len"]),
     )
 
 
@@ -222,12 +239,12 @@ def _build_quantize_util(x: torch.Tensor):
     return get_test_quant_params(QuantAlgo.W4A8_MXFP4_FP8, x, MoeBackendType.TRTLLM)
 
 
-def _build_variant_ref(quantize_util, routing_method, variant_kwargs) -> VariantRef:
+def _build_variant_ref(cfg, quantize_util, routing_method, variant_kwargs) -> VariantRef:
     ref = VariantRef(
-        num_experts=NUM_EXPERTS,
+        num_experts=cfg["num_experts"],
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
+        hidden_size=cfg["hidden_size"],
+        intermediate_size=cfg["intermediate_size"],
         dtype=DTYPE,
         model_config=ModelConfig(quant_config=quantize_util.quant_config),
         bias=quantize_util.bias,
@@ -269,127 +286,121 @@ def _diff_stats(out_a: torch.Tensor, out_b: torch.Tensor) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
+def _run_one_config(cfg):
+    """Run all variants for a single config and print a summary."""
+    label = cfg["label"]
+    seq_len = cfg["seq_len"]
+    hidden_size = cfg["hidden_size"]
+    num_experts = cfg["num_experts"]
+    intermediate_size = cfg["intermediate_size"]
+    top_k = cfg["top_k"]
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    x = torch.randn((seq_len, hidden_size), dtype=DTYPE, device="cuda")
+    router_logits = torch.randn((seq_len, num_experts), dtype=DTYPE, device="cuda")
+
+    quantize_util_cls, quant_config, quant_kwargs = _build_quantize_util(x)
+    quantize_util = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=DTYPE,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=True,
+        swiglu_gptoss_style=True,
+        swiglu_alpha=SWIGLU_ALPHA,
+        swiglu_beta=SWIGLU_BETA,
+        swiglu_limit=SWIGLU_LIMIT,
+        num_local_experts=num_experts,
+    )
+    weights = quantize_util.create_weights(**quant_kwargs)
+    variant_weights = {k: copy.deepcopy(v) for k, v in weights.items()}
+
+    model_cfg = _build_model_config(cfg, quant_config)
+    routing_method = _build_routing_method(cfg)
+    swiglu_tensors = quantize_util.get_swiglu_tensors()
+
+    print(f"\n========== {label} ==========")
+    print(
+        f"Config: e{num_experts}_k{top_k}_h{hidden_size}_i{intermediate_size} "
+        f"seq={seq_len}, gpt-oss alpha={SWIGLU_ALPHA} beta={SWIGLU_BETA} "
+        f"limit={SWIGLU_LIMIT}"
+    )
+
+    with create_moe(
+        routing_method=routing_method,
+        reduce_results=True,
+        model_config=model_cfg,
+        bias=True,
+        swiglu_alpha=swiglu_tensors["swiglu_alpha"],
+        swiglu_beta=swiglu_tensors["swiglu_beta"],
+        swiglu_limit=swiglu_tensors["swiglu_limit"],
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+    ) as fused_moe:
+        fused_moe.load_weights([weights])
+        fused_moe.post_load_weights()
+        fused_moe.cuda("cuda:0")
+        with torch.inference_mode():
+            k_full = fused_moe.forward(
+                x,
+                router_logits,
+                all_rank_num_tokens=[seq_len],
+            )
+            torch.cuda.synchronize()
+
+    k_full = k_full.detach()
+    print(
+        f"K_full stats: abs_max={k_full.abs().max().item():.6f}, "
+        f"abs_mean={k_full.abs().mean().item():.6f}, "
+        f"abs_median={k_full.abs().float().median().item():.6f}, "
+        f"shape={tuple(k_full.shape)}"
+    )
+    print()
+
+    # Build V0 once for both vs-K_full and pairwise comparisons.
+    ref0 = _build_variant_ref(cfg, quantize_util, routing_method, VARIANTS["V0_baseline"])
+    ref0.moe_tp_size = 1
+    ref0.load_weights([{k: v.clone() for k, v in variant_weights.items()}])
+    ref0.cuda("cuda:0")
+    with torch.inference_mode():
+        r0 = ref0.forward(x, router_logits)
+        torch.cuda.synchronize()
+    r0 = r0.detach()
+    print(
+        f"V0 ref stats: abs_max={r0.abs().max().item():.6f}, "
+        f"abs_mean={r0.abs().float().mean().item():.6f}"
+    )
+    ratio = r0.abs().mean().item() / max(k_full.abs().mean().item(), 1e-12)
+    print(f"Magnitude ratio (V0 / K_full): {ratio:.2f}x")
+    print()
+
+    print("  -- Variant vs K_full --")
+    for variant_name, variant_kwargs in VARIANTS.items():
+        this_weights = {k: v.clone() for k, v in variant_weights.items()}
+        ref = _build_variant_ref(cfg, quantize_util, routing_method, variant_kwargs)
+        ref.moe_tp_size = 1
+        ref.load_weights([this_weights])
+        ref.cuda("cuda:0")
+        with torch.inference_mode():
+            r_out = ref.forward(x, router_logits)
+            torch.cuda.synchronize()
+        stats_vs_k = _diff_stats(r_out, k_full)
+        print(f"  [{variant_name}]")
+        for key, value in stats_vs_k.items():
+            print(f"      {key:34s} = {value:.6f}")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GB200 required for TRTLLM-Gen W4A8 path")
 def test_w4a8_mxfp4_fp8_divergence_repro():
     torch.cuda.set_device(0)
     with torch.device("cuda:0"):
-        torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
+        for cfg in (FAILING_CFG, PASSING_CFG):
+            _run_one_config(cfg)
 
-        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=DTYPE, device="cuda")
-        router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=DTYPE, device="cuda")
-
-        quantize_util_cls, quant_config, quant_kwargs = _build_quantize_util(x)
-        quantize_util = quantize_util_cls(
-            num_experts=NUM_EXPERTS,
-            dtype=DTYPE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            hidden_size=HIDDEN_SIZE,
-            quant_config=quant_config,
-            bias=True,
-            swiglu_gptoss_style=True,
-            swiglu_alpha=SWIGLU_ALPHA,
-            swiglu_beta=SWIGLU_BETA,
-            swiglu_limit=SWIGLU_LIMIT,
-            num_local_experts=NUM_EXPERTS,
-        )
-        weights = quantize_util.create_weights(**quant_kwargs)
-        # Deep copy: each variant ref is built fresh and load_weights may
-        # consume tensors destructively.
-        variant_weights = {k: copy.deepcopy(v) for k, v in weights.items()}
-
-        model_cfg = _build_model_config(quant_config)
-        routing_method = _build_routing_method()
-        swiglu_tensors = quantize_util.get_swiglu_tensors()
-
-        # ----- Build fused TRTLLM-Gen MoE and capture K_full -----
-        with create_moe(
-            routing_method=routing_method,
-            reduce_results=True,
-            model_config=model_cfg,
-            bias=True,
-            swiglu_alpha=swiglu_tensors["swiglu_alpha"],
-            swiglu_beta=swiglu_tensors["swiglu_beta"],
-            swiglu_limit=swiglu_tensors["swiglu_limit"],
-            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-        ) as fused_moe:
-            fused_moe.load_weights([weights])
-            fused_moe.post_load_weights()
-            fused_moe.cuda("cuda:0")
-
-            with torch.inference_mode():
-                k_full = fused_moe.forward(
-                    x,
-                    router_logits,
-                    all_rank_num_tokens=[SEQ_LEN],
-                )
-                torch.cuda.synchronize()
-
-        k_full = k_full.detach()
-        print("\n========== W4A8_MXFP4_FP8 single_gpu gpt-oss divergence repro ==========")
-        print(
-            f"Config: e{NUM_EXPERTS}_k{TOP_K}_h{HIDDEN_SIZE}_i{INTERMEDIATE_SIZE} "
-            f"seq={SEQ_LEN}, gpt-oss alpha={SWIGLU_ALPHA} beta={SWIGLU_BETA} "
-            f"limit={SWIGLU_LIMIT}"
-        )
-        print(
-            f"K_full stats: abs_max={k_full.abs().max().item():.4f}, "
-            f"abs_mean={k_full.abs().mean().item():.4f}, shape={tuple(k_full.shape)}"
-        )
-        print()
-
-        # ----- Run each variant ref against fixed weights -----
-        # K_full is one column; for each variant, we compute mismatch vs K_full.
-        rows = []
-        for variant_name, variant_kwargs in VARIANTS.items():
-            # Make a fresh copy of the weights for the ref each time so
-            # destructive ops in load_weights don't poison subsequent runs.
-            this_weights = {k: v.clone() for k, v in variant_weights.items()}
-            ref = _build_variant_ref(quantize_util, routing_method, variant_kwargs)
-            ref.moe_tp_size = 1
-            ref.load_weights([this_weights])
-            ref.cuda("cuda:0")
-            with torch.inference_mode():
-                r_out = ref.forward(x, router_logits)
-                torch.cuda.synchronize()
-
-            stats_vs_k = _diff_stats(r_out, k_full)
-            rows.append((variant_name, stats_vs_k))
-            print(f"  [{variant_name}]")
-            for key, value in stats_vs_k.items():
-                print(f"      {key:34s} = {value:.6f}")
-
-        # Also dump pairwise R0 vs each variant to see how the variants
-        # differ from each other (sanity).
-        print("\n  -- Pairwise mismatch vs V0_baseline --")
-        v0_kwargs = VARIANTS["V0_baseline"]
-        ref0 = _build_variant_ref(quantize_util, routing_method, v0_kwargs)
-        ref0.moe_tp_size = 1
-        ref0.load_weights([{k: v.clone() for k, v in variant_weights.items()}])
-        ref0.cuda("cuda:0")
-        with torch.inference_mode():
-            r0 = ref0.forward(x, router_logits)
-            torch.cuda.synchronize()
-
-        for variant_name, variant_kwargs in VARIANTS.items():
-            if variant_name == "V0_baseline":
-                continue
-            this_weights = {k: v.clone() for k, v in variant_weights.items()}
-            ref = _build_variant_ref(quantize_util, routing_method, variant_kwargs)
-            ref.moe_tp_size = 1
-            ref.load_weights([this_weights])
-            ref.cuda("cuda:0")
-            with torch.inference_mode():
-                r_out = ref.forward(x, router_logits)
-                torch.cuda.synchronize()
-            pair_stats = _diff_stats(r_out, r0)
-            print(f"  [{variant_name} - V0]")
-            for key, value in pair_stats.items():
-                print(f"      {key:34s} = {value:.6f}")
-
-        print(
-            "\nLegend: 'mismatch_frac@atol0.3_rtol0.15' is the production "
-            "check_accuracy mismatch fraction; <0.15 means the variant would "
-            "pass the test."
-        )
-        print("========================================================\n")
+    print(
+        "\nLegend: 'mismatch_frac@atol0.3_rtol0.15' is the production "
+        "check_accuracy mismatch fraction; <0.15 means the variant would "
+        "pass the test."
+    )
+    print("========================================================\n")
