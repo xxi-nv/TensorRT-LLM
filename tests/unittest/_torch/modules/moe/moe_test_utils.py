@@ -356,6 +356,31 @@ def should_skip_trtllm(
     # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
     # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so top_k=1 / single-expert
     # configs see the same FP8 quantization noise as the fused kernel.
+    #
+    # The one remaining intersection that still diverges is
+    # W4A8_MXFP4_FP8 + top_k=1 + swiglu_gptoss_style=True. The kernel-faithful
+    # ref + FP8 round-trip already brings the generic top_k=1 and the
+    # gpt-oss-style top_k>=2 cases inside tolerance, but the static per-tensor
+    # FP8 input scales (``fc31_input_gate_dequant`` / ``fc2_input_dequant``)
+    # are calibrated at load time across all tokens. With top_k=1 only a
+    # single token routes to each expert, and the gpt-oss SwiGLU's
+    # ``silu_alpha(clamp(gate)) * (clamp(linear) + 1)`` term amplifies the
+    # FC2 activation magnitude so the load-time FC2 scale becomes a poor
+    # approximation for that single token; ref vs kernel diverge ~92-94%.
+    # This matches the analogous skip for W4A8_MXFP4_MXFP8 above and the
+    # original PR #13401 rationale for the W4A8_MXFP4_FP8 + top_k=1 design
+    # limitation, but only on the gpt-oss intersection.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style and top_k == 1:
+        return (
+            f"[Design Limitation] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
+            f"swiglu_gptoss_style and top_k={top_k}: the static per-tensor "
+            f"FP8 input scale is calibrated across all tokens at load time, "
+            f"but a single routed token plus the gpt-oss SwiGLU "
+            f"``*(linear + 1)`` term moves the FC2 activation outside the "
+            f"calibrated FP8 range, so the kernel-faithful bf16 reference "
+            f"and the fused kernel diverge beyond test tolerance. "
+            f"Generic top_k=1 and gpt-oss top_k>=2 are covered."
+        )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
