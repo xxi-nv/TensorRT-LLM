@@ -893,21 +893,6 @@ def _get_comm_method_skip_reason(
     return None
 
 
-def _get_configurable_moe_skip_reason(
-    backend_type: MoeBackendType,
-    quant_algo: Optional[QuantAlgo],
-    model_config: MoeModelConfig,
-) -> Optional[str]:
-    """Return known high-level ConfigurableMoE limitations not shared by backend tests."""
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and backend_type == MoeBackendType.TRTLLM:
-        return (
-            "[Follow-up] ConfigurableMoE W4A8_MXFP4_FP8 TRTLLM "
-            f"{model_config}: fused_moe.forward vs bf16 ref diverges at module level; "
-            "test_moe_backend.py covers the backend-level path."
-        )
-    return None
-
-
 def generate_multi_gpu_test_params(
     parallel_modes,
     comm_methods,
@@ -1005,7 +990,6 @@ def generate_multi_gpu_test_params(
                     should_skip_multi_gpu(
                         parallel_mode, model_config, world_size=4, comm_method=comm_method
                     ),
-                    _get_configurable_moe_skip_reason(backend_type, quant_algo, model_config),
                 ):
                     if reason:
                         skip_reason = reason
@@ -1067,9 +1051,6 @@ def generate_base_test_params(
     ) in iter_base_test_configs(
         swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
     ):
-        if skip_reason:
-            continue
-        skip_reason = _get_configurable_moe_skip_reason(backend_type, quant_algo, model_config)
         if skip_reason:
             continue
         param_values = (
