@@ -350,36 +350,46 @@ def should_skip_trtllm(
     # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
     # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
     # caused by the ref module's dynamic FP8 quantization being miswired to
-    # `trtllm::w4a8_mxfp4_fp8_gemm` (FP4GemmType.W4A8_MXFP4_MXFP8, which
+    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
     # expects per-block activation scales with alpha=1). The reference now
     # dequantizes the MXFP4 weights at load time AND emulates the kernel's
     # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
-    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so top_k=1 / single-expert
-    # configs see the same FP8 quantization noise as the fused kernel.
+    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
+    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
+    # the fused kernel and pass.
     #
-    # The one remaining intersection that still diverges is
-    # W4A8_MXFP4_FP8 + top_k=1 + swiglu_gptoss_style=True. The kernel-faithful
-    # ref + FP8 round-trip already brings the generic top_k=1 and the
-    # gpt-oss-style top_k>=2 cases inside tolerance, but the static per-tensor
-    # FP8 input scales (``fc31_input_gate_dequant`` / ``fc2_input_dequant``)
-    # are calibrated at load time across all tokens. With top_k=1 only a
-    # single token routes to each expert, and the gpt-oss SwiGLU's
-    # ``silu_alpha(clamp(gate)) * (clamp(linear) + 1)`` term amplifies the
-    # FC2 activation magnitude so the load-time FC2 scale becomes a poor
-    # approximation for that single token; ref vs kernel diverge ~92-94%.
-    # This matches the analogous skip for W4A8_MXFP4_MXFP8 above and the
-    # original PR #13401 rationale for the W4A8_MXFP4_FP8 + top_k=1 design
-    # limitation, but only on the gpt-oss intersection.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style and top_k == 1:
+    # The remaining failure surface is
+    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
+    # any model shape, single- or multi-GPU). The element-wise reproducer at
+    # ``tests/unittest/_torch/modules/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
+    # holds the model config / weights / input identical and only toggles
+    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
+    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
+    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
+    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
+    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
+    # Eight ref variants that toggle gate clamp single/double-sided, drop
+    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
+    # round-trip all stay at ~94% mismatch, so the ref activation algebra
+    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
+    # passes (Phase B verification, 16 passed / 0 failed). The bug is
+    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
+    # (likely a wrong scale wired into the gpt-oss epilogue path - see
+    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
+    #
+    # TODO: replace the placeholder NVBug ID below with a real bug once the
+    # kernel team has triaged. Skip removal must be tied to the bug fix.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
         return (
-            f"[Design Limitation] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-            f"swiglu_gptoss_style and top_k={top_k}: the static per-tensor "
-            f"FP8 input scale is calibrated across all tokens at load time, "
-            f"but a single routed token plus the gpt-oss SwiGLU "
-            f"``*(linear + 1)`` term moves the FC2 activation outside the "
-            f"calibrated FP8 range, so the kernel-faithful bf16 reference "
-            f"and the fused kernel diverge beyond test tolerance. "
-            f"Generic top_k=1 and gpt-oss top_k>=2 are covered."
+            "[Kernel Bug NVBUG-TBD-W4A8_MXFP4_FP8_TRTLLMGen_GPTOSS_SWIGLU] "
+            "TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with swiglu_gptoss_style: the "
+            "kernel produces output ~600-800x smaller than the bf16 reference "
+            "across all top_k / model shapes / parallel modes, while the "
+            "same kernel matches ref under default SwiGLU and CUTLASS matches "
+            "ref under gpt-oss SwiGLU. Bug is isolated to the TRTLLM-Gen "
+            "gpt-oss SwiGLU epilogue scale path. See repro: "
+            "tests/unittest/_torch/modules/moe/"
+            "test_w4a8_mxfp4_fp8_divergence_repro.py."
         )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.

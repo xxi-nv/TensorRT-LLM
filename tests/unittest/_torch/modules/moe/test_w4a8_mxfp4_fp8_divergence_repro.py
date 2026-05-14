@@ -423,6 +423,14 @@ def _run_one_config(cfg):
             print(f"      {key:34s} = {value:.6f}")
 
 
+@pytest.mark.skipif(
+    os.environ.get("TRTLLM_W4A8_MXFP4_FP8_REPRO") != "1",
+    reason=(
+        "Diagnostic reproducer for the W4A8_MXFP4_FP8 + TRTLLM-Gen + "
+        "gpt-oss SwiGLU kernel bug; opt-in via TRTLLM_W4A8_MXFP4_FP8_REPRO=1 "
+        "(prints diagnostics, does not assert, requires GB200)."
+    ),
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GB200 required for TRTLLM-Gen W4A8 path")
 def test_w4a8_mxfp4_fp8_divergence_repro():
     torch.cuda.set_device(0)
