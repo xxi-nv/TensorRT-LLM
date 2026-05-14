@@ -351,21 +351,11 @@ def should_skip_trtllm(
     # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
     # caused by the ref module's dynamic FP8 quantization being miswired to
     # `trtllm::w4a8_mxfp4_fp8_gemm` (FP4GemmType.W4A8_MXFP4_MXFP8, which
-    # expects per-block activation scales with alpha=1). The ref module for
-    # W4A8_MXFP4_FP8 is now a dedicated bf16 implementation that dequantizes
-    # the MXFP4 weights at load time (see MXFP4FP8RefGatedMLPFusedMoE); with
-    # that in place the larger TRTLLM configs (e.g. e60_k4_h2048_i1408) pass.
-    # top_k=1 still has a genuine per-tensor static/dynamic FP8 scale
-    # divergence because a single activated expert sees only one routed token.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
-        if top_k == 1:
-            return (
-                f"[Design Limitation] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-                f"top_k={top_k}: with a single activated expert the bf16 ref "
-                f"and the fused kernel see very different activation ranges, "
-                f"and the fused kernel's static per-tensor FP8 scale can no "
-                f"longer stay within the test threshold."
-            )
+    # expects per-block activation scales with alpha=1). The reference now
+    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
+    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
+    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so top_k=1 / single-expert
+    # configs see the same FP8 quantization noise as the fused kernel.
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
@@ -491,12 +481,13 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # W4A8_MXFP4_FP8 on CUTLASS: even after replacing the reference with the
-    # bf16 `MXFP4FP8RefGatedMLPFusedMoE`, CUTLASS W4A8_MXFP4_FP8 still fails
-    # across all tested configs on GB200 (~99% mismatch), which points at the
-    # CUTLASS MoE kernel itself rather than the reference. Skip until the
-    # CUTLASS kernel correctness is audited; the TRTLLM backend exercises the
-    # same quantization path.
+    # W4A8_MXFP4_FP8 on CUTLASS: even with the kernel-faithful reference
+    # (``MXFP4FP8RefGatedMLPFusedMoE`` does the static FP8 round-trip on FC1
+    # and FC2 inputs), CUTLASS W4A8_MXFP4_FP8 still fails across all tested
+    # configs on GB200 (~99% mismatch), which points at the CUTLASS MoE kernel
+    # itself rather than the reference. Skip until the CUTLASS kernel
+    # correctness is audited; the TRTLLM backend exercises the same
+    # quantization path.
     if quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
         return (
             "[Potential Bug] CutlassFusedMoE W4A8_MXFP4_FP8 produces "

@@ -1646,22 +1646,27 @@ class MXFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
     Reference implementation of W4A8_MXFP4_FP8 quantization for correctness testing.
 
-    The original design delegated to GatedMLP + ``W4A8MXFP4FP8LinearMethod``,
-    but that path was empirically shown to produce outputs ~50-70x larger than
-    the fused MoE kernel for large configs (verified on GB200,
-    e60_k4_h2048_i1408 bf16: ref ~744 vs fused ~10.9 per element). Root cause:
-    ``W4A8MXFP4FP8LinearMethod.apply`` passes a dynamic per-tensor FP8
-    input_scale into ``trtllm::w4a8_mxfp4_fp8_gemm``, which is wired to
-    ``FP4GemmType.W4A8_MXFP4_MXFP8`` and expects per-block activation scales
-    combined with ``alpha=1``; the per-tensor scale is not applied correctly
-    and the dequant is off by roughly ``1/input_scale`` (= 448/amax).
+    Background: the original design delegated to GatedMLP +
+    ``W4A8MXFP4FP8LinearMethod``, but that path was empirically shown to produce
+    outputs ~50-70x larger than the fused MoE kernel for large configs
+    (verified on GB200, e60_k4_h2048_i1408 bf16: ref ~744 vs fused ~10.9 per
+    element). Root cause: ``W4A8MXFP4FP8LinearMethod.apply`` passes a dynamic
+    per-tensor FP8 input_scale into ``trtllm::w4a8_mxfp4_fp8_gemm``, which is
+    wired to ``FP4GemmType.W4A8_MXFP4_MXFP8`` and expects per-block activation
+    scales combined with ``alpha=1``; the per-tensor scale is not applied
+    correctly and the dequant is off by roughly ``1/input_scale`` (= 448/amax).
 
-    To keep the reference aligned with the fused kernel, this class follows
-    the ``WFP4A16RefGatedMLPFusedMoE`` pattern: it dequantizes the MXFP4
-    weights to bf16 at load time and runs a plain bf16 GatedMLP forward.
-    This mirrors what the fused kernel computes up to the FP8 activation
-    quantization noise, which is covered by the relaxed thresholds in
-    ``check_accuracy`` below.
+    Implementation strategy: dequantize the MXFP4 weights to bf16 at load
+    time, then on every forward emulate the fused kernel's *static per-tensor
+    FP8 activation quantization* round-trip on the FC1 input and on the FC2
+    input. This matches what the kernel actually computes -- both the TRTLLM
+    Gen and CUTLASS W4A8_MXFP4_FP8 paths feed activations through
+    ``static_quantize_e4m3_per_tensor`` with ``fc31_input_gate_dequant`` /
+    ``fc2_input_dequant`` derived from per-expert input scales (see
+    ``W4A8MXFP4FP8TRTLLMGenFusedMoEMethod.load_quant_scales`` and
+    ``W4A8MXFP4FP8CutlassFusedMoEMethod``'s ``quantize_input``). Without this
+    explicit round-trip the bf16 ref diverged from the kernel for sparse
+    routing such as ``top_k=1``.
     """
 
     def __init__(
@@ -1756,28 +1761,110 @@ class MXFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
+        # Capture per-expert FP8 input dequant scales and reduce them to the
+        # tensor-level scalars the fused kernels actually use. This mirrors
+        # ``W4A8MXFP4FP8TRTLLMGenFusedMoEMethod.load_quant_scales``:
+        #   fc31_input_gate_dequant = max(per-expert w1/w3 input_scale)
+        #   fc2_input_dequant       = max(per-expert w2 input_scale)
+        # The kernel asserts w1.input_scale == w3.input_scale, mirrored here.
+        tmp_fc31 = torch.empty(self.num_experts, dtype=torch.float32, device="cuda")
+        tmp_fc2 = torch.empty(self.num_experts, dtype=torch.float32, device="cuda")
+        for expert in range(self.num_experts):
+            w1_input_scale = weights[f"{expert}.w1.input_scale"][...].reshape([])
+            w3_input_scale = weights[f"{expert}.w3.input_scale"][...].reshape([])
+            w2_input_scale = weights[f"{expert}.w2.input_scale"][...].reshape([])
+            assert torch.allclose(w1_input_scale, w3_input_scale), (
+                "W4A8_MXFP4_FP8 ref expects w1.input_scale == w3.input_scale"
+            )
+            tmp_fc31[expert] = w1_input_scale.float()
+            tmp_fc2[expert] = w2_input_scale.float()
+
+        # Store as 1-element float32 tensors (matches the kernel's API for
+        # static_quantize_e4m3_per_tensor, which accepts a scalar/1-D scale).
+        self.fc31_input_gate_dequant = tmp_fc31.max().reshape(1).contiguous()
+        self.fc2_input_dequant = tmp_fc2.max().reshape(1).contiguous()
+
+    def _fp8_round_trip(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Static per-tensor FP8 round-trip: x -> e4m3 -> dequantize back.
+
+        Mirrors the fused kernel's behavior: the kernel feeds the FP8-quantized
+        activation through a low-precision GEMM whose epilogue scales the
+        result by ``alpha`` (= ``input_dequant``), so to faithfully simulate
+        that in plain bf16 we round-trip the activation through the same FP8
+        bucket and dequantize before the bf16 matmul.
+        """
+        orig_dtype = x.dtype
+        x_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x.contiguous(), scale)
+        # Cast FP8 -> orig dtype, then multiply by the dequant scale to undo
+        # the static quantization. This is the bf16 analogue of how the
+        # FP8 GEMM absorbs the scale into ``alpha``.
+        return x_fp8.to(orig_dtype) * scale.to(orig_dtype)
+
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        # Pad input if hidden_size_unpadded < hidden_size
+        assert hidden_states.shape[-1] == self.hidden_size_unpadded, (
+            f"hidden_states last dim {hidden_states.shape[-1]} != "
+            f"hidden_size_unpadded {self.hidden_size_unpadded}"
+        )
+
+        # Pad input if hidden_size_unpadded < hidden_size to match the kernel
+        # path, which always operates on the padded width.
         if self.hidden_size_unpadded < self.hidden_size:
             pad_size = self.hidden_size - self.hidden_size_unpadded
             hidden_states = torch.nn.functional.pad(hidden_states, (0, pad_size))
 
-        output = super().forward(hidden_states, router_logits)
+        original_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        selected_experts, routing_weights = self.routing_method.apply(router_logits)
+
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # Inline the per-expert MLP to inject the FP8 round-trips between
+        # gate_up_proj / activation / down_proj. This is the core of Option A:
+        # the bf16 reference now sees the same FP8 quantization noise on the
+        # FC1 input and the FC2 input as the fused W4A8_MXFP4_FP8 kernel.
+        for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
+            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+            expert_inputs = hidden_states[batch_idx]
+            expert = self.experts[expert_id]
+
+            # FC1 input static FP8 round-trip (kernel: fc31_input_gate_dequant).
+            expert_inputs = self._fp8_round_trip(expert_inputs, self.fc31_input_gate_dequant)
+
+            h1 = expert.gate_up_proj(expert_inputs)
+            h2 = expert._apply_activation(h1)
+
+            # FC2 input static FP8 round-trip (kernel: fc2_input_dequant).
+            h2 = self._fp8_round_trip(h2, self.fc2_input_dequant)
+
+            output = expert.down_proj(h2)
+            final_hidden_states[batch_idx] += (
+                routing_weights[batch_idx, nth_expert, None] * output.float()
+            )
+
+        final_hidden_states = final_hidden_states.reshape(original_shape)
 
         if self.hidden_size_unpadded < self.hidden_size:
-            output = output[:, : self.hidden_size_unpadded]
-        return output
+            final_hidden_states = final_hidden_states[..., : self.hidden_size_unpadded]
+        return final_hidden_states
 
     def check_accuracy(self, output, ref_output):
-        # The bf16 reference skips the FP8 per-tensor activation quantization
-        # that the fused kernel applies, which introduces a few percent of
-        # additional noise. Use slightly looser rtol than the MXFP8 sibling.
+        # With the static FP8 round-trip applied on both FC1 and FC2 inputs,
+        # the reference is much closer to the fused kernel: the dominant
+        # remaining noise is FP8 (E4M3) quantization on activations plus
+        # accumulation differences. Keep tolerances aligned with the MXFP8
+        # sibling (``MXFP4MXFP8RefGatedMLPFusedMoE.check_accuracy``); only
+        # relax slightly for very large hidden_size and gptoss-style swiglu
+        # configs to absorb FP8 saturation behavior on extreme activations.
         if self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.8)
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
         elif self.hidden_size >= 4096:
-            check_accuracy(output, ref_output, rtol=0.2, atol=0.3, percent=0.85)
+            check_accuracy(output, ref_output, rtol=0.2, atol=0.3, percent=0.9)
         else:
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.2, percent=0.85)
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.2, percent=0.9)
 
 
 class MXFP4FP8QuantizeUtil(MXFP4MXFP8QuantizeUtil):
