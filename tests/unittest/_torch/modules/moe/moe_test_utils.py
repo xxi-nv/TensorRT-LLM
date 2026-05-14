@@ -506,21 +506,6 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # W4A8_MXFP4_FP8 on CUTLASS: even with the kernel-faithful reference
-    # (``MXFP4FP8RefGatedMLPFusedMoE`` does the static FP8 round-trip on FC1
-    # and FC2 inputs), CUTLASS W4A8_MXFP4_FP8 still fails across all tested
-    # configs on GB200 (~99% mismatch), which points at the CUTLASS MoE kernel
-    # itself rather than the reference. Skip until the CUTLASS kernel
-    # correctness is audited; the TRTLLM backend exercises the same
-    # quantization path.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
-        return (
-            "[Potential Bug] CutlassFusedMoE W4A8_MXFP4_FP8 produces "
-            "incorrect outputs on GB200 across all tested configs even with "
-            "the bf16 reference. Suspect the CUTLASS kernel; TRTLLM backend "
-            "covers the quantization path in the meantime."
-        )
-
     # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
     # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
     # (num_rows % rows_per_tile != 0). NVFP4 pads to 128-alignment
