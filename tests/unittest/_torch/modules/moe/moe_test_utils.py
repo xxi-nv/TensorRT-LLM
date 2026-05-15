@@ -360,10 +360,10 @@ def should_skip_trtllm(
     #
     # The remaining failure surface is
     # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
-    # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/modules/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
-    # holds the model config / weights / input identical and only toggles
-    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
+    # any model shape, single- or multi-GPU). An element-wise reproducer
+    # holding model config / weights / input identical and only toggling
+    # the SwiGLU shape (default vs gpt-oss) on ``e60_k4_h2048_i1408 seq=1``
+    # shows:
     #   * default SwiGLU (alpha=1, beta=0, limit=inf):
     #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
     #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
@@ -386,9 +386,7 @@ def should_skip_trtllm(
             "than the bf16 reference across all top_k / model shapes / "
             "parallel modes, while the same kernel matches ref under default "
             "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
-            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path. "
-            "See repro: tests/unittest/_torch/modules/moe/"
-            "test_w4a8_mxfp4_fp8_divergence_repro.py."
+            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
         )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
