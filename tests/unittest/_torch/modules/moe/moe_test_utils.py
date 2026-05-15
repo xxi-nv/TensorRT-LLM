@@ -377,18 +377,17 @@ def should_skip_trtllm(
     # (likely a wrong scale wired into the gpt-oss epilogue path - see
     # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
     #
-    # TODO: replace the placeholder NVBug ID below with a real bug once the
-    # kernel team has triaged. Skip removal must be tied to the bug fix.
+    # Skip removal must be tied to the kernel bug fix tracked in
+    # https://nvbugspro.nvidia.com/bug/6178914.
     if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
         return (
-            "[Kernel Bug NVBUG-TBD-W4A8_MXFP4_FP8_TRTLLMGen_GPTOSS_SWIGLU] "
-            "TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with swiglu_gptoss_style: the "
-            "kernel produces output ~600-800x smaller than the bf16 reference "
-            "across all top_k / model shapes / parallel modes, while the "
-            "same kernel matches ref under default SwiGLU and CUTLASS matches "
-            "ref under gpt-oss SwiGLU. Bug is isolated to the TRTLLM-Gen "
-            "gpt-oss SwiGLU epilogue scale path. See repro: "
-            "tests/unittest/_torch/modules/moe/"
+            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
+            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
+            "than the bf16 reference across all top_k / model shapes / "
+            "parallel modes, while the same kernel matches ref under default "
+            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
+            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path. "
+            "See repro: tests/unittest/_torch/modules/moe/"
             "test_w4a8_mxfp4_fp8_divergence_repro.py."
         )
 
