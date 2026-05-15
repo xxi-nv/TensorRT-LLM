@@ -87,15 +87,6 @@ from torch.autograd import DeviceType
 # never touched, so import them lazily inside ``main()`` to avoid hard
 # dependencies on container images that ship only the minimal mpi4py.
 
-# When invoked as ``python tests/microbenchmarks/bench_moe.py`` (rather than
-# ``python -m`` or via pytest), Python sets ``sys.path[0]`` to the script's
-# directory (``tests/microbenchmarks/``), not the repo root. Adding the repo
-# root first makes ``import tensorrt_llm`` resolve to the in-tree checkout
-# without requiring an installed wheel or a manual ``PYTHONPATH``.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 # ``quantize_utils.py`` lives under ``tests/unittest/_torch/modules/moe/`` and
 # uses pytest-style relative imports such as ``from _torch.helpers import ...``;
 # the project's ``tests/unittest/conftest.py`` puts ``tests/unittest`` on
@@ -103,6 +94,21 @@ if str(_REPO_ROOT) not in sys.path:
 _TESTS_UNITTEST_DIR = Path(__file__).resolve().parent.parent / "unittest"
 if str(_TESTS_UNITTEST_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_UNITTEST_DIR))
+
+# When invoked as ``python tests/microbenchmarks/bench_moe.py`` (rather than
+# ``python -m`` or via pytest), Python sets ``sys.path[0]`` to the script's
+# directory (``tests/microbenchmarks/``), not the repo root. Adding the repo
+# root first makes ``import tensorrt_llm`` resolve to the in-tree checkout
+# without requiring an installed wheel or a manual ``PYTHONPATH``.
+#
+# Only do this when the in-tree ``tensorrt_llm`` package can be imported as a
+# fully built package (i.e., the worktree contains compiled ``bindings``). On
+# OCI / pre-built container environments where ``tensorrt_llm`` is installed
+# system-wide and the worktree is just a source checkout, leaving the worktree
+# off sys.path is correct: the installed wheel is used and bindings resolve.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if (_REPO_ROOT / "tensorrt_llm" / "bindings").is_dir() and str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from _torch.modules.moe.moe_test_utils import (  # noqa: E402
     MoeBackendType,
