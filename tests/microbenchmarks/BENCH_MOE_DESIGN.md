@@ -191,7 +191,7 @@ CLI: `--model deepseek_v3` selects a profile; per-field overrides
 --routing_method` follow the `_resolve_profile_args` pattern in
 `bench_moe_comm.py:1000-1016`.
 
-### Req 2 — `--tokens_per_rank_imbalance_ratio ∈ [0, 1]`
+### Req 2 — `--rank_imbalance_ratio ∈ [0, 1]`
 
 ```python
 def _distribute_tokens(total: int, world_size: int, ratio: float) -> List[int]:
@@ -233,7 +233,7 @@ with a printed reason (mirrors `bench_moe_comm.py:1169-1173`).
 > The user-facing `experts_hot_imbalane_ratio` reads as *"how hot"*, which is
 > the inverse, hence `internal_balance_ratio = 1 - experts_hot_imbalane_ratio`.
 
-`tokens_per_rank_imbalance_ratio` and `experts_hot_imbalane_ratio` are
+`rank_imbalance_ratio` and `experts_hot_imbalane_ratio` are
 **orthogonal**: the first controls inter-rank token counts; the second controls
 intra-rank token-to-expert assignment. Any combination is allowed.
 
@@ -244,7 +244,7 @@ intra-rank token-to-expert assignment. Any combination is allowed.
 ```
 
 For each value, per-rank distribution = `_distribute_tokens(total, world_size,
-tokens_per_rank_imbalance_ratio)`. Example with `world_size=4`:
+rank_imbalance_ratio)`. Example with `world_size=4`:
 
 | total | ratio | per-rank |
 |---|---|---|
@@ -370,7 +370,7 @@ python tests/microbenchmarks/bench_moe.py \
     [--moe_ep_size N --moe_tp_size M --enable_attention_dp]   # Req 5 — fine override
     [--enable_eplb --num_slots K --layer_updates_per_iter U]  # Req 5 — EPLB; dynamic EPLB requires --no_cuda_graph
     --backend best                                   # Req 6 — CUTLASS|TRTLLM|CUTEDSL|DEEPGEMM|DENSEGEMM|MEGAMOE_DEEPGEMM|best
-    --tokens_per_rank_imbalance_ratio 0.0            # Req 2 ∈ [0,1]
+    --rank_imbalance_ratio 0.0                       # Req 2 ∈ [0,1]
     --experts_hot_imbalane_ratio 0.0                 # Req 3 ∈ [0,1]
     [--cuda_graph | --no_cuda_graph]                 # Req 7 — default cuda_graph ON, except dynamic EPLB
     --warmup 1 --iters 5                             # Req 8 defaults
@@ -483,7 +483,7 @@ tests/microbenchmarks/bench_moe.py
     "world_size": 4,
     "parallel_mode": "DEP",
     "moe_ep_size": 4, "moe_tp_size": 1, "enable_attention_dp": true,
-    "tokens_per_rank_imbalance_ratio": 0.0,
+    "rank_imbalance_ratio": 0.0,
     "experts_hot_imbalane_ratio": 0.0,
     "perfect_router_used": true,
     "cuda_graph": true,
@@ -530,7 +530,7 @@ to avoid prohibitive I/O).
 | `MEGAMOE_DEEPGEMM` requires `dist.init_process_group("nccl")`. | Call `_ensure_dist_for_megamoe(...)` only when that backend is selected; other paths pay nothing. |
 | CUPTI must be initialized before the CUDA context. | Strictly follow `bench_moe_comm.py:1028-1037`: `_try_init_cupti()` is the first call in the worker, before `_set_device_from_local_rank()`. |
 | Routing patches must reset their assertion flag every forward. | Use `make_forward_impl_check` (`runner.py:382-392`) which restores `_routing_results_replaced_at = None` per call. New backend → new module → fresh patch. |
-| `tokens_per_rank_imbalance_ratio == 1` produces ranks with `local_num_tokens = 0`. | Most backends accept zero-token forward. For ones that don't, surface `is_workload_feasible(...) == False` and print skip reason (mirrors `bench_moe_comm.py:1169-1173`). |
+| `rank_imbalance_ratio == 1` produces ranks with `local_num_tokens = 0`. | Most backends accept zero-token forward. For ones that don't, surface `is_workload_feasible(...) == False` and print skip reason (mirrors `bench_moe_comm.py:1169-1173`). |
 | `ConfigurableMoE` holds NVSHMEM / DeepEP buffers that must be released collectively. | After each `(backend, num_tokens)` case, `try / finally moe.destroy()` (`configurable_moe.py:461-475`); without it, switching cases can hang at the next collective. |
 | `experts_hot_imbalane_ratio == 0` via `ENABLE_PERFECT_ROUTER` should be equivalent to `BalanceMethod.Balanced` patch — but they exercise different code paths. | `--force_balance_patch` debug switch routes the `ratio==0` case through the patch as well, so both paths can be diff'd kernel-by-kernel. |
 | Router-method dtype quirks (e.g. `DeepSeekV3 + TRTLLM` requires fp32 routing logits, see `cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72`). | Mirror `test_moe_module.py:1336-1343` — set `dtype_routing_logits=torch.float32` for that combination. |
@@ -583,7 +583,7 @@ These defaults are part of the revised design unless the user overrides them:
    `--experts_hot_imbalane_ratio 0.0 --force_balance_patch` on the same config —
    per-kernel times must agree within noise (validates equivalence of the two
    `ratio==0` paths).
-5. `--tokens_per_rank_imbalance_ratio 1.0 --num_tokens 64 --world_size 4` —
+5. `--rank_imbalance_ratio 1.0 --num_tokens 64 --world_size 4` —
    expect `per_rank_num_tokens == [64, 0, 0, 0]`; backend either runs or emits
    `is_workload_feasible=False` skip.
 6. `--enable_eplb --num_slots 16 --backend CUTLASS --model qwen1.5_moe` —

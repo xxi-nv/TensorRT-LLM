@@ -162,7 +162,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks.runner import (  # noqa: E402
 # Output schema version
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -282,27 +282,79 @@ class ModelSpec:
 
 
 @dataclass(frozen=True)
+class RoutingControlSpec:
+    """Advanced routing-control knobs for one workload.
+
+    See ``tests/microbenchmarks/BENCH_MOE_ROUTING_CONTROL_DESIGN.md`` for the
+    full design. Briefly: ``comm_pattern`` and ``expert_pattern`` describe the
+    requested traffic shape; ``routing_mode`` picks between native logits
+    realization and forced supplied-topk; ``projection_policy`` controls what
+    happens when native logits cannot exactly express the requested pattern.
+
+    All fields default to "balanced everything via native logits", which keeps
+    the benchmark behaviour identical to legacy invocations that did not
+    request routing control.
+    """
+
+    routing_mode: str = "native"  # "native" | "forced"
+    projection_policy: str = "project"  # "project" | "reject"
+    comm_pattern: str = "balanced_alltoall"
+    expert_pattern: str = "balanced"
+    per_rank_num_tokens: Optional[Tuple[int, ...]] = None
+    routing_dump_matrix: bool = False
+    seed: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "routing_mode": self.routing_mode,
+            "projection_policy": self.projection_policy,
+            "comm_pattern": self.comm_pattern,
+            "expert_pattern": self.expert_pattern,
+            "per_rank_num_tokens": (
+                list(int(v) for v in self.per_rank_num_tokens)
+                if self.per_rank_num_tokens is not None
+                else None
+            ),
+            "routing_dump_matrix": bool(self.routing_dump_matrix),
+            "seed": int(self.seed),
+        }
+
+    @property
+    def is_active(self) -> bool:
+        """True when this spec asks for non-default routing behaviour.
+
+        Used to decide whether to dispatch through the new routing-control
+        path or fall back to legacy ``expert_hotspot_ratio`` / balanced-patch
+        behaviour.
+        """
+        return (
+            self.routing_mode != "native"
+            or self.comm_pattern != "balanced_alltoall"
+            or self.expert_pattern != "balanced"
+            or self.per_rank_num_tokens is not None
+        )
+
+
+@dataclass(frozen=True)
 class WorkloadSpec:
     """Workload for one timing case after the model is fixed."""
 
     num_tokens: int
-    token_unit: str = "global"  # "global" | "per_rank"
-    rank_distribution: str = "balanced"  # "balanced" | "rank0_hot"
-    rank_hotspot_ratio: float = 0.0
+    rank_imbalance_ratio: float = 0.0
     expert_distribution: str = "balanced_patch"  # "balanced_patch" | "hotspot"
     expert_hotspot_ratio: float = 0.0
+    routing_control: RoutingControlSpec = field(default_factory=RoutingControlSpec)
 
     def to_dict(self, per_rank_num_tokens: Optional[List[int]] = None) -> Dict[str, Any]:
         return {
             "num_tokens": int(self.num_tokens),
-            "token_unit": self.token_unit,
-            "rank_distribution": self.rank_distribution,
-            "rank_hotspot_ratio": float(self.rank_hotspot_ratio),
+            "rank_imbalance_ratio": float(self.rank_imbalance_ratio),
             "expert_distribution": self.expert_distribution,
             "expert_hotspot_ratio": float(self.expert_hotspot_ratio),
             "per_rank_num_tokens": (
                 [int(v) for v in per_rank_num_tokens] if per_rank_num_tokens is not None else None
             ),
+            "routing_control": self.routing_control.to_dict(),
         }
 
 
@@ -394,6 +446,7 @@ class RunResult:
     kernel_breakdown: Dict[str, Any] = field(default_factory=dict)
     overlap: Dict[str, Any] = field(default_factory=dict)
     bottleneck: Optional[str] = None
+    routing_control: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -621,11 +674,9 @@ def _distribute_tokens(total: int, world_size: int, ratio: float) -> List[int]:
 
 def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
     """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
-    if workload.token_unit == "per_rank":
-        # Same local count on every rank, no distribution.
-        return [int(workload.num_tokens)] * world_size
-    # Global: split per ``rank_hotspot_ratio``.
-    ratio = float(workload.rank_hotspot_ratio) if workload.rank_distribution == "rank0_hot" else 0.0
+    # ``num_tokens`` is always global; ``rank_imbalance_ratio`` controls how much
+    # of the balanced share moves to rank 0.
+    ratio = float(workload.rank_imbalance_ratio)
     return _distribute_tokens(int(workload.num_tokens), world_size, ratio)
 
 
@@ -1033,6 +1084,863 @@ def _build_moe_module(
 
 
 # ---------------------------------------------------------------------------
+# Routing control: pattern parsing, plan building, materialization
+#
+# See ``tests/microbenchmarks/BENCH_MOE_ROUTING_CONTROL_DESIGN.md`` for the
+# full design. Highlights:
+#   - ``RoutingPlan`` is the canonical normalised form (per-rank tokens +
+#     slot dispatch matrix + expert histogram).
+#   - Pattern parsers turn user-facing strings like
+#     ``"receiver_hotspot,hotness=0.75,rank=0"`` into structured kwargs.
+#   - Plan builders generate ``dispatch_matrix`` and ``expert_histogram`` for
+#     the requested pattern.
+#   - The materializer turns the plan into a per-rank ``selected_experts``
+#     tensor and reports the observed slot/token traffic + expert histogram.
+#   - The native logits planner reverse-engineers a ``router_logits`` tensor
+#     that drives the actual production routing kernels towards the requested
+#     plan. The exact-reachability table follows the design document.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RoutingPlan:
+    """Canonical normalised routing plan.
+
+    ``per_rank_num_tokens[src]`` is the local input token count on source rank
+    ``src``. ``dispatch_matrix[src][dst]`` is the *slot* count (each selected
+    (token, expert) slot counts once) sent from ``src`` to ``dst``. Row sums
+    are ``per_rank_num_tokens[src] * top_k``. ``expert_histogram[dst][le]`` is
+    the global slot count owned by local expert ``le`` on rank ``dst``.
+    """
+
+    per_rank_num_tokens: Tuple[int, ...]
+    dispatch_matrix: Tuple[Tuple[int, ...], ...]
+    expert_histogram: Tuple[Tuple[int, ...], ...]
+    seed: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "per_rank_num_tokens": [int(v) for v in self.per_rank_num_tokens],
+            "dispatch_matrix": [[int(v) for v in row] for row in self.dispatch_matrix],
+            "expert_histogram": [[int(v) for v in row] for row in self.expert_histogram],
+            "seed": int(self.seed),
+        }
+
+
+@dataclass(frozen=True)
+class RoutingProjectionResult:
+    """Outcome of trying to realise a ``RoutingPlan`` for a given routing method."""
+
+    router_logits: Optional[torch.Tensor]
+    status: str  # "exact" | "projected" | "rejected" | "forced_exact" | "not_applicable"
+    reason: str
+    observed_slot_dispatch_matrix: Tuple[Tuple[int, ...], ...]
+    observed_token_dispatch_matrix: Tuple[Tuple[int, ...], ...]
+    observed_expert_histogram: Tuple[Tuple[int, ...], ...]
+    max_abs_slot_error: int
+    max_relative_slot_error: float
+    selected_experts: Optional[torch.Tensor]
+    selected_scales: Optional[torch.Tensor]
+    warnings: Tuple[str, ...] = ()
+
+
+# --- pattern parsing -------------------------------------------------------
+
+
+_COMM_PATTERN_NAMES: Tuple[str, ...] = (
+    "balanced_alltoall",
+    "receiver_hotspot",
+    "pair_hotspot",
+    "local_only",
+    "ring",
+)
+
+_EXPERT_PATTERN_NAMES: Tuple[str, ...] = ("balanced", "hotspot")
+
+
+_ROUTING_SCENARIOS: Dict[str, Dict[str, str]] = {
+    "balanced_baseline": {
+        "routing_mode": "native",
+        "projection_policy": "project",
+        "comm_pattern": "balanced_alltoall",
+        "expert_pattern": "balanced",
+    },
+    "receiver_hotspot_75": {
+        "routing_mode": "native",
+        "projection_policy": "project",
+        "comm_pattern": "receiver_hotspot,hotness=0.75,rank=0",
+        "expert_pattern": "balanced",
+    },
+    "pair_hotspot_50": {
+        "routing_mode": "native",
+        "projection_policy": "project",
+        "comm_pattern": "pair_hotspot,hotness=0.5,src=0,dst=1",
+        "expert_pattern": "balanced",
+    },
+    "local_only_baseline": {
+        "routing_mode": "native",
+        "projection_policy": "reject",
+        "comm_pattern": "local_only",
+        "expert_pattern": "balanced",
+    },
+}
+
+
+def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:
+    """Parse ``name,k1=v1,k2=v2`` into ``(name, {k1: v1, k2: v2})``.
+
+    A spec starting with ``file:`` is returned as ``("file", {"path": <rest>})``.
+    """
+    raw = str(spec).strip()
+    if not raw:
+        raise ValueError("empty pattern spec")
+    if raw.startswith("file:"):
+        return "file", {"path": raw[len("file:") :]}
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"invalid pattern spec: {spec!r}")
+    name = parts[0]
+    kwargs: Dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            raise ValueError(f"invalid pattern fragment {part!r} in {spec!r}; expected k=v")
+        k, v = part.split("=", 1)
+        kwargs[k.strip()] = v.strip()
+    return name, kwargs
+
+
+def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
+    name, raw = _parse_pattern_spec(spec)
+    if name == "file":
+        return "file", {"path": raw["path"]}
+    if name not in _COMM_PATTERN_NAMES:
+        raise ValueError(
+            f"unknown comm_pattern {name!r}; supported: {_COMM_PATTERN_NAMES} or 'file:<path>'"
+        )
+    kwargs: Dict[str, Any] = {}
+    if "hotness" in raw:
+        kwargs["hotness"] = float(raw["hotness"])
+        if not 0.0 <= kwargs["hotness"] <= 1.0:
+            raise ValueError(f"comm_pattern hotness must be in [0, 1]; got {kwargs['hotness']}")
+    if "rank" in raw:
+        kwargs["rank"] = int(raw["rank"])
+    if "src" in raw:
+        kwargs["src"] = int(raw["src"])
+    if "dst" in raw:
+        kwargs["dst"] = int(raw["dst"])
+    if name == "receiver_hotspot":
+        if "hotness" not in kwargs:
+            raise ValueError("receiver_hotspot requires hotness=<ratio>")
+        kwargs.setdefault("rank", 0)
+    if name == "pair_hotspot":
+        if "hotness" not in kwargs or "src" not in kwargs or "dst" not in kwargs:
+            raise ValueError("pair_hotspot requires hotness=<ratio>, src=<src>, dst=<dst>")
+    return name, kwargs
+
+
+def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
+    name, raw = _parse_pattern_spec(spec)
+    if name == "file":
+        return "file", {"path": raw["path"]}
+    if name not in _EXPERT_PATTERN_NAMES:
+        raise ValueError(
+            f"unknown expert_pattern {name!r}; supported: {_EXPERT_PATTERN_NAMES} or 'file:<path>'"
+        )
+    kwargs: Dict[str, Any] = {}
+    if "hotness" in raw:
+        kwargs["hotness"] = float(raw["hotness"])
+        if not 0.0 <= kwargs["hotness"] <= 1.0:
+            raise ValueError(f"expert_pattern hotness must be in [0, 1]; got {kwargs['hotness']}")
+    if "active_experts" in raw:
+        kwargs["active_experts"] = int(raw["active_experts"])
+        if kwargs["active_experts"] <= 0:
+            raise ValueError("expert_pattern active_experts must be > 0")
+    if name == "hotspot" and "hotness" not in kwargs and "active_experts" not in kwargs:
+        raise ValueError(
+            "expert_pattern hotspot requires hotness=<ratio> or active_experts=<count>"
+        )
+    return name, kwargs
+
+
+def _resolve_scenario(scenario: Optional[str], spec: RoutingControlSpec) -> RoutingControlSpec:
+    """Expand a routing-scenario preset into a concrete ``RoutingControlSpec``.
+
+    Explicit fields on ``spec`` win over preset defaults so users can layer
+    fine-grained overrides on top of a scenario name.
+    """
+    if scenario is None or scenario == "":
+        return spec
+    if scenario not in _ROUTING_SCENARIOS:
+        raise ValueError(
+            f"unknown routing_scenario {scenario!r}; supported: {sorted(_ROUTING_SCENARIOS)}"
+        )
+    preset = _ROUTING_SCENARIOS[scenario]
+    # Default fields from RoutingControlSpec(): allow preset to set them when
+    # caller left them at default; explicit non-default values on ``spec`` win.
+    default = RoutingControlSpec()
+    overrides: Dict[str, Any] = {}
+    for key, value in preset.items():
+        current = getattr(spec, key)
+        if current == getattr(default, key):
+            overrides[key] = value
+    return replace(spec, **overrides)
+
+
+# --- per-rank token / dispatch matrix / expert histogram builders ----------
+
+
+def _largest_remainder_split(total: int, weights: List[float]) -> List[int]:
+    """Split ``total`` integer units among bins using largest-remainder method.
+
+    All weights must be non-negative. Zero-weight bins always receive zero
+    units. The result is deterministic for ties (ties broken by lower index).
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    total = int(total)
+    if total <= 0:
+        return [0] * n
+    s = sum(weights)
+    if s <= 0.0:
+        # Distribute evenly when all weights are zero.
+        base = total // n
+        rem = total - base * n
+        out = [base] * n
+        for i in range(rem):
+            out[i] += 1
+        return out
+    raw = [total * (w / s) for w in weights]
+    floors = [int(x) for x in raw]
+    used = sum(floors)
+    remainders = sorted(
+        ((raw[i] - floors[i], -i) for i in range(n)), key=lambda pair: pair[0], reverse=True
+    )
+    for k in range(total - used):
+        _, neg_idx = remainders[k % n]
+        floors[-neg_idx] += 1
+    return floors
+
+
+def _build_per_rank_num_tokens(
+    spec: RoutingControlSpec,
+    num_tokens: int,
+    world_size: int,
+    legacy_rank_imbalance_ratio: float = 0.0,
+) -> List[int]:
+    """Resolve ``per_rank_num_tokens`` for a workload.
+
+    Priority order: explicit ``spec.per_rank_num_tokens`` > legacy
+    ``rank_imbalance_ratio`` > uniform split.
+    """
+    if spec.per_rank_num_tokens is not None:
+        per_rank = [int(v) for v in spec.per_rank_num_tokens]
+        if len(per_rank) != world_size:
+            raise ValueError(
+                f"per_rank_num_tokens has length {len(per_rank)}, expected world_size={world_size}"
+            )
+        if any(v < 0 for v in per_rank):
+            raise ValueError("per_rank_num_tokens entries must be >= 0")
+        if sum(per_rank) != int(num_tokens):
+            raise ValueError(
+                f"sum(per_rank_num_tokens)={sum(per_rank)} must equal num_tokens={num_tokens}"
+            )
+        return per_rank
+    return _distribute_tokens(int(num_tokens), world_size, float(legacy_rank_imbalance_ratio))
+
+
+def _build_dispatch_matrix(
+    comm_pattern: str,
+    per_rank_num_tokens: List[int],
+    top_k: int,
+    ep_size: int,
+) -> List[List[int]]:
+    """Build the canonical slot ``dispatch_matrix`` for ``comm_pattern``.
+
+    Row sums always equal ``per_rank_num_tokens[src] * top_k``. The matrix is
+    a pure planning artefact: it does not enforce per-token uniqueness yet.
+    That constraint is checked at materialisation time.
+    """
+    name, kwargs = _parse_comm_pattern(comm_pattern)
+    matrix: List[List[int]] = [[0] * ep_size for _ in range(ep_size)]
+    for src in range(ep_size):
+        row_total = int(per_rank_num_tokens[src]) * int(top_k)
+        if row_total == 0:
+            continue
+        if name == "file":
+            # Loaded separately by ``_load_dispatch_matrix_file``.
+            raise ValueError(
+                "file:<path> dispatch matrices are loaded via _load_dispatch_matrix_file"
+            )
+        elif name == "balanced_alltoall":
+            weights = [1.0] * ep_size
+        elif name == "receiver_hotspot":
+            hot_rank = int(kwargs["rank"])
+            if not 0 <= hot_rank < ep_size:
+                raise ValueError(f"receiver_hotspot rank={hot_rank} out of range [0, {ep_size})")
+            hotness = float(kwargs["hotness"])
+            weights = [(1.0 - hotness) / max(ep_size, 1)] * ep_size
+            weights[hot_rank] += hotness
+        elif name == "pair_hotspot":
+            pair_src = int(kwargs["src"])
+            pair_dst = int(kwargs["dst"])
+            if not 0 <= pair_src < ep_size or not 0 <= pair_dst < ep_size:
+                raise ValueError(
+                    f"pair_hotspot src/dst must be in [0, {ep_size}); got src={pair_src}, dst={pair_dst}"
+                )
+            hotness = float(kwargs["hotness"])
+            if src == pair_src:
+                weights = [(1.0 - hotness) / max(ep_size, 1)] * ep_size
+                weights[pair_dst] += hotness
+            else:
+                weights = [1.0] * ep_size
+        elif name == "local_only":
+            weights = [0.0] * ep_size
+            weights[src] = 1.0
+        elif name == "ring":
+            weights = [0.0] * ep_size
+            weights[(src + 1) % ep_size] = 1.0
+        else:
+            raise ValueError(f"unknown comm_pattern {name!r}")
+        matrix[src] = _largest_remainder_split(row_total, weights)
+    return matrix
+
+
+def _build_expert_histogram(
+    expert_pattern: str,
+    dispatch_matrix: List[List[int]],
+    experts_per_rank: int,
+    ep_size: int,
+) -> List[List[int]]:
+    """Build the canonical global ``expert_histogram[ep_size][experts_per_rank]``."""
+    name, kwargs = _parse_expert_pattern(expert_pattern)
+    histogram: List[List[int]] = [[0] * experts_per_rank for _ in range(ep_size)]
+    # Per-target slot totals come from column sums of the dispatch matrix.
+    col_sums = [sum(dispatch_matrix[src][dst] for src in range(ep_size)) for dst in range(ep_size)]
+    for dst in range(ep_size):
+        target_total = int(col_sums[dst])
+        if target_total <= 0:
+            continue
+        if name == "file":
+            raise ValueError(
+                "file:<path> expert histograms are loaded via _load_expert_histogram_file"
+            )
+        elif name == "balanced":
+            weights = [1.0] * experts_per_rank
+        elif name == "hotspot":
+            if "active_experts" in kwargs:
+                active = int(kwargs["active_experts"])
+                active = max(1, min(active, experts_per_rank))
+                weights = [1.0 if le < active else 0.0 for le in range(experts_per_rank)]
+            else:
+                hotness = float(kwargs["hotness"])
+                # Concentrate ``hotness`` fraction onto expert 0; spread the
+                # remainder uniformly.
+                weights = [(1.0 - hotness) / max(experts_per_rank, 1)] * experts_per_rank
+                weights[0] += hotness
+        else:
+            raise ValueError(f"unknown expert_pattern {name!r}")
+        histogram[dst] = _largest_remainder_split(target_total, weights)
+    return histogram
+
+
+def _load_dispatch_matrix_file(path: str, ep_size: int) -> List[List[int]]:
+    """Load and validate a ``file:<path>`` slot dispatch matrix."""
+    with open(path) as f:
+        payload = json.load(f)
+    if str(payload.get("schema", "")) != "v1":
+        raise ValueError(f"dispatch matrix {path!r}: unsupported schema {payload.get('schema')!r}")
+    if int(payload.get("ep_size", -1)) != ep_size:
+        raise ValueError(
+            f"dispatch matrix {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
+        )
+    matrix = payload.get("slot_dispatch_matrix")
+    if (
+        not isinstance(matrix, list)
+        or len(matrix) != ep_size
+        or any(not isinstance(row, list) or len(row) != ep_size for row in matrix)
+    ):
+        raise ValueError(
+            f"dispatch matrix {path!r}: slot_dispatch_matrix must be a {ep_size}x{ep_size} integer list"
+        )
+    return [[int(v) for v in row] for row in matrix]
+
+
+def _load_expert_histogram_file(path: str, ep_size: int, experts_per_rank: int) -> List[List[int]]:
+    """Load and validate a ``file:<path>`` expert histogram."""
+    with open(path) as f:
+        payload = json.load(f)
+    if str(payload.get("schema", "")) != "v1":
+        raise ValueError(f"expert histogram {path!r}: unsupported schema {payload.get('schema')!r}")
+    if int(payload.get("ep_size", -1)) != ep_size:
+        raise ValueError(
+            f"expert histogram {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
+        )
+    if int(payload.get("experts_per_rank", -1)) != experts_per_rank:
+        raise ValueError(
+            f"expert histogram {path!r}: experts_per_rank={payload.get('experts_per_rank')} mismatches "
+            f"runtime experts_per_rank={experts_per_rank}"
+        )
+    histogram = payload.get("expert_histogram")
+    if (
+        not isinstance(histogram, list)
+        or len(histogram) != ep_size
+        or any(not isinstance(row, list) or len(row) != experts_per_rank for row in histogram)
+    ):
+        raise ValueError(
+            f"expert histogram {path!r}: expert_histogram must be a {ep_size}x{experts_per_rank} integer list"
+        )
+    return [[int(v) for v in row] for row in histogram]
+
+
+def _build_routing_plan(
+    spec: RoutingControlSpec,
+    num_tokens: int,
+    world_size: int,
+    top_k: int,
+    num_experts: int,
+    moe_ep_size: int,
+    legacy_rank_imbalance_ratio: float = 0.0,
+) -> RoutingPlan:
+    """Translate a ``RoutingControlSpec`` into a canonical normalised plan."""
+    if moe_ep_size <= 0 or num_experts % moe_ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+        )
+    experts_per_rank = num_experts // moe_ep_size
+    if top_k > num_experts:
+        raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
+    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size, legacy_rank_imbalance_ratio)
+    # ``moe_ep_size`` may be smaller than ``world_size`` when MoE is replicated
+    # across attention DP slots; the dispatch matrix indexing follows the EP
+    # axis, but materialisation is still per source rank. For the v1 dispatch
+    # matrix abstraction we use ``moe_ep_size`` as both axes.
+    if spec.comm_pattern.startswith("file:"):
+        dispatch_matrix = _load_dispatch_matrix_file(spec.comm_pattern[len("file:") :], moe_ep_size)
+    else:
+        dispatch_matrix = _build_dispatch_matrix(spec.comm_pattern, per_rank, top_k, moe_ep_size)
+    if spec.expert_pattern.startswith("file:"):
+        expert_histogram = _load_expert_histogram_file(
+            spec.expert_pattern[len("file:") :], moe_ep_size, experts_per_rank
+        )
+    else:
+        expert_histogram = _build_expert_histogram(
+            spec.expert_pattern, dispatch_matrix, experts_per_rank, moe_ep_size
+        )
+
+    # Per-row sums are an invariant; emit a clearer error than the materialiser would.
+    for src in range(moe_ep_size):
+        expected = int(per_rank[src]) * int(top_k) if src < len(per_rank) else 0
+        actual = sum(dispatch_matrix[src])
+        if actual != expected:
+            raise ValueError(
+                f"dispatch_matrix row {src} sums to {actual}, expected per_rank_num_tokens[{src}] * top_k = {expected}"
+            )
+    # Global expert histogram total must match total slots.
+    total_slots = sum(int(t) for t in per_rank) * int(top_k)
+    hist_total = sum(sum(row) for row in expert_histogram)
+    if hist_total != total_slots:
+        raise ValueError(
+            f"expert_histogram sum={hist_total} must equal sum(per_rank_num_tokens) * top_k = {total_slots}"
+        )
+
+    return RoutingPlan(
+        per_rank_num_tokens=tuple(int(v) for v in per_rank),
+        dispatch_matrix=tuple(tuple(int(v) for v in row) for row in dispatch_matrix),
+        expert_histogram=tuple(tuple(int(v) for v in row) for row in expert_histogram),
+        seed=int(spec.seed),
+    )
+
+
+# --- materialisation -------------------------------------------------------
+
+
+def _split_slot_count_to_experts(
+    slot_count: int,
+    target_histogram_row: List[int],
+) -> List[int]:
+    """Allocate ``slot_count`` slots across local experts proportionally.
+
+    Largest-remainder over ``target_histogram_row`` ensures the per-local-expert
+    distribution within this (src, dst) cell tracks the global histogram for
+    the target rank. Returns a list of length ``len(target_histogram_row)``.
+    """
+    weights = [float(v) for v in target_histogram_row]
+    return _largest_remainder_split(int(slot_count), weights)
+
+
+def _materialize_selected_experts_for_rank(
+    plan: RoutingPlan,
+    src_rank: int,
+    top_k: int,
+    experts_per_rank: int,
+    moe_ep_size: int,
+    device: torch.device,
+    scale_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Materialise ``[local_num_tokens, top_k]`` expert ids + uniform scales.
+
+    The algorithm:
+      1. Flatten ``dispatch_matrix[src_rank]`` into a slot-count-per-(dst, le)
+         table by splitting the row counts across local experts proportional
+         to the target rank's global histogram.
+      2. Build a flat list of expert ids of length ``local_num_tokens * top_k``.
+      3. Reshape column-major (k=0 first across tokens, then k=1, ...) so
+         that within a row consecutive slots come from different "buckets" and
+         per-token expert ids stay distinct in practice.
+      4. Run a small repair pass that swaps duplicated expert ids between
+         rows until each token has ``top_k`` distinct experts.
+    """
+    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    if local_num_tokens == 0:
+        ids = torch.zeros((0, top_k), dtype=torch.int32, device=device)
+        scales = torch.zeros((0, top_k), dtype=scale_dtype, device=device)
+        return ids, scales
+
+    row = list(plan.dispatch_matrix[src_rank])
+    if sum(row) != local_num_tokens * top_k:
+        raise ValueError(
+            f"dispatch_matrix row sum ({sum(row)}) must equal local_num_tokens*top_k "
+            f"({local_num_tokens * top_k}) for rank {src_rank}"
+        )
+
+    flat: List[int] = []
+    for dst in range(moe_ep_size):
+        cell = int(row[dst])
+        if cell == 0:
+            continue
+        target_hist = list(plan.expert_histogram[dst])
+        per_le = _split_slot_count_to_experts(cell, target_hist)
+        for le, cnt in enumerate(per_le):
+            if cnt <= 0:
+                continue
+            expert_id = dst * experts_per_rank + le
+            flat.extend([expert_id] * int(cnt))
+
+    if len(flat) != local_num_tokens * top_k:
+        raise ValueError(
+            f"materialiser flat length {len(flat)} != local_num_tokens*top_k={local_num_tokens * top_k}"
+        )
+
+    # Reshape column-major: pos i -> (token_idx=i%num_tokens, k_idx=i//num_tokens).
+    out = [[0] * top_k for _ in range(local_num_tokens)]
+    for i, val in enumerate(flat):
+        k_idx = i // local_num_tokens
+        t_idx = i % local_num_tokens
+        out[t_idx][k_idx] = val
+
+    # Repair duplicates: for any token with duplicated expert ids, swap one of
+    # the duplicates with a different expert id from another token.
+    max_passes = 4
+    for _pass in range(max_passes):
+        any_repair = False
+        for t in range(local_num_tokens):
+            seen: Dict[int, int] = {}
+            for k in range(top_k):
+                eid = out[t][k]
+                if eid in seen:
+                    # Find a swap partner: another row whose (k slot) has a
+                    # different expert id and that does not introduce a new
+                    # duplicate.
+                    target_k = k
+                    swapped = False
+                    for t2 in range(local_num_tokens):
+                        if t2 == t:
+                            continue
+                        partner = out[t2][target_k]
+                        if partner == eid:
+                            continue
+                        if partner in seen:
+                            continue
+                        out[t][target_k], out[t2][target_k] = partner, eid
+                        swapped = True
+                        any_repair = True
+                        break
+                    if not swapped:
+                        # Try swapping the k-th slot with a different k slot
+                        # inside the same row.
+                        for k2 in range(top_k):
+                            if k2 == k:
+                                continue
+                            alt = out[t][k2]
+                            if alt == eid or alt in seen:
+                                continue
+                            out[t][k], out[t][k2] = alt, eid
+                            any_repair = True
+                            break
+                    seen[out[t][k]] = k
+                else:
+                    seen[eid] = k
+        if not any_repair:
+            break
+
+    ids = torch.tensor(out, dtype=torch.int32, device=device)
+    scales = torch.full(
+        (local_num_tokens, top_k), 1.0 / max(top_k, 1), dtype=scale_dtype, device=device
+    )
+    return ids, scales
+
+
+def _observe_routing_metrics(
+    plan: RoutingPlan,
+    selected_experts_per_rank: List[torch.Tensor],
+    experts_per_rank: int,
+    moe_ep_size: int,
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Derive observed slot/token traffic and expert histogram from materialised ids."""
+    slot_traffic = [[0] * moe_ep_size for _ in range(moe_ep_size)]
+    token_traffic = [[0] * moe_ep_size for _ in range(moe_ep_size)]
+    expert_hist = [[0] * experts_per_rank for _ in range(moe_ep_size)]
+    for src, ids in enumerate(selected_experts_per_rank):
+        if ids is None or ids.numel() == 0:
+            continue
+        ids_cpu = ids.detach().cpu().numpy() if not isinstance(ids, list) else ids
+        for row in ids_cpu:
+            dst_visited = set()
+            for eid in row:
+                eid_int = int(eid)
+                dst = eid_int // experts_per_rank
+                le = eid_int % experts_per_rank
+                if 0 <= dst < moe_ep_size and 0 <= le < experts_per_rank:
+                    slot_traffic[src][dst] += 1
+                    expert_hist[dst][le] += 1
+                    if dst not in dst_visited:
+                        token_traffic[src][dst] += 1
+                        dst_visited.add(dst)
+    return slot_traffic, token_traffic, expert_hist
+
+
+def _observe_summary(
+    requested_slot: List[List[int]],
+    observed_slot: List[List[int]],
+) -> Tuple[int, float]:
+    """Return ``(max_abs_slot_error, max_relative_slot_error)``."""
+    max_abs = 0
+    max_rel = 0.0
+    for src in range(len(observed_slot)):
+        for dst in range(len(observed_slot[src])):
+            req = int(requested_slot[src][dst]) if src < len(requested_slot) else 0
+            obs = int(observed_slot[src][dst])
+            abs_err = abs(obs - req)
+            if abs_err > max_abs:
+                max_abs = abs_err
+            denom = max(req, 1)
+            rel_err = abs_err / denom
+            if rel_err > max_rel:
+                max_rel = rel_err
+    return int(max_abs), float(max_rel)
+
+
+# --- native logits projection ---------------------------------------------
+
+
+_NATIVE_PROJECTION_CAPABILITIES: Dict[str, str] = {
+    "DefaultMoeRoutingMethod": "exact_ids",
+    "RenormalizeMoeRoutingMethod": "exact",
+    "RenormalizeNaiveMoeRoutingMethod": "exact",
+    "SigmoidRenormMoeRoutingMethod": "exact_ids",
+    "Llama4RenormalizeMoeRoutingMethod": "top1_exact",
+    "MiniMaxM2MoeRoutingMethod": "exact_with_zero_bias",
+    "DeepSeekV3MoeRoutingMethod": "projected_or_exact",
+    "SparseMixerMoeRoutingMethod": "unsupported",
+}
+
+
+def _project_router_logits_for_plan(
+    plan: RoutingPlan,
+    src_rank: int,
+    routing_method,
+    num_experts: int,
+    top_k: int,
+    experts_per_rank: int,
+    moe_ep_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    high_logit: float = 10.0,
+    low_logit: float = -10.0,
+) -> Tuple[torch.Tensor, str, str]:
+    """Build router_logits for ``routing_method.apply`` matching the plan.
+
+    Construct logits such that ``routing_method.apply`` yields a top-k matching
+    ``plan``'s ``[local_num_tokens, top_k]`` materialised expert ids.
+
+    Returns ``(router_logits, status, reason)`` where ``status`` is one of
+    ``"exact"``, ``"projected"``, or ``"rejected"``.
+    """
+    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    if local_num_tokens == 0:
+        return (
+            torch.empty((0, num_experts), dtype=dtype, device=device),
+            "exact",
+            "no local tokens; trivial logits",
+        )
+
+    method_name = type(routing_method).__name__
+    capability = _NATIVE_PROJECTION_CAPABILITIES.get(method_name, "unsupported")
+
+    # Materialise target experts using the canonical plan, then construct
+    # logits that drive the routing kernels towards those experts.
+    ids, _ = _materialize_selected_experts_for_rank(
+        plan,
+        src_rank=src_rank,
+        top_k=top_k,
+        experts_per_rank=experts_per_rank,
+        moe_ep_size=moe_ep_size,
+        device=device,
+        scale_dtype=dtype if dtype.is_floating_point else torch.bfloat16,
+    )
+
+    # Base low / high pattern with a small monotone perturbation by k index so
+    # that ties inside a row are broken consistently.
+    logits = torch.full((local_num_tokens, num_experts), low_logit, dtype=dtype, device=device)
+    k_offsets = torch.linspace(0.0, 1.0, steps=top_k, device=device, dtype=dtype) * 0.01
+    # Score per slot decreases with k_idx so that top-k tie-breaking yields the
+    # same expert ordering when scales are derived from logits.
+    score_per_k = high_logit + (k_offsets.flip(dims=(0,)) - 0.005)
+    row_idx = (
+        torch.arange(local_num_tokens, device=device).unsqueeze(1).expand(local_num_tokens, top_k)
+    )
+    logits[row_idx, ids.long()] = score_per_k.unsqueeze(0).expand_as(ids).to(dtype)
+
+    status = "exact"
+    reason = "high/low logits drive top-k to plan"
+
+    if capability == "exact":
+        pass
+    elif capability == "exact_ids":
+        reason = (
+            "expert ids exactly realised; selected_scales follow native routing kernel and are not "
+            "matrix-controlled"
+        )
+    elif capability == "top1_exact":
+        # Llama4 only uses top1 routing semantically; if the plan asks for top-k
+        # > 1 we cannot exactly express the same workload via native logits.
+        if top_k > 1:
+            status = "projected"
+            reason = (
+                "Llama4 native realisation is only exact for top1; multi-target plans are projected"
+            )
+    elif capability == "exact_with_zero_bias":
+        # MiniMax2 selects via ``sigmoid(logits) + bias``; with zero bias the
+        # ids are still exact but final scales come from a bias-less sigmoid.
+        reason = "MiniMax2 exact realisation assumes zero score-correction bias"
+    elif capability == "projected_or_exact":
+        # DeepSeekV3 grouped routing: every selected expert must belong to one
+        # of the top ``topk_group`` groups (out of ``n_group``). Detect a
+        # violation by counting groups per token.
+        routing_impl = getattr(routing_method, "routing_impl", None)
+        n_group = getattr(routing_impl, "n_group", 1) if routing_impl is not None else 1
+        topk_group = getattr(routing_impl, "topk_group", 1) if routing_impl is not None else 1
+        if n_group > 1 and topk_group >= 1:
+            experts_per_group = num_experts // n_group
+            ids_cpu = ids.detach().cpu().tolist()
+            for row in ids_cpu:
+                groups = {int(eid) // experts_per_group for eid in row}
+                if len(groups) > topk_group:
+                    status = "projected"
+                    reason = (
+                        f"DeepSeekV3 grouped routing: row needs experts in {len(groups)} groups "
+                        f"but topk_group={topk_group}"
+                    )
+                    break
+    elif capability == "unsupported":
+        status = "projected"
+        reason = f"{method_name} native logits realisation is unsupported in v1; falling back to high/low logits"
+    else:
+        status = "projected"
+        reason = f"{method_name}: unknown capability"
+
+    return logits, status, reason
+
+
+def _make_supplied_topk_run_moe(
+    moe_module,
+    run_moe_orig,
+    materialized_ids: torch.Tensor,
+    materialized_scales: torch.Tensor,
+):
+    """Return a ``run_moe`` wrapper that injects pre-materialised top-k tensors.
+
+    Mirrors the ``make_balanced_run_moe`` helper in the layer-wise benchmark
+    runner, but feeds the routing-control plan instead of the legacy
+    balanced/imbalanced selection helpers.
+    """
+
+    def supplied_run_moe(
+        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
+    ):
+        if getattr(moe_module, "_routing_results_replaced_at", None) is not None:
+            return run_moe_orig(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                router_logits,
+                do_finalize,
+                moe_output,
+            )
+        local = materialized_ids
+        scales = materialized_scales
+        # If the engine resized the local batch (e.g. CUDA graph padding), align
+        # to the runtime ``x.shape[0]`` so we never index out of bounds.
+        if local.shape[0] != x.shape[0]:
+            if local.shape[0] >= x.shape[0]:
+                local = local[: x.shape[0]]
+                scales = scales[: x.shape[0]]
+            else:
+                # Pad by repeating the last row; rare, only happens when the
+                # backend over-allocates the batch dimension.
+                pad_rows = x.shape[0] - local.shape[0]
+                local = torch.cat([local, local[-1:].expand(pad_rows, -1).clone()], dim=0)
+                scales = torch.cat([scales, scales[-1:].expand(pad_rows, -1).clone()], dim=0)
+        local = local.to(device=x.device, dtype=torch.int32)
+        scales = scales.to(device=x.device)
+        final_hidden_states = run_moe_orig(x, local, scales, x_sf, None, do_finalize, moe_output)
+        if not do_finalize:
+            final_hidden_states = (
+                final_hidden_states[0],
+                scales,
+                final_hidden_states[2],
+            )
+        moe_module._routing_results_replaced_at = "make_supplied_topk_run_moe"
+        return final_hidden_states
+
+    return supplied_run_moe
+
+
+def _make_supplied_topk_apply(
+    moe_module,
+    apply_orig,
+    materialized_ids: torch.Tensor,
+    materialized_scales: torch.Tensor,
+):
+    """Return a ``routing_method.apply`` wrapper returning the plan directly."""
+
+    def supplied_apply(router_logits):
+        # Honour the original apply to preserve dtypes/device when possible,
+        # but discard its result.
+        try:
+            _ = apply_orig(router_logits)
+        except Exception:
+            pass
+        local = materialized_ids
+        scales = materialized_scales
+        if router_logits is not None and local.shape[0] != router_logits.shape[0]:
+            if local.shape[0] >= router_logits.shape[0]:
+                local = local[: router_logits.shape[0]]
+                scales = scales[: router_logits.shape[0]]
+            else:
+                pad_rows = router_logits.shape[0] - local.shape[0]
+                local = torch.cat([local, local[-1:].expand(pad_rows, -1).clone()], dim=0)
+                scales = torch.cat([scales, scales[-1:].expand(pad_rows, -1).clone()], dim=0)
+        device = router_logits.device if router_logits is not None else local.device
+        moe_module._routing_results_replaced_at = "make_supplied_topk_apply"
+        return local.to(device=device, dtype=torch.int32), scales.to(device=device)
+
+    return supplied_apply
+
+
+# ---------------------------------------------------------------------------
 # Routing-imbalance patch
 # ---------------------------------------------------------------------------
 
@@ -1123,6 +2031,53 @@ def _maybe_install_balance_patch(
         if state.run_moe_orig is not None:
             getattr(moe, "backend", moe).run_moe = state.run_moe_orig
         state.moe.forward_impl = state.forward_impl_orig
+
+
+@contextlib.contextmanager
+def _maybe_install_routing_control_patch(
+    moe,
+    materialized_ids: Optional[torch.Tensor],
+    materialized_scales: Optional[torch.Tensor],
+    active: bool,
+):
+    """Install supplied-topk patches when routing control is active in forced mode.
+
+    For non-TRTLLM backends we override ``routing_method.apply`` to return the
+    pre-materialised ``(ids, scales)`` pair. For ``TRTLLMGenFusedMoE`` the
+    fused TEP path needs ``run_moe`` to be patched as well, mirroring the
+    layer-wise benchmark's ``make_balanced_run_moe`` flow.
+
+    ``active=False`` makes this a no-op pass-through so legacy callers keep
+    behaving exactly as before.
+    """
+    if not active or materialized_ids is None or materialized_scales is None:
+        yield
+        return
+
+    routing_target = moe
+    apply_method_orig = routing_target.routing_method.apply
+    routing_target.routing_method.apply = _make_supplied_topk_apply(
+        routing_target, apply_method_orig, materialized_ids, materialized_scales
+    )
+
+    inner_backend = getattr(moe, "backend", moe)
+    run_moe_orig = None
+    if isinstance(inner_backend, TRTLLMGenFusedMoE):
+        run_moe_orig = inner_backend.run_moe
+        inner_backend.run_moe = _make_supplied_topk_run_moe(
+            inner_backend, run_moe_orig, materialized_ids, materialized_scales
+        )
+
+    forward_impl_orig = moe.forward_impl
+    moe.forward_impl = make_forward_impl_check(moe, forward_impl_orig)
+
+    try:
+        yield
+    finally:
+        routing_target.routing_method.apply = apply_method_orig
+        if run_moe_orig is not None:
+            getattr(moe, "backend", moe).run_moe = run_moe_orig
+        moe.forward_impl = forward_impl_orig
 
 
 # ---------------------------------------------------------------------------
@@ -1762,6 +2717,95 @@ def _gather_status_per_rank(local_status: str) -> Dict[str, str]:
     return {f"rank{i}": s for i, s in enumerate(payload)}
 
 
+def _build_routing_control_block(
+    *,
+    spec: RoutingControlSpec,
+    plan: RoutingPlan,
+    observed_slot: List[List[int]],
+    observed_token: List[List[int]],
+    observed_hist: List[List[int]],
+    routing_path: Optional[str],
+    realization_status: str,
+    realization_reason: str,
+    enable_perfect_router: bool,
+    max_num_tokens_per_rank: int,
+    num_chunks_observed: Optional[int],
+    warnings: List[str],
+    scale_dtype: torch.dtype,
+    moe_ep_size: int,
+    dump_full: bool,
+) -> Dict[str, Any]:
+    """Compose the ``routing_control`` block for a result row.
+
+    Always includes ``requested`` and an ``actual`` summary; full slot/token
+    matrices and histograms are included only when ``dump_full`` is set, to
+    avoid JSON bloat during large sweeps.
+    """
+    requested_slot = [list(row) for row in plan.dispatch_matrix]
+    max_abs, max_rel = _observe_summary(requested_slot, observed_slot)
+    row_sums = [sum(row) for row in observed_slot]
+    col_sums = [sum(observed_slot[s][d] for s in range(moe_ep_size)) for d in range(moe_ep_size)]
+    diag = sum(observed_slot[i][i] for i in range(moe_ep_size)) if moe_ep_size > 0 else 0
+    total = sum(row_sums)
+    off_diag_ratio = 0.0 if total <= 0 else (1.0 - diag / total)
+
+    flat_hist = [v for row in observed_hist for v in row]
+    hist_min = min(flat_hist) if flat_hist else 0
+    hist_max = max(flat_hist) if flat_hist else 0
+    active_experts = sum(1 for v in flat_hist if v > 0)
+
+    block: Dict[str, Any] = {
+        "requested": {
+            "routing_mode": spec.routing_mode,
+            "projection_policy": spec.projection_policy,
+            "comm_pattern": spec.comm_pattern,
+            "expert_pattern": spec.expert_pattern,
+            "per_rank_num_tokens": list(plan.per_rank_num_tokens),
+            "seed": int(spec.seed),
+        },
+        "actual": {
+            "routing_path": routing_path,
+            "routing_realization": {
+                "status": realization_status,
+                "reason": realization_reason,
+                "max_abs_slot_error": int(max_abs),
+                "max_relative_slot_error": float(max_rel),
+            },
+            "enable_perfect_router": bool(enable_perfect_router),
+            "effective_src_axis": "dp_rank",
+            "max_num_tokens_per_rank": int(max_num_tokens_per_rank),
+            "num_chunks_observed": int(num_chunks_observed)
+            if isinstance(num_chunks_observed, int)
+            else None,
+            "use_dp_padding": False,
+            "observed_dispatch_matrix_summary": {
+                "row_sums": row_sums,
+                "col_sums": col_sums,
+                "off_diagonal_ratio": float(off_diag_ratio),
+                "max_abs_slot_error": int(max_abs),
+                "matrix_dump_path": None,
+            },
+            "observed_expert_histogram_summary": {
+                "min": int(hist_min),
+                "max": int(hist_max),
+                "active_experts": int(active_experts),
+            },
+            "selected_scales": {
+                "distribution": "uniform",
+                "dtype": str(scale_dtype),
+                "seed": int(spec.seed),
+            },
+            "warnings": list(warnings),
+        },
+    }
+    if dump_full:
+        block["actual"]["observed_slot_dispatch_matrix"] = [list(r) for r in observed_slot]
+        block["actual"]["observed_token_dispatch_matrix"] = [list(r) for r in observed_token]
+        block["actual"]["observed_expert_histogram"] = [list(r) for r in observed_hist]
+        block["actual"]["requested_slot_dispatch_matrix"] = [list(r) for r in requested_slot]
+    return block
+
+
 def _run_one_candidate(
     *,
     model: ModelSpec,
@@ -1786,9 +2830,66 @@ def _run_one_candidate(
     case.
     """
     result = RunResult(model=model, workload=workload, config=config)
-    per_rank = _per_rank_tokens(workload, world_size)
+    rc_spec = workload.routing_control
+    rc_active = rc_spec.is_active
+
+    # Resolve EP-axis ``moe_ep_size`` from the candidate now so routing-plan
+    # building can use it. The mapping object created later will agree.
+    try:
+        moe_ep_size, _moe_tp_size, _enable_dp = _resolve_mapping_layout(config, world_size)
+    except ValueError as exc:
+        result.status = "skipped"
+        result.skip_reason = str(exc)
+        result.status_per_rank = _gather_status_per_rank("skipped")
+        return result
+
+    # EPLB mutex (design says v1 rejects routing control with eplb_mode != off).
+    if rc_active and config.eplb_mode != "off":
+        reason = (
+            "routing_control is mutually exclusive with eplb_mode != off in v1; "
+            "EPLB slot remapping is not yet supported"
+        )
+        result.status = "skipped"
+        result.skip_reason = reason
+        result.status_per_rank = _gather_status_per_rank("skipped")
+        return result
+
+    routing_plan: Optional[RoutingPlan] = None
+    materialized_ids: Optional[torch.Tensor] = None
+    materialized_scales: Optional[torch.Tensor] = None
+    routing_realization_status: Optional[str] = None
+    routing_realization_reason: Optional[str] = None
+    routing_warnings: List[str] = []
+
+    if rc_active:
+        try:
+            routing_plan = _build_routing_plan(
+                rc_spec,
+                num_tokens=int(workload.num_tokens),
+                world_size=world_size,
+                top_k=int(model.top_k),
+                num_experts=int(model.num_experts),
+                moe_ep_size=int(moe_ep_size),
+                legacy_rank_imbalance_ratio=float(workload.rank_imbalance_ratio),
+            )
+        except Exception as exc:
+            reason = f"routing plan error: {type(exc).__name__}: {exc}"
+            _maybe_print_rank0(f"[bench_moe] {reason}")
+            result.status = "skipped"
+            result.skip_reason = reason
+            result.status_per_rank = _gather_status_per_rank("skipped")
+            return result
+        per_rank = list(routing_plan.per_rank_num_tokens)
+        # Pad ``per_rank`` to ``world_size`` when ``moe_ep_size < world_size``;
+        # MoE-replicated source ranks share the same EP-axis bucket.
+        if len(per_rank) < world_size:
+            base = per_rank + [0] * (world_size - len(per_rank))
+            per_rank = base
+    else:
+        per_rank = _per_rank_tokens(workload, world_size)
+
     result.per_rank_num_tokens = list(per_rank)
-    local_num_tokens = per_rank[rank]
+    local_num_tokens = per_rank[rank] if rank < len(per_rank) else 0
     all_rank_num_tokens = list(per_rank)
 
     instrumentation: Dict[str, Any] = {
@@ -1829,6 +2930,23 @@ def _run_one_candidate(
     prev_force_comm = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
     _force_comm_env(config.comm_method, prev_force_comm)
 
+    # ``enable_perfect_router`` selection per design table.
+    if rc_active:
+        # ``forced`` always disables perfect router; ``native`` enables it
+        # only for ``balanced_alltoall`` + ``balanced``.
+        if rc_spec.routing_mode == "forced":
+            enable_perfect_router = False
+        else:
+            enable_perfect_router = (
+                rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
+            )
+    else:
+        enable_perfect_router = (
+            workload.expert_distribution == "balanced_patch"
+            and workload.expert_hotspot_ratio == 0.0
+            and not force_balance_patch
+        )
+
     moe = moe_load_balancer = None
     local_status = "success"
     try:
@@ -1844,11 +2962,7 @@ def _run_one_candidate(
                 enable_eplb=enable_eplb,
                 num_slots=int(num_slots),
                 layer_updates_per_iter=int(layer_updates),
-                enable_perfect_router=(
-                    workload.expert_distribution == "balanced_patch"
-                    and workload.expert_hotspot_ratio == 0.0
-                    and not force_balance_patch
-                ),
+                enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
                 routing_logits_dtype=routing_logits_dtype,
                 device=device,
@@ -1883,15 +2997,116 @@ def _run_one_candidate(
             device,
         )
 
-        with _maybe_install_balance_patch(
-            moe,
-            mapping,
-            model.num_experts,
-            model.top_k,
-            float(workload.expert_hotspot_ratio)
-            if workload.expert_distribution == "hotspot"
-            else 0.0,
-            bool(force_balance_patch),
+        routing_path: Optional[str] = None
+        if rc_active and routing_plan is not None:
+            experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+            ep_axis_rank = rank if rank < int(moe_ep_size) else (rank % int(moe_ep_size))
+            if rc_spec.routing_mode == "forced":
+                try:
+                    materialized_ids, materialized_scales = _materialize_selected_experts_for_rank(
+                        routing_plan,
+                        src_rank=ep_axis_rank,
+                        top_k=int(model.top_k),
+                        experts_per_rank=experts_per_rank,
+                        moe_ep_size=int(moe_ep_size),
+                        device=device,
+                        scale_dtype=act_dtype,
+                    )
+                except Exception as exc:
+                    reason = f"routing materialise error: {type(exc).__name__}: {exc}"
+                    _maybe_print_rank0(f"[bench_moe] {reason}")
+                    result.status = "skipped"
+                    result.skip_reason = reason
+                    result.status_per_rank = _gather_status_per_rank("skipped")
+                    return result
+                routing_realization_status = "forced_exact"
+                routing_realization_reason = (
+                    "forced routing_mode: top-k ids and uniform 1/top_k scales materialised "
+                    "from RoutingPlan; native fused scoring is intentionally bypassed"
+                )
+                inner_backend = getattr(moe, "backend", moe)
+                if isinstance(inner_backend, TRTLLMGenFusedMoE):
+                    routing_path = "supplied_topk_run_moe"
+                else:
+                    routing_path = "supplied_topk_apply"
+            else:
+                try:
+                    new_logits, projection_status, projection_reason = (
+                        _project_router_logits_for_plan(
+                            routing_plan,
+                            src_rank=ep_axis_rank,
+                            routing_method=moe.routing_method,
+                            num_experts=int(model.num_experts),
+                            top_k=int(model.top_k),
+                            experts_per_rank=experts_per_rank,
+                            moe_ep_size=int(moe_ep_size),
+                            device=device,
+                            dtype=routing_logits_dtype,
+                        )
+                    )
+                except Exception as exc:
+                    reason = f"native logits projection error: {type(exc).__name__}: {exc}"
+                    _maybe_print_rank0(f"[bench_moe] {reason}")
+                    result.status = "skipped"
+                    result.skip_reason = reason
+                    result.status_per_rank = _gather_status_per_rank("skipped")
+                    return result
+                if projection_status != "exact" and rc_spec.projection_policy == "reject":
+                    routing_realization_status = "rejected"
+                    routing_realization_reason = projection_reason
+                    result.status = "skipped"
+                    result.skip_reason = (
+                        f"routing_realization rejected by projection_policy=reject: "
+                        f"{projection_reason}"
+                    )
+                    result.status_per_rank = _gather_status_per_rank("skipped")
+                    # Still record routing-control summary so dashboards see the case.
+                    result.routing_control = _build_routing_control_block(
+                        spec=rc_spec,
+                        plan=routing_plan,
+                        observed_slot=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
+                        observed_token=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
+                        observed_hist=[[0] * experts_per_rank for _ in range(int(moe_ep_size))],
+                        routing_path=None,
+                        realization_status="rejected",
+                        realization_reason=projection_reason,
+                        enable_perfect_router=enable_perfect_router,
+                        max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
+                        num_chunks_observed=result.num_chunks,
+                        warnings=routing_warnings,
+                        scale_dtype=act_dtype,
+                        moe_ep_size=int(moe_ep_size),
+                        dump_full=bool(rc_spec.routing_dump_matrix),
+                    )
+                    return result
+                router_logits = new_logits
+                routing_realization_status = projection_status
+                routing_realization_reason = projection_reason
+                routing_path = (
+                    "logits_native" if projection_status == "exact" else "logits_projected"
+                )
+                if projection_status != "exact":
+                    routing_warnings.append(
+                        f"routing_realization={projection_status}: {projection_reason}"
+                    )
+
+        with (
+            _maybe_install_balance_patch(
+                moe,
+                mapping,
+                model.num_experts,
+                model.top_k,
+                float(workload.expert_hotspot_ratio)
+                if workload.expert_distribution == "hotspot" and not rc_active
+                else 0.0,
+                bool(force_balance_patch) and not rc_active,
+            ),
+            _maybe_install_routing_control_patch(
+                moe,
+                materialized_ids,
+                materialized_scales,
+                active=(rc_active and rc_spec.routing_mode == "forced"),
+            ),
         ):
             try:
                 _run_autotune(
@@ -1955,6 +3170,51 @@ def _run_one_candidate(
         result.bottleneck = _classify_bottleneck(
             result.phase_times_us["agg"], result.kernel_breakdown, result.latency_us["score"]
         )
+
+        if rc_active and routing_plan is not None:
+            experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+            # Observation uses the canonical plan to materialise *every* EP
+            # source independently. This avoids MPI gather double-counting in
+            # mapping modes where multiple world ranks share the same EP rank
+            # (e.g. DTP/TTP with moe_ep_size < world_size), and lets the rank-0
+            # writer report consistent slot/token/histogram numbers regardless
+            # of which world rank executed which EP axis.
+            per_rank_ids: List[Any] = []
+            for src in range(int(moe_ep_size)):
+                try:
+                    src_ids, _ = _materialize_selected_experts_for_rank(
+                        routing_plan,
+                        src_rank=src,
+                        top_k=int(model.top_k),
+                        experts_per_rank=experts_per_rank,
+                        moe_ep_size=int(moe_ep_size),
+                        device=torch.device("cpu"),
+                        scale_dtype=torch.float32,
+                    )
+                except Exception:
+                    src_ids = torch.empty((0, int(model.top_k)), dtype=torch.int32)
+                per_rank_ids.append(src_ids)
+            observed_slot, observed_token, observed_hist = _observe_routing_metrics(
+                routing_plan, per_rank_ids, experts_per_rank, int(moe_ep_size)
+            )
+            result.routing_control = _build_routing_control_block(
+                spec=rc_spec,
+                plan=routing_plan,
+                observed_slot=observed_slot,
+                observed_token=observed_token,
+                observed_hist=observed_hist,
+                routing_path=routing_path,
+                realization_status=routing_realization_status or "exact",
+                realization_reason=routing_realization_reason or "balanced default",
+                enable_perfect_router=enable_perfect_router,
+                max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
+                num_chunks_observed=result.num_chunks,
+                warnings=routing_warnings,
+                scale_dtype=act_dtype,
+                moe_ep_size=int(moe_ep_size),
+                dump_full=bool(rc_spec.routing_dump_matrix),
+            )
+
         result.status_per_rank = _gather_status_per_rank(local_status)
         return result
     finally:
@@ -1976,7 +3236,7 @@ def _run_one_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Output schema v2 serialization
+# Output schema serialization
 # ---------------------------------------------------------------------------
 
 
@@ -2013,6 +3273,7 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
             "moe_forward_kernels": [],
             "other_kernels": [],
         },
+        "routing_control": result.routing_control or None,
     }
 
 
@@ -2214,36 +3475,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         required=False,
-        help=(
-            "Token counts to sweep. Interpreted as global tokens by default; "
-            "see --token_unit per_rank for the alternate semantics."
-        ),
+        help="Global token counts to sweep; each value is split across ranks.",
     )
     parser.add_argument(
-        "--token_unit",
-        type=lambda s: str(s).lower(),
-        default="global",
-        choices=("global", "per_rank"),
-        help="Whether each --num_tokens entry is global or per-rank tokens.",
-    )
-    parser.add_argument(
-        "--rank_distribution",
-        type=lambda s: str(s).lower(),
-        default="balanced",
-        choices=("balanced", "rank0_hot"),
-        help="How global tokens are split across ranks.",
+        "--rank_imbalance_ratio",
+        type=float,
+        default=0.0,
+        help="In [0, 1]. 0=balanced rank split; 1=all global tokens on rank 0.",
     )
     parser.add_argument(
         "--rank_hotspot_ratio",
         type=float,
-        default=0.0,
-        help="In [0, 1]. Used when --rank_distribution=rank0_hot.",
+        default=None,
+        help="Deprecated alias for --rank_imbalance_ratio." + _DEPRECATED_HELP,
     )
     parser.add_argument(
         "--tokens_per_rank_imbalance_ratio",
         type=float,
         default=None,
-        help="Deprecated alias for --rank_hotspot_ratio." + _DEPRECATED_HELP,
+        help="Deprecated alias for --rank_imbalance_ratio." + _DEPRECATED_HELP,
     )
     parser.add_argument(
         "--expert_distribution",
@@ -2268,6 +3518,77 @@ def parse_args() -> argparse.Namespace:
         "--force_balance_patch",
         action="store_true",
         help="Force the balanced routing patch even when expert_hotspot_ratio == 0.",
+    )
+
+    # ---- Routing control (see BENCH_MOE_ROUTING_CONTROL_DESIGN.md) ----
+    parser.add_argument(
+        "--routing_mode",
+        type=lambda s: str(s).lower(),
+        default="native",
+        choices=("native", "forced"),
+        help=(
+            "native: route through production logits kernels (default); "
+            "forced: supply top-k ids/scales directly (skips fused scoring)."
+        ),
+    )
+    parser.add_argument(
+        "--projection_policy",
+        type=lambda s: str(s).lower(),
+        default="project",
+        choices=("project", "reject"),
+        help=(
+            "project: when native logits cannot exactly realise the plan, run with "
+            "the closest legal projection and warn; reject: skip the case instead."
+        ),
+    )
+    parser.add_argument(
+        "--comm_pattern",
+        type=str,
+        default="balanced_alltoall",
+        help=(
+            "Source-to-target slot dispatch pattern. Examples: balanced_alltoall, "
+            "receiver_hotspot,hotness=0.75,rank=0, pair_hotspot,hotness=0.5,src=0,dst=1, "
+            "local_only, ring, file:path/to/matrix.json"
+        ),
+    )
+    parser.add_argument(
+        "--expert_pattern",
+        type=str,
+        default="balanced",
+        help=(
+            "Per-target-rank local expert histogram pattern. Examples: balanced, "
+            "hotspot,hotness=0.5, hotspot,active_experts=2, file:path/to/histogram.json"
+        ),
+    )
+    parser.add_argument(
+        "--routing_scenario",
+        type=str,
+        default=None,
+        choices=sorted(_ROUTING_SCENARIOS),
+        help=(
+            "Routing scenario preset; expands to routing_mode/projection_policy/"
+            "comm_pattern/expert_pattern unless they are explicitly overridden."
+        ),
+    )
+    parser.add_argument(
+        "--per_rank_num_tokens",
+        type=str,
+        default=None,
+        help=(
+            "Explicit per-rank token counts, comma-separated (length must equal "
+            "world_size). Independent of comm_pattern; sum must equal --num_tokens."
+        ),
+    )
+    parser.add_argument(
+        "--routing_dump_matrix",
+        action="store_true",
+        help="Include the full observed slot/token matrix and expert histogram in each result row.",
+    )
+    parser.add_argument(
+        "--routing_seed",
+        type=int,
+        default=0,
+        help="Seed for deterministic routing-plan materialisation.",
     )
 
     # ---- Parallel mode ----
@@ -2450,36 +3771,85 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
 def _resolve_workloads_from_args(args: argparse.Namespace) -> List[WorkloadSpec]:
     if not args.num_tokens:
         raise ValueError("--num_tokens is required (or supply via --config_file)")
-    rank_ratio = args.rank_hotspot_ratio
+    rank_ratio = args.rank_imbalance_ratio
+    if args.rank_hotspot_ratio is not None:
+        _emit_deprecation("rank_hotspot_ratio", "rank_imbalance_ratio")
+        rank_ratio = float(args.rank_hotspot_ratio)
     if args.tokens_per_rank_imbalance_ratio is not None:
-        _emit_deprecation("tokens_per_rank_imbalance_ratio", "rank_hotspot_ratio")
+        _emit_deprecation("tokens_per_rank_imbalance_ratio", "rank_imbalance_ratio")
         rank_ratio = float(args.tokens_per_rank_imbalance_ratio)
     expert_ratio = args.expert_hotspot_ratio
     if args.experts_hot_imbalane_ratio is not None:
         _emit_deprecation("experts_hot_imbalane_ratio", "expert_hotspot_ratio")
         expert_ratio = float(args.experts_hot_imbalane_ratio)
-    rank_distribution = args.rank_distribution
-    if rank_ratio > 0.0 and rank_distribution == "balanced":
-        rank_distribution = "rank0_hot"
     expert_distribution = args.expert_distribution
     if expert_ratio > 0.0 and expert_distribution == "balanced_patch":
         expert_distribution = "hotspot"
 
     if not (0.0 <= rank_ratio <= 1.0):
-        raise ValueError("rank_hotspot_ratio must be in [0, 1]")
+        raise ValueError("rank_imbalance_ratio must be in [0, 1]")
     if not (0.0 <= expert_ratio <= 1.0):
         raise ValueError("expert_hotspot_ratio must be in [0, 1]")
     if any(t < 0 for t in args.num_tokens):
         raise ValueError("--num_tokens entries must be >= 0")
 
+    # Resolve RoutingControlSpec from CLI args (with scenario preset overlay).
+    per_rank_num_tokens: Optional[Tuple[int, ...]] = None
+    if getattr(args, "per_rank_num_tokens", None):
+        raw = str(args.per_rank_num_tokens).strip()
+        if raw:
+            try:
+                parts = [int(p.strip()) for p in raw.split(",") if p.strip()]
+            except ValueError as exc:
+                raise ValueError(
+                    f"--per_rank_num_tokens must be a comma-separated integer list; got {raw!r}"
+                ) from exc
+            per_rank_num_tokens = tuple(parts)
+
+    base_routing_spec = RoutingControlSpec(
+        routing_mode=str(getattr(args, "routing_mode", "native")),
+        projection_policy=str(getattr(args, "projection_policy", "project")),
+        comm_pattern=str(getattr(args, "comm_pattern", "balanced_alltoall")),
+        expert_pattern=str(getattr(args, "expert_pattern", "balanced")),
+        per_rank_num_tokens=per_rank_num_tokens,
+        routing_dump_matrix=bool(getattr(args, "routing_dump_matrix", False)),
+        seed=int(getattr(args, "routing_seed", 0)),
+    )
+    routing_spec = _resolve_scenario(getattr(args, "routing_scenario", None), base_routing_spec)
+
+    # Legacy backward-compat translation: if the user opted into
+    # ``force_balance_patch`` without picking a routing mode, treat it as
+    # ``forced + balanced_alltoall + balanced`` per the design.
+    if (
+        getattr(args, "force_balance_patch", False)
+        and routing_spec == RoutingControlSpec()
+        and expert_distribution != "hotspot"
+    ):
+        routing_spec = RoutingControlSpec(
+            routing_mode="forced",
+            comm_pattern="balanced_alltoall",
+            expert_pattern="balanced",
+        )
+
+    # Legacy ``expert_hotspot_ratio`` -> ``expert_pattern=hotspot,hotness=<v>``
+    # only when the new flag was left at its default.
+    if (
+        expert_distribution == "hotspot"
+        and expert_ratio > 0.0
+        and routing_spec.expert_pattern == "balanced"
+    ):
+        routing_spec = replace(
+            routing_spec,
+            expert_pattern=f"hotspot,hotness={float(expert_ratio):.4f}",
+        )
+
     return [
         WorkloadSpec(
             num_tokens=int(t),
-            token_unit=args.token_unit,
-            rank_distribution=rank_distribution,
-            rank_hotspot_ratio=float(rank_ratio),
+            rank_imbalance_ratio=float(rank_ratio),
             expert_distribution=expert_distribution,
             expert_hotspot_ratio=float(expert_ratio),
+            routing_control=routing_spec,
         )
         for t in args.num_tokens
     ]
@@ -2609,16 +3979,36 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
     workload_cfg = cfg.get("workload", {}) or {}
     if "num_tokens" in workload_cfg:
         args.num_tokens = list(workload_cfg["num_tokens"])
-    if "token_unit" in workload_cfg:
-        args.token_unit = workload_cfg["token_unit"]
-    if "rank_distribution" in workload_cfg:
-        args.rank_distribution = workload_cfg["rank_distribution"]
-    if "rank_hotspot_ratio" in workload_cfg:
-        args.rank_hotspot_ratio = float(workload_cfg["rank_hotspot_ratio"])
+    if "rank_imbalance_ratio" in workload_cfg:
+        args.rank_imbalance_ratio = float(workload_cfg["rank_imbalance_ratio"])
+    if "rank_hotspot_ratio" in workload_cfg and "rank_imbalance_ratio" not in workload_cfg:
+        _emit_deprecation("workload.rank_hotspot_ratio", "workload.rank_imbalance_ratio")
+        args.rank_imbalance_ratio = float(workload_cfg["rank_hotspot_ratio"])
     if "expert_distribution" in workload_cfg:
         args.expert_distribution = workload_cfg["expert_distribution"]
     if "expert_hotspot_ratio" in workload_cfg:
         args.expert_hotspot_ratio = float(workload_cfg["expert_hotspot_ratio"])
+    if "per_rank_num_tokens" in workload_cfg:
+        prnt = workload_cfg["per_rank_num_tokens"]
+        if isinstance(prnt, list):
+            args.per_rank_num_tokens = ",".join(str(int(v)) for v in prnt)
+        else:
+            args.per_rank_num_tokens = str(prnt)
+    routing_cfg = workload_cfg.get("routing_control", {}) or {}
+    if "routing_mode" in routing_cfg:
+        args.routing_mode = str(routing_cfg["routing_mode"]).lower()
+    if "projection_policy" in routing_cfg:
+        args.projection_policy = str(routing_cfg["projection_policy"]).lower()
+    if "comm_pattern" in routing_cfg:
+        args.comm_pattern = str(routing_cfg["comm_pattern"])
+    if "expert_pattern" in routing_cfg:
+        args.expert_pattern = str(routing_cfg["expert_pattern"])
+    if "scenario" in routing_cfg:
+        args.routing_scenario = str(routing_cfg["scenario"])
+    if "routing_dump_matrix" in routing_cfg:
+        args.routing_dump_matrix = bool(routing_cfg["routing_dump_matrix"])
+    if "seed" in routing_cfg:
+        args.routing_seed = int(routing_cfg["seed"])
     search_cfg = cfg.get("search", {}) or {}
     # When a search block is present we promote --search to an inferred mode.
     if search_cfg:
