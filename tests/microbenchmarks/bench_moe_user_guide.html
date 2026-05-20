@@ -1,0 +1,1264 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bench_moe.py 用户使用指导</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b1020;
+      --panel: #111831;
+      --text: #e9edf7;
+      --muted: #aab4cc;
+      --accent: #76b900;
+      --accent-soft: rgba(118, 185, 0, 0.14);
+      --border: #29334f;
+      --code: #070b16;
+      --warn: #ffd166;
+      --bad: #ff6b6b;
+      --good: #80ed99;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }
+    h1, h2, h3 {
+      line-height: 1.25;
+    }
+    h1 {
+      font-size: 36px;
+      margin: 0 0 12px;
+    }
+    h2 {
+      margin-top: 42px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    h3 {
+      margin-top: 28px;
+    }
+    a {
+      color: var(--accent);
+    }
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    pre {
+      overflow-x: auto;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    code {
+      background: rgba(255, 255, 255, 0.07);
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 24px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    th {
+      background: var(--panel);
+      text-align: left;
+    }
+    .hero, .card, .note, .warning {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px 20px;
+      background: var(--panel);
+    }
+    .hero {
+      background:
+        radial-gradient(circle at 20% 0%, rgba(118, 185, 0, 0.28), transparent 32%),
+        var(--panel);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .note {
+      border-color: rgba(118, 185, 0, 0.45);
+      background: var(--accent-soft);
+    }
+    .warning {
+      border-color: rgba(255, 209, 102, 0.55);
+      background: rgba(255, 209, 102, 0.1);
+    }
+    .status-ok {
+      color: var(--good);
+      font-weight: 700;
+    }
+    .status-warn {
+      color: var(--warn);
+      font-weight: 700;
+    }
+    .status-bad {
+      color: var(--bad);
+      font-weight: 700;
+    }
+    .toc {
+      columns: 2;
+    }
+    @media (max-width: 720px) {
+      .toc {
+        columns: 1;
+      }
+      h1 {
+        font-size: 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <span class="tag">TensorRT-LLM MoE Microbenchmark</span>
+    <h1>bench_moe.py 用户使用指导</h1>
+    <p>
+      <code>tests/microbenchmarks/bench_moe.py</code> 是一个面向 MoE layer 的微基准工具，
+      它直接计时 <code>ConfigurableMoE.forward</code>，用于比较 MoE backend、通信方式、EPLB、
+      并行模式、CUDA Graph、combine 精度，以及 <strong>高级 routing 控制</strong>（可控的
+      source→target dispatch traffic 与 expert histogram）。
+    </p>
+    <p class="muted">
+      本指南基于当前脚本实现重新生成，包含运行方法、参数语义、JSON 输出、典型应用案例和
+      已知限制；routing-control 相关参数全部映射到 <code>BENCH_MOE_ROUTING_CONTROL_DESIGN.md</code>。
+    </p>
+  </section>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#what">这个工具测什么</a></li>
+    <li><a href="#quick-start">快速开始</a></li>
+    <li><a href="#launch">启动方式</a></li>
+    <li><a href="#model">模型与 shape</a></li>
+    <li><a href="#workload">Workload：token 数和路由分布</a></li>
+    <li><a href="#routing-control">高级 routing control</a></li>
+    <li><a href="#runtime">Runtime 配置</a></li>
+    <li><a href="#search">搜索模式</a></li>
+    <li><a href="#timing">Timing 与 analysis</a></li>
+    <li><a href="#output">输出 JSON 解读</a></li>
+    <li><a href="#examples">典型应用案例</a></li>
+    <li><a href="#pitfalls">常见问题和限制</a></li>
+    <li><a href="#evidence">实现依据</a></li>
+  </ol>
+
+  <h2 id="what">1. 这个工具测什么</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>测量对象</h3>
+      <p>
+        计时对象是 <code>ConfigurableMoE.forward</code>，包含 routing、dispatch、MoE backend 计算、
+        activation、combine 等 MoE 模块内部阶段。它不是 full decoder layer benchmark。
+      </p>
+    </div>
+    <div class="card">
+      <h3>输入方式</h3>
+      <p>
+        使用 synthetic hidden states 和 router logits，不依赖 HuggingFace checkpoint。
+        Token 数由 <code>num_tokens</code> + 可选的 <code>per_rank_num_tokens</code> 决定；
+        路由形状可以由模型原生 logits 决定，也可以通过 routing-control 显式约束。
+      </p>
+    </div>
+    <div class="card">
+      <h3>主要用途</h3>
+      <p>
+        生成 dashboard 可消费的 structured JSON，并回答：给定 model shape、token 数、
+        以及可控的 routing 流量分布时，哪个 backend / comm / EPLB / parallel mode 最快。
+      </p>
+    </div>
+  </div>
+
+  <div class="note">
+    <strong>推荐理解方式：</strong>
+    先选择 <code>model</code>，再 sweep <code>num_tokens</code>，然后用
+    <a href="#routing-control">routing control</a> 决定要研究什么 routing 形状，最后搜索
+    runtime configuration。
+  </div>
+
+  <h2 id="quick-start">2. 快速开始</h2>
+  <h3>单卡固定 backend，关闭 CUDA Graph</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 1 \
+  --model qwen1.5_moe \
+  --backend CUTLASS \
+  --num_tokens 16 64 \
+  --no_cuda_graph</code></pre>
+
+  <h3>4 卡 DEP，搜索所有 backend</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --parallel_mode DEP \
+  --model deepseek_v3 \
+  --search backend \
+  --backend ALL \
+  --num_tokens 64 256 \
+  --output_file out/moe_backend_search.json</code></pre>
+
+  <h3>4 卡 DEP，receiver-hotspot 通信形状</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --parallel_mode DEP \
+  --model deepseek_v3 \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_scenario receiver_hotspot_75 \
+  --output_file out/recv_hotspot.json</code></pre>
+
+  <h3>从 JSON config 运行 dashboard sweep</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --config_file configs/moe_dashboard_deepseek_v3.json</code></pre>
+
+  <h2 id="launch">3. 启动方式</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>场景</th>
+        <th>命令形式</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>单 rank</td>
+        <td><code>--world_size 1</code> 或不传 <code>--world_size</code></td>
+        <td>脚本在当前进程内直接运行。</td>
+      </tr>
+      <tr>
+        <td>脚本自拉多 rank</td>
+        <td><code>--world_size N</code></td>
+        <td>使用 <code>mpi4py.futures.MPIPoolExecutor</code> 生成 MPI worker。</td>
+      </tr>
+      <tr>
+        <td>外部 MPI</td>
+        <td><code>mpirun -n N python tests/microbenchmarks/bench_moe.py ...</code></td>
+        <td>脚本检测到外部 MPI world size 后，直接在这些 rank 上运行。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <pre><code>mpirun -n 4 python tests/microbenchmarks/bench_moe.py \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --search backend \
+  --backend ALL \
+  --num_tokens 128 512</code></pre>
+
+  <div class="note">
+    <strong>Import 行为：</strong>
+    脚本会把 <code>tests/unittest</code> 加入 <code>sys.path</code>，以便直接复用 MoE unittest helper。
+    对 <code>tensorrt_llm</code> 主包，只有当当前源码树里存在已编译的
+    <code>tensorrt_llm/bindings</code> 时才优先使用源码树；否则会使用环境里已经安装好的
+    TensorRT-LLM wheel。这适合 OCI / 预构建容器里"源码 checkout + 已安装 wheel"的运行方式。
+  </div>
+
+  <h2 id="model">4. 模型与 shape</h2>
+  <p>
+    可以通过 <code>--model</code> 选择内置模型，也可以不传 <code>--model</code>，改用显式 shape 参数。
+    内置模型会提供默认 <code>num_experts</code>、<code>top_k</code>、<code>hidden_size</code>、
+    <code>intermediate_size</code>、默认 quant 和默认 routing method。
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>内置模型</th>
+        <th>num_experts</th>
+        <th>top_k</th>
+        <th>hidden_size</th>
+        <th>intermediate_size</th>
+        <th>默认 quant</th>
+        <th>默认 routing</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>qwen1.5_moe</code></td><td>60</td><td>4</td><td>2048</td><td>1408</td><td><code>FP8</code></td><td><code>RENORMALIZE</code></td></tr>
+      <tr><td><code>deepseek_v2_lite</code></td><td>64</td><td>6</td><td>2048</td><td>1408</td><td><code>FP8_BLOCK_SCALES</code></td><td><code>DEEPSEEK_V3</code></td></tr>
+      <tr><td><code>deepseek_v3</code></td><td>256</td><td>8</td><td>7168</td><td>2048</td><td><code>FP8_BLOCK_SCALES</code></td><td><code>DEEPSEEK_V3</code></td></tr>
+      <tr><td><code>kimi_k2</code></td><td>384</td><td>8</td><td>7168</td><td>2048</td><td><code>FP8_BLOCK_SCALES</code></td><td><code>DEEPSEEK_V3</code></td></tr>
+      <tr><td><code>deepseek_v4_pro</code></td><td>384</td><td>6</td><td>7168</td><td>3072</td><td>需显式传 <code>--quant</code></td><td><code>RENORMALIZE</code></td></tr>
+      <tr><td><code>deepseek_v4_flash</code></td><td>256</td><td>6</td><td>4096</td><td>2048</td><td>需显式传 <code>--quant</code></td><td><code>RENORMALIZE</code></td></tr>
+      <tr><td><code>mixtral_8x7b</code></td><td>8</td><td>2</td><td>4096</td><td>14336</td><td><code>FP8</code></td><td><code>RENORMALIZE</code></td></tr>
+      <tr><td><code>gpt_oss_120b</code></td><td>128</td><td>4</td><td>2880</td><td>2880</td><td><code>W4A8_MXFP4_MXFP8</code></td><td><code>RENORMALIZE</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>自定义 shape</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 1 \
+  --num_experts 384 \
+  --top_k 6 \
+  --hidden_size 7168 \
+  --intermediate_size 3072 \
+  --quant FP8_BLOCK_SCALES \
+  --routing_method RENORMALIZE \
+  --backend TRTLLM \
+  --num_tokens 64 128</code></pre>
+
+  <div class="warning">
+    <strong>注意：</strong>
+    不传 <code>--model</code> 时，<code>--routing_method AUTO</code> 会报错。
+    因为 custom shape 没有可继承的模型默认 routing。
+  </div>
+
+  <h2 id="workload">5. Workload：token 数和路由分布</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>默认值</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>--num_tokens</code></td>
+        <td>必填</td>
+        <td>要 sweep 的全局 token 数列表。每个值都会按 rank split 规则切分到各 rank。</td>
+      </tr>
+      <tr>
+        <td><code>--rank_imbalance_ratio</code></td>
+        <td><code>0.0</code></td>
+        <td>
+          <em>Legacy</em> rank 间 token 不均衡比例，范围 <code>[0, 1]</code>。
+          <code>0</code> 均匀切分，<code>1</code> 全部放到 rank0。
+          只控制 source-rank 本地 token 数 / <code>max_num_tokens_per_rank</code>；
+          不控制 dispatch traffic matrix。新用法推荐 <code>--per_rank_num_tokens</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--per_rank_num_tokens</code></td>
+        <td><code>None</code></td>
+        <td>
+          显式 per-rank token 列表（逗号分隔，长度必须等于 <code>world_size</code>，
+          总和必须等于 <code>--num_tokens</code>）。优先级高于 <code>rank_imbalance_ratio</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--expert_distribution</code></td>
+        <td><code>balanced_patch</code></td>
+        <td>
+          <em>Legacy</em> synthetic routing 方式。可选 <code>balanced_patch</code> 或 <code>hotspot</code>。
+          <code>hotspot</code> 会被自动映射到 <code>--expert_pattern hotspot,hotness=…</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--expert_hotspot_ratio</code></td>
+        <td><code>0.0</code></td>
+        <td>
+          <em>Legacy</em> 专家热点比例，范围 <code>[0, 1]</code>。
+          若 <code>--expert_pattern</code> 还是默认 <code>balanced</code>，
+          会被自动转成 <code>expert_pattern=hotspot,hotness=&lt;ratio&gt;</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--force_balance_patch</code></td>
+        <td>false</td>
+        <td>
+          <em>Legacy</em> 在 <code>expert_hotspot_ratio=0</code> 时也强制走 balanced patch。
+          等价于 <code>--routing_mode forced --comm_pattern balanced_alltoall --expert_pattern balanced</code>，
+          并按设计文档自动迁移。
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>rank imbalance 示例</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --rank_imbalance_ratio 0.75</code></pre>
+
+  <h3>per_rank_num_tokens 示例</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 896 \
+  --per_rank_num_tokens 128,128,512,128</code></pre>
+  <p>用途：研究 source-rank 倾斜对 <code>max(all_rank_num_tokens)</code>、workspace、padding、
+  chunking 的影响。</p>
+
+  <h3>expert hotspot 示例</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --expert_distribution hotspot \
+  --expert_hotspot_ratio 0.5</code></pre>
+
+  <h2 id="routing-control">6. 高级 routing control</h2>
+  <p>
+    Routing control 让 benchmark 能 <strong>显式控制 dispatch / all-to-all 通信流量形状和 expert 热点</strong>，
+    用于复现可控的 routing workload。它和模型原生 routing 兼容：你可以让模型继续走原生 fused routing
+    （<code>native</code> 模式），也可以直接 supply <code>top-k ids/scales</code>（<code>forced</code> 模式）。
+    完整设计见 <code>BENCH_MOE_ROUTING_CONTROL_DESIGN.md</code>。
+  </p>
+
+  <h3>核心参数</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>默认值</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>--routing_mode</code></td>
+        <td><code>native</code></td>
+        <td>
+          <code>native</code>：保留模型原生 logits / fused routing，benchmark 反推 logits 把
+          top-k 推向计划的形状。<br>
+          <code>forced</code>：直接 materialize <code>topk_ids</code> + 均匀 <code>1/top_k</code> scales，
+          绕过 fused scoring，但保留后续 metadata / permutation / grouped GEMM。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--projection_policy</code></td>
+        <td><code>project</code></td>
+        <td>
+          仅作用于 <code>native</code> 模式：<br>
+          <code>project</code>：当原生 logits 无法精确表达时，使用最接近的合法 projection 继续运行，
+          并在结果里记录 <code>routing_realization.status="projected"</code> 与偏差。<br>
+          <code>reject</code>：直接跳过该 case 并写入 <code>skip_reason</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--comm_pattern</code></td>
+        <td><code>balanced_alltoall</code></td>
+        <td>source → target slot dispatch 形状。见下表。</td>
+      </tr>
+      <tr>
+        <td><code>--expert_pattern</code></td>
+        <td><code>balanced</code></td>
+        <td>每个 target rank 内部的 local expert 直方图形状。见下表。</td>
+      </tr>
+      <tr>
+        <td><code>--routing_scenario</code></td>
+        <td><code>None</code></td>
+        <td>
+          预设组合，等价于 <code>routing_mode / projection_policy / comm_pattern / expert_pattern</code>
+          的特定取值（见下表）。显式参数总是优先于 scenario。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--routing_dump_matrix</code></td>
+        <td>false</td>
+        <td>
+          在每行结果中输出完整 <code>observed_slot_dispatch_matrix</code> /
+          <code>observed_token_dispatch_matrix</code> / <code>observed_expert_histogram</code>。
+          默认只输出 summary，避免大 sweep JSON 膨胀。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--routing_seed</code></td>
+        <td><code>0</code></td>
+        <td>routing-plan materialize 时的确定性 seed。同 seed 输出一致。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Comm patterns</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>名称</th>
+        <th>语义</th>
+        <th>典型例</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>balanced_alltoall</code></td>
+        <td>每个 source rank 把 selected slots 尽量均匀发送到所有 target ranks。公平基线。</td>
+        <td><code>--comm_pattern balanced_alltoall</code></td>
+      </tr>
+      <tr>
+        <td><code>receiver_hotspot</code></td>
+        <td>
+          每个 source row 把 <code>hotness</code> 比例的 slots 转向 <code>rank=&lt;k&gt;</code>。
+          研究接收端带宽 / 排队瓶颈。
+        </td>
+        <td><code>--comm_pattern receiver_hotspot,hotness=0.75,rank=0</code></td>
+      </tr>
+      <tr>
+        <td><code>pair_hotspot</code></td>
+        <td>
+          只让 <code>src=&lt;s&gt;</code> 行把 <code>hotness</code> 比例的 slots 转向
+          <code>dst=&lt;d&gt;</code>。研究单条 peer-link 热点。
+        </td>
+        <td><code>--comm_pattern pair_hotspot,hotness=0.5,src=0,dst=1</code></td>
+      </tr>
+      <tr>
+        <td><code>local_only</code></td>
+        <td>
+          所有 slot 都留在本 rank。研究最低通信量 baseline；
+          原生路由通常不能精确表达，需要 <code>--projection_policy project</code>
+          或显式 <code>--routing_mode forced</code>。
+        </td>
+        <td><code>--comm_pattern local_only</code></td>
+      </tr>
+      <tr>
+        <td><code>ring</code></td>
+        <td>source <code>i</code> 全部发往 <code>(i+1) % ep_size</code>。结构化 peer traffic。</td>
+        <td><code>--comm_pattern ring</code></td>
+      </tr>
+      <tr>
+        <td><code>file:&lt;path&gt;</code></td>
+        <td>
+          从 JSON 加载 slot dispatch matrix（<code>schema=v1</code>，
+          字段 <code>slot_dispatch_matrix</code> 是 <code>ep_size × ep_size</code> 整数矩阵）。
+          每行 row sum 必须等于 <code>per_rank_num_tokens[src] × top_k</code>。
+        </td>
+        <td><code>--comm_pattern file:matrix.json</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <pre><code>// matrix.json
+{
+  "schema": "v1",
+  "ep_size": 4,
+  "slot_dispatch_matrix": [
+    [64, 64, 64, 64],
+    [64, 64, 64, 64],
+    [64, 64, 64, 64],
+    [64, 64, 64, 64]
+  ]
+}</code></pre>
+
+  <h3>Expert patterns</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>名称</th>
+        <th>语义</th>
+        <th>典型例</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>balanced</code></td>
+        <td>每个 target rank 内 slots 在 local experts 间近似均匀。</td>
+        <td><code>--expert_pattern balanced</code></td>
+      </tr>
+      <tr>
+        <td><code>hotspot,hotness=…</code></td>
+        <td>每个 target rank 把 <code>hotness</code> 比例的 slots 集中到 1 个 local expert。</td>
+        <td><code>--expert_pattern hotspot,hotness=0.5</code></td>
+      </tr>
+      <tr>
+        <td><code>hotspot,active_experts=…</code></td>
+        <td>每个 target rank 内只有 <code>active_experts</code> 个 expert 承担全部 slots。</td>
+        <td><code>--expert_pattern hotspot,active_experts=2</code></td>
+      </tr>
+      <tr>
+        <td><code>file:&lt;path&gt;</code></td>
+        <td>
+          从 JSON 加载 expert histogram（<code>schema=v1</code>，
+          字段 <code>expert_histogram</code> 是 <code>ep_size × experts_per_rank</code> 整数矩阵）。
+          全局总和必须等于 <code>sum(per_rank_num_tokens) × top_k</code>。
+        </td>
+        <td><code>--expert_pattern file:hist.json</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Routing scenarios（preset 组合）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>scenario</th>
+        <th>等价展开</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>balanced_baseline</code></td>
+        <td><code>native + project + balanced_alltoall + balanced</code></td>
+      </tr>
+      <tr>
+        <td><code>receiver_hotspot_75</code></td>
+        <td><code>native + project + receiver_hotspot,hotness=0.75,rank=0 + balanced</code></td>
+      </tr>
+      <tr>
+        <td><code>pair_hotspot_50</code></td>
+        <td><code>native + project + pair_hotspot,hotness=0.5,src=0,dst=1 + balanced</code></td>
+      </tr>
+      <tr>
+        <td><code>local_only_baseline</code></td>
+        <td><code>native + reject + local_only + balanced</code>（不可精确表达就跳过）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>各 routing method 的反推能力</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Routing method</th>
+        <th>capability</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Default</code></td><td><code>exact_ids</code></td><td>目标 expert ids 精确；scales 来自 softmax，不可任意指定。</td></tr>
+      <tr><td><code>Renormalize / RenormalizeNaive</code></td><td><code>exact</code></td><td>ids + scales 都可精确控制。</td></tr>
+      <tr><td><code>SigmoidRenorm</code></td><td><code>exact_ids</code></td><td>ids 精确；scales 受 sigmoid 限制。</td></tr>
+      <tr><td><code>Llama4</code></td><td><code>top1_exact</code></td><td>只能表达 top1；<code>top_k &gt; 1</code> 时退化为 projected。</td></tr>
+      <tr><td><code>MiniMax2</code></td><td><code>exact_with_zero_bias</code></td><td>当 score-correction bias 为 0 时 ids 精确。</td></tr>
+      <tr><td><code>DeepSeekV3</code></td><td><code>projected_or_exact</code></td><td>受 <code>n_group</code>/<code>topk_group</code> 约束，可能 projected。</td></tr>
+      <tr><td><code>SparseMixer</code></td><td><code>unsupported</code></td><td>v1 不支持精确反推，统一标 projected。</td></tr>
+    </tbody>
+  </table>
+
+  <h3><code>enable_perfect_router</code> 选择规则</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>routing_mode</th>
+        <th>comm_pattern</th>
+        <th>expert_pattern</th>
+        <th>perfect_router</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>native</td><td>balanced_alltoall</td><td>balanced</td><td><span class="status-ok">on</span></td></tr>
+      <tr><td>native</td><td>其它任何</td><td>任意</td><td><span class="status-warn">off</span>（避免和 projection 冲突）</td></tr>
+      <tr><td>forced</td><td>任意</td><td>任意</td><td><span class="status-bad">off</span></td></tr>
+    </tbody>
+  </table>
+
+  <div class="warning">
+    <strong>EPLB 互斥：</strong>
+    v1 中 routing control 与 <code>eplb_mode != off</code> 互斥，会被直接 reject，
+    <code>skip_reason</code> 写明原因。EPLB 的 slot remapping 需要在后续版本里独立支持。
+  </div>
+
+  <h2 id="runtime">7. Runtime 配置</h2>
+  <h3>Backend</h3>
+  <p>
+    <code>--backend</code> 默认是 <code>TRTLLM</code>。也可以传具体 backend，或在搜索模式下使用
+    <code>ALL</code>。脚本会先调用 backend <code>can_implement()</code> 做 capability gate，
+    不支持的候选会以 <code>status="skipped"</code> 写入结果。
+  </p>
+
+  <h3>并行模式</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>模式</th>
+        <th>moe_ep_size</th>
+        <th>moe_tp_size</th>
+        <th>enable_attention_dp</th>
+        <th>典型含义</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>DEP</code></td><td><code>world_size</code></td><td>1</td><td>true</td><td>Data Parallel attention + Expert Parallel MoE。</td></tr>
+      <tr><td><code>TEP</code></td><td><code>world_size</code></td><td>1</td><td>false</td><td>Tensor Parallel attention + Expert Parallel MoE。</td></tr>
+      <tr><td><code>DTP</code></td><td>1</td><td><code>world_size</code></td><td>true</td><td>Data Parallel attention + MoE TP。</td></tr>
+      <tr><td><code>TTP</code></td><td>1</td><td><code>world_size</code></td><td>false</td><td>Tensor Parallel attention + MoE TP。</td></tr>
+      <tr><td><code>CUSTOM</code></td><td>用户指定</td><td>用户指定</td><td>用户指定</td><td>高级自定义布局。</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode CUSTOM \
+  --moe_ep_size 2 \
+  --moe_tp_size 2 \
+  --enable_attention_dp \
+  --backend TRTLLM \
+  --num_tokens 256</code></pre>
+
+  <h3>通信方式</h3>
+  <p>
+    <code>--comm_method</code> 支持 <code>AUTO</code>、<code>NVLINK_ONE_SIDED</code>、
+    <code>NVLINK_TWO_SIDED</code>、<code>DEEPEP</code>、<code>DEEPEPLOWLATENCY</code>、
+    <code>ALLGATHER</code>。当前实现仍通过 <code>TRTLLM_FORCE_COMM_METHOD</code> 在单个 case
+    内注入强制通信方式，并在 case 结束后恢复环境变量。
+  </p>
+
+  <div class="warning">
+    <strong>限制：</strong>
+    <code>--per_case_subprocess</code> 当前只是 no-op stub，会打印 warning 后回退到 in-process。
+    大规模 dashboard sweep 仍需注意同一进程内多 case 的状态共享。
+  </div>
+
+  <h3>EPLB</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>--eplb_mode off</code></td><td>不启用 load balancer。</td></tr>
+      <tr><td><code>--eplb_mode static</code></td><td>启用 slots 和 routing bookkeeping，但 timed iterations 中不迁移权重。</td></tr>
+      <tr><td><code>--eplb_mode dynamic</code></td><td>允许运行时统计和权重迁移；必须配合 <code>--no_cuda_graph</code>。</td></tr>
+      <tr><td><code>--num_slots</code></td><td>覆盖 slot 数。未指定时脚本会从模型和 EP size 推导。</td></tr>
+      <tr><td><code>--layer_updates_per_iter</code></td><td>覆盖动态 EPLB 每轮更新层数。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="search">8. 搜索模式</h2>
+  <table>
+    <thead>
+      <tr>
+        <th><code>--search</code></th>
+        <th>搜索维度</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>none</code></td><td>只运行当前配置。</td></tr>
+      <tr><td><code>backend</code></td><td>搜索 backend。配合 <code>--backend ALL</code> 最常用。</td></tr>
+      <tr><td><code>comm</code></td><td>固定 backend，搜索通信方式。</td></tr>
+      <tr><td><code>parallel</code></td><td>搜索 <code>DEP</code> / <code>TEP</code> / <code>DTP</code> / <code>TTP</code>。</td></tr>
+      <tr><td><code>eplb</code></td><td>搜索 <code>off</code> / <code>static</code> / <code>dynamic</code>。</td></tr>
+      <tr><td><code>full</code></td><td>搜索 backend、parallel、comm、EPLB、CUDA Graph 开关。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    搜索候选会先展开笛卡尔积，再通过 backend capability、mapping、EPLB/CUDA Graph 兼容性、
+    forced comm 合法性剪枝。被剪枝的候选不会丢失，会作为 <code>status="skipped"</code> 结果行输出。
+  </p>
+
+  <h3>限制搜索规模</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --search full \
+  --backend ALL \
+  --num_tokens 64 128 256 \
+  --max_configs 20 \
+  --time_budget_minutes 30 \
+  --output_file out/moe_full_limited.json</code></pre>
+
+  <h2 id="timing">9. Timing 与 analysis</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>默认值</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>--no_cuda_graph</code></td><td>默认不开启该 flag</td><td>默认使用 CUDA Graph timing；传该 flag 改成 eager timing。</td></tr>
+      <tr><td><code>--warmup</code></td><td>1</td><td>timed loop 前的 warmup 次数。</td></tr>
+      <tr><td><code>--iters</code></td><td>5</td><td>计时迭代次数。</td></tr>
+      <tr><td><code>--fast_autotune</code></td><td>false</td><td>缩短 autotune repeat/warmup，适合快速调试。</td></tr>
+      <tr><td><code>--analysis</code></td><td><code>kernels</code></td><td>可传 <code>summary</code>、<code>phases</code>、<code>kernels</code>、<code>phases,kernels</code>。</td></tr>
+      <tr><td><code>--dtype</code></td><td><code>bfloat16</code></td><td>activation dtype，可选 <code>bfloat16</code> 或 <code>float16</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>当前 phase 状态：</strong>
+    <code>--analysis phases</code> 的 CLI 已存在，但 scheduler-side phase marker 尚未实现。
+    当前输出中 <code>phase_timing_available=false</code>，<code>phase_times_us</code> 为空结构。
+  </div>
+
+  <p>
+    Autotune 是 untimed pre-pass：脚本会在正式 timing 前运行一次 <code>autotune(...)</code>，
+    用来填充 kernel cache。正式 latency 不包含这个 autotune pass。
+  </p>
+
+  <h2 id="output">10. 输出 JSON 解读</h2>
+  <p>
+    rank0 会在 stdout 打印 header 和每个 result row。如果传了 <code>--output_file</code>，
+    最终完整 payload 会写入文件。
+  </p>
+
+  <pre><code>{
+  "schema_version": 3,
+  "benchmark": "bench_moe",
+  "environment": { "...": "..." },
+  "model": { "...": "..." },
+  "search": { "...": "..." },
+  "base_config": { "...": "..." },
+  "results": [],
+  "rankings": []
+}</code></pre>
+
+  <h3>单个 result row 的关键字段</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>字段</th>
+        <th>含义</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>workload</code></td><td>本 case 的 token 设置、per-rank token 列表，以及 <code>routing_control</code> 请求 spec。</td></tr>
+      <tr><td><code>requested_config</code></td><td>用户请求或搜索生成的配置。</td></tr>
+      <tr><td><code>actual_config</code></td><td>实际运行到的 backend、comm、scheduler、EP/TP、chunk 数。</td></tr>
+      <tr><td><code>status</code></td><td><code>success</code>、<code>skipped</code> 或 <code>failed</code>。</td></tr>
+      <tr><td><code>latency_us.score</code></td><td>默认 score 为每次迭代取最慢 rank，再对迭代求平均。</td></tr>
+      <tr><td><code>kernel_breakdown</code></td><td>kernel 分类统计，包含 <code>moe_forward_kernels</code> 和 <code>other_kernels</code>。</td></tr>
+      <tr><td><code>routing_control</code></td><td>请求与实际 routing 形状的对比（见下）。开启 routing-control 时存在。</td></tr>
+      <tr><td><code>rankings</code></td><td>按 <code>(num_tokens, parallel_mode)</code> 分组，对所有结果按 score 排序。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>routing_control 块</h3>
+  <pre><code>"routing_control": {
+  "requested": {
+    "routing_mode": "native",
+    "projection_policy": "project",
+    "comm_pattern": "receiver_hotspot,hotness=0.75,rank=0",
+    "expert_pattern": "balanced",
+    "per_rank_num_tokens": [256, 256, 256, 256],
+    "seed": 0
+  },
+  "actual": {
+    "routing_path": "logits_projected",
+    "routing_realization": {
+      "status": "projected",
+      "reason": "DeepSeekV3 grouped routing: row needs experts in 5 groups but topk_group=4",
+      "max_abs_slot_error": 3,
+      "max_relative_slot_error": 0.004
+    },
+    "enable_perfect_router": false,
+    "effective_src_axis": "dp_rank",
+    "max_num_tokens_per_rank": 256,
+    "num_chunks_observed": 1,
+    "use_dp_padding": false,
+    "observed_dispatch_matrix_summary": {
+      "row_sums": [2048, 2048, 2048, 2048],
+      "col_sums": [6144, 682, 683, 683],
+      "off_diagonal_ratio": 0.75,
+      "max_abs_slot_error": 3,
+      "matrix_dump_path": null
+    },
+    "observed_expert_histogram_summary": {
+      "min": 0,
+      "max": 512,
+      "active_experts": 8
+    },
+    "selected_scales": {
+      "distribution": "uniform",
+      "dtype": "torch.bfloat16",
+      "seed": 0
+    },
+    "warnings": ["routing_realization=projected: ..."]
+  }
+}</code></pre>
+
+  <p>
+    <code>routing_path</code> 取值：
+    <code>logits_native</code> / <code>logits_projected</code> / <code>supplied_topk_apply</code> /
+    <code>supplied_topk_run_moe</code>。<br>
+    <code>routing_realization.status</code> 取值：
+    <code>exact</code> / <code>projected</code> / <code>rejected</code> / <code>forced_exact</code>。<br>
+    传 <code>--routing_dump_matrix</code> 时还会在 <code>actual</code> 中输出完整的
+    <code>observed_slot_dispatch_matrix</code> / <code>observed_token_dispatch_matrix</code> /
+    <code>observed_expert_histogram</code> / <code>requested_slot_dispatch_matrix</code>。
+  </p>
+
+  <h3>如何看 winner</h3>
+  <pre><code>{
+  "num_tokens": 256,
+  "parallel_mode": "DEP",
+  "best": {
+    "backend": "TRTLLM",
+    "requested_backend": "TRTLLM",
+    "comm_method": "NVLinkOneSided",
+    "eplb_mode": "off",
+    "cuda_graph": true,
+    "score_us": 850.2,
+    "status": "success"
+  },
+  "ranking": [...]
+}</code></pre>
+
+  <p>
+    <code>best</code> 是同一个 <code>num_tokens</code> 和 <code>parallel_mode</code> 组内最小
+    <code>score_us</code> 的成功 case。被 skip/failed 的候选仍会出现在 ranking 中，便于 dashboard
+    展示为什么某些配置不可用。
+  </p>
+
+  <h2 id="examples">11. 典型应用案例</h2>
+
+  <h3>案例 A：最小单卡 sanity（环境冒烟）</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 1 \
+  --model mixtral_8x7b \
+  --backend CUTLASS \
+  --num_tokens 8 \
+  --no_cuda_graph \
+  --analysis summary</code></pre>
+  <p><strong>用途：</strong>确认环境、import、CUDA、backend 构建能跑通。</p>
+
+  <h3>案例 B：DeepSeek-V3 backend search（"哪个 backend 最快"）</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --search backend \
+  --backend ALL \
+  --num_tokens 64 128 256 512 \
+  --output_file out/deepseek_v3_backend_search.json</code></pre>
+  <p><strong>用途：</strong>为每个 token count 找最快 backend。</p>
+
+  <h3>案例 C：固定 backend，搜索通信方式（"哪个 comm 最快"）</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --backend TRTLLM \
+  --parallel_mode DEP \
+  --search comm \
+  --num_tokens 256 \
+  --output_file out/deepseek_v3_comm_search.json</code></pre>
+  <p><strong>用途：</strong>比较 AUTO、NVLink、DeepEP、AllGather 等通信路径。</p>
+
+  <h3>案例 D：动态 EPLB</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --backend TRTLLM \
+  --parallel_mode DEP \
+  --eplb_mode dynamic \
+  --num_tokens 512 \
+  --no_cuda_graph</code></pre>
+  <p><strong>用途：</strong>测试动态 EPLB。必须关闭 CUDA Graph，否则候选会被判为 invalid。
+    routing-control 会和 EPLB 互斥，不要同时开。</p>
+
+  <h3>案例 E：source-rank token 倾斜（max_num_tokens_per_rank 研究）</h3>
+  <pre><code># 显式表达：4 卡，rank2 拿 512 tokens，其余 128
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 896 \
+  --per_rank_num_tokens 128,128,512,128 \
+  --routing_dump_matrix \
+  --output_file out/per_rank_skew.json</code></pre>
+  <p><strong>用途：</strong>研究 source-rank 倾斜对 <code>max(all_rank_num_tokens)</code>、
+    workspace、padding、num_chunks 的影响。<code>--routing_dump_matrix</code> 让结果里包含完整矩阵
+    以便后续分析。</p>
+
+  <h3>案例 F：Receiver-hotspot（接收端带宽 / 排队）</h3>
+  <pre><code># 75% 流量打向 rank 0
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_scenario receiver_hotspot_75 \
+  --output_file out/receiver_hotspot.json</code></pre>
+  <p><strong>用途：</strong>验证两端 NVLink / RDMA 上 receiver hotspot 的影响；
+    DeepSeek-V3 的 grouped routing 可能让 <code>routing_realization.status="projected"</code>，
+    benchmark 会继续运行并把偏差写入结果。</p>
+
+  <h3>案例 G：Pair-hotspot（peer link / NVLink-pair 热点）</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 512 \
+  --comm_pattern pair_hotspot,hotness=0.5,src=0,dst=1 \
+  --routing_dump_matrix</code></pre>
+  <p><strong>用途：</strong>研究单条 peer-link 上的 hotspot，比如某条 GPU-GPU NVLink 被打满时的退化。</p>
+
+  <h3>案例 H：Local-only baseline（最低通信量上限）</h3>
+  <pre><code># reject 模式：当原生 logits 无法精确表达 local-only 时直接跳过
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_scenario local_only_baseline \
+  --output_file out/local_only_native.json
+
+# forced 模式：直接 supply top-k，绕过 fused scoring
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_mode forced \
+  --comm_pattern local_only \
+  --routing_dump_matrix \
+  --output_file out/local_only_forced.json</code></pre>
+  <p><strong>用途：</strong>评估 "如果完全没有跨 rank 通信" 的下界。如果你只想看 compute 的占比，
+    用 <code>forced</code> 模式得到精确 local-only；如果你想看 native fused routing 在 local-only
+    形状下的真实行为，用 <code>native + reject</code>，并对 reject 行做单独分析。</p>
+
+  <h3>案例 I：Ring 通信（结构化 peer traffic）</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 8 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 1024 \
+  --routing_mode forced \
+  --comm_pattern ring \
+  --output_file out/ring_8gpu.json</code></pre>
+  <p><strong>用途：</strong>把 source <code>i</code> 全部发到 <code>(i+1) mod 8</code>，
+    研究 ring-shaped traffic 与 all-to-all 的吞吐差异。</p>
+
+  <h3>案例 J：Expert hotspot（per-rank 内 expert 热点）</h3>
+  <pre><code># 4 卡 DEP，每个 target rank 内 50% 流量集中到 1 个 expert
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --comm_pattern balanced_alltoall \
+  --expert_pattern hotspot,hotness=0.5 \
+  --routing_dump_matrix
+
+# 仅让 2 个 expert 是活跃的
+python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --expert_pattern hotspot,active_experts=2</code></pre>
+  <p><strong>用途：</strong>研究 grouped-GEMM tile 分布、padding waste 和 tail behavior。</p>
+
+  <h3>案例 K：Forced supplied-topk on TRTLLM TEP</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode TEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_mode forced \
+  --comm_pattern balanced_alltoall \
+  --expert_pattern balanced \
+  --output_file out/tep_forced.json</code></pre>
+  <p>
+    <strong>用途：</strong>精确控制 TRTLLM TEP 上的 dispatch / compute workload。<br>
+    <strong>注意：</strong>该模式会 patch <code>TRTLLMGenFusedMoE.run_moe</code>，
+    跳过 fused scoring / top-k；结果不能直接和 "native fused TEP" 横向比较。
+    输出里 <code>routing_realization.status="forced_exact"</code>。
+  </p>
+
+  <h3>案例 L：File-based dispatch matrix（精确 reproduce）</h3>
+  <pre><code># matrix.json
+{
+  "schema": "v1",
+  "ep_size": 4,
+  "slot_dispatch_matrix": [
+    [800, 64, 64, 96],
+    [128, 768, 64, 64],
+    [64, 64, 832, 64],
+    [128, 64, 96, 736]
+  ]
+}</code></pre>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens $(($((800+64+64+96))+...)) \
+  --routing_mode forced \
+  --comm_pattern file:matrix.json \
+  --expert_pattern balanced \
+  --routing_dump_matrix \
+  --output_file out/reproduce.json</code></pre>
+  <p><strong>用途：</strong>研究从生产 trace 抓回来的真实 dispatch 形状，或精确复现某次 perf 问题。
+    要求 row sum 等于 <code>per_rank_num_tokens[src] × top_k</code>。</p>
+
+  <h3>案例 M：DeepSeek-V3 native projection 偏差分析</h3>
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --backend TRTLLM \
+  --num_tokens 256 \
+  --routing_mode native \
+  --projection_policy project \
+  --comm_pattern receiver_hotspot,hotness=0.9,rank=0 \
+  --routing_dump_matrix \
+  --output_file out/dsv3_project.json</code></pre>
+  <p><strong>用途：</strong>测量 DeepSeek-V3 的 <code>n_group</code>/<code>topk_group</code> 约束下，
+    benchmark projection 与 requested matrix 的偏差。<code>routing_control.actual.routing_realization</code>
+    里有 <code>max_abs_slot_error</code> 和 <code>max_relative_slot_error</code>。</p>
+
+  <h3>案例 N：JSON config（dashboard sweep）</h3>
+  <pre><code>{
+  "model": "deepseek_v3",
+  "workload": {
+    "num_tokens": [64, 128, 256, 512],
+    "per_rank_num_tokens": [128, 128, 128, 128],
+    "routing_control": {
+      "scenario": "receiver_hotspot_75",
+      "routing_dump_matrix": false,
+      "seed": 42
+    }
+  },
+  "search": {
+    "backend": "ALL",
+    "parallel_mode": ["DEP", "TEP"],
+    "comm_method": ["AUTO"],
+    "eplb_mode": ["off"]
+  },
+  "analysis": ["kernels"],
+  "max_configs": 32,
+  "output_file": "out/deepseek_v3_dashboard.json"
+}</code></pre>
+
+  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  --config_file configs/deepseek_v3_dashboard.json</code></pre>
+
+  <h2 id="pitfalls">12. 常见问题和限制</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>现象</th>
+        <th>原因 / 处理方式</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Custom shapes ... AUTO has no safe default</code></td>
+        <td>自定义 shape 必须显式指定 <code>--routing_method</code>。</td>
+      </tr>
+      <tr>
+        <td>动态 EPLB 被 skip</td>
+        <td><code>eplb_mode=dynamic</code> 与 CUDA Graph 不兼容，请加 <code>--no_cuda_graph</code>。</td>
+      </tr>
+      <tr>
+        <td>routing-control 与 EPLB 同时开</td>
+        <td>v1 直接 reject，<code>skip_reason</code> 会写明原因；二选一。</td>
+      </tr>
+      <tr>
+        <td>forced comm 被 skip</td>
+        <td>非 DP、MoE TP、或 world_size=1 时部分通信方式没有意义，会被候选剪枝拒绝。</td>
+      </tr>
+      <tr>
+        <td><code>routing_realization.status="projected"</code></td>
+        <td>routing method 不能精确反推请求的形状（最常见：DeepSeek-V3 grouped routing，
+          Llama4 top1-only）。检查 <code>max_abs_slot_error</code> 判断偏差是否可接受。</td>
+      </tr>
+      <tr>
+        <td><code>routing_realization.status="rejected"</code></td>
+        <td>用户传了 <code>--projection_policy reject</code> 而又请求了不可精确表达的 pattern。
+          该 case 会作为 skipped 行输出，仍保留 <code>routing_control</code> summary。</td>
+      </tr>
+      <tr>
+        <td>forced 模式在 TEP 下结果不能和 native 比</td>
+        <td><code>forced</code> 会 patch <code>TRTLLMGenFusedMoE.run_moe</code>，跳过 fused scoring；
+          它度量的是 supplied-topk 的执行路径，不是 native fused routing。</td>
+      </tr>
+      <tr>
+        <td>file: 形式的 dispatch matrix 报 row-sum 错</td>
+        <td>每行 row sum 必须等于 <code>per_rank_num_tokens[src] × top_k</code>；
+          <code>ep_size</code> 必须和 runtime <code>moe_ep_size</code> 一致。</td>
+      </tr>
+      <tr>
+        <td>per_rank_num_tokens 报长度错</td>
+        <td>长度必须等于 <code>world_size</code>，总和等于 <code>--num_tokens</code>。</td>
+      </tr>
+      <tr>
+        <td><code>phase_times_us</code> 为空</td>
+        <td>当前 scheduler-side phase marker 尚未实现；只能看 latency 和 kernel breakdown。</td>
+      </tr>
+      <tr>
+        <td><code>--per_case_subprocess</code> 没有真正隔离</td>
+        <td>当前是 no-op stub，只打印 warning 后继续 in-process。</td>
+      </tr>
+      <tr>
+        <td>某 backend 出现在 skipped 行</td>
+        <td>backend <code>can_implement()</code>、mapping、EPLB 或 comm gate 不满足；看 <code>skip_reason</code>。</td>
+      </tr>
+      <tr>
+        <td>CUDA Graph timing 没有 kernel breakdown</td>
+        <td>CUPTI 需要在 CUDA context 创建前初始化；失败时会标记 <code>cupti_available=false</code> 或跳过 breakdown。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="evidence">13. 实现依据</h2>
+  <p>本指南对应的关键代码位置如下，便于核对行为是否和当前实现一致：</p>
+  <ul>
+    <li><code>tests/microbenchmarks/bench_moe.py:18-37</code>：脚本定位为 <code>ConfigurableMoE.forward</code> benchmark 和 dashboard JSON generator。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:90-111</code>：运行时 import 路径处理，优先复用 unittest helper，并只在源码树有 compiled bindings 时优先使用源码树。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:165</code>：当前输出 schema 版本为 <code>3</code>。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:219-454</code>：<code>ModelSpec</code>、<code>RoutingControlSpec</code>、<code>WorkloadSpec</code>、<code>ConfigSpec</code>、<code>SearchSpec</code>、<code>RunResult</code>。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:456-545</code>：内置模型列表。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:650-680</code>：global token 到各 rank 的分布逻辑，<code>rank_imbalance_ratio</code> 控制 rank0 倾斜。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:706-736</code>：DEP / TEP / DTP / TTP / CUSTOM 映射解析。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:1086-1551</code>：routing-control 核心 —— <code>RoutingPlan</code>、pattern 解析、scenario 展开、dispatch matrix / expert histogram 构造、文件加载与校验。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:1570-1745</code>：<code>_materialize_selected_experts_for_rank</code> 与 observed slot / token / histogram 派生。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:1747-1847</code>：native logits 反推与 projection 状态决定（含 DeepSeekV3 group 检测、Llama4 top1-only fallback）。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:1850-1941</code>：supplied-topk patch helpers，对应 <code>routing_path=supplied_topk_run_moe</code> / <code>supplied_topk_apply</code>。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2037-2081</code>：<code>_maybe_install_routing_control_patch</code>（与 legacy <code>_maybe_install_balance_patch</code> 并存且互斥）。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2088-2107</code>：autotune 是 untimed pre-pass。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2121-2160</code>：eager timing + Kineto kernel parsing 入口。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2336-2436</code>：CUDA Graph timing 和 external CUDA events。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2589-2693</code>：搜索展开、剪枝和 <code>--max_configs</code>。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2720-2807</code>：<code>_build_routing_control_block</code>，按 <code>routing_dump_matrix</code> 决定要不要落完整矩阵。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:2809-3245</code>：<code>_run_one_candidate</code> —— EPLB 互斥、native projection / forced materialize、patch 安装、计时、observed 指标聚合与清理。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:3250-3331</code>：JSON result row 和 rankings 输出（包含 <code>routing_control</code> 块）。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:3436-3711</code>：CLI 参数（含 routing-control 全部新参数）。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:3712-3964</code>：CLI/config file 解析与 spec resolution（含 legacy 兼容映射）。</li>
+    <li><code>tests/microbenchmarks/bench_moe.py:4072-4239</code>：worker 主流程和最终输出。</li>
+    <li><code>tests/microbenchmarks/BENCH_MOE_ROUTING_CONTROL_DESIGN.md</code>：routing control 完整设计文档与 routing-method 反推能力表。</li>
+    <li><code>tests/microbenchmarks/test_bench_moe_routing_control.py</code>：routing-control 的 CPU-only 单元测试。</li>
+    <li><code>tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md:34-65</code>：<code>ConfigurableMoE</code>、backend、communication、EPLB、scheduler 的职责边界。</li>
+  </ul>
+</main>
+</body>
+</html>
