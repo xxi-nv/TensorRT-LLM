@@ -36,6 +36,34 @@ timing.
 See ``tests/microbenchmarks/BENCH_MOE_DASHBOARD_DESIGN.md`` for the full
 design.
 
+File layout (top to bottom; section banners use ``# ---`` rulers):
+
+    1.  Imports (stdlib / third-party / sys.path setup / project / optional)
+    2.  Routing method registry
+    3.  Structured specs (``ModelSpec``, ``WorkloadSpec``, ``ConfigSpec``,
+        ``SearchSpec``, ``RoutingControlSpec``, ``RunResult``)
+    4.  Built-in model registry
+    5.  Backend capability gate (``can_implement`` wrapper)
+    6.  Small helpers (printing, distributed setup, stats)
+    7.  Token distribution & input synthesis
+    8.  Mapping / ModelConfig / RoutingMethod construction
+    9.  MoE module construction (build phase)
+    10. Routing control: pattern parsing, plan building, materialisation,
+        native logits projection, ``forward`` patches
+    11. Autotune (untimed pre-pass)
+    12. Eager timing path
+    13. CUPTI helpers (must initialise before the CUDA context)
+    14. CUDA Graph timing path
+    15. Per-rank gather + scoring
+    16. Bottleneck classification
+    17. Search expansion + candidate validation
+    18. Per-case execution (``_run_one_candidate``)
+    19. Output schema serialisation
+    20. CLI argument parsing
+    21. Spec resolution from CLI args / config file
+    22. Worker (``_run_benchmark_worker_under_current_mpi``)
+    23. MPI launchers (external, inline, self-spawn)
+
 Launch examples::
 
     # Single-rank fixed run (eager).
@@ -67,9 +95,13 @@ Launch examples::
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Standard library
+# ---------------------------------------------------------------------------
 import argparse
 import contextlib
 import ctypes
+import functools
 import getpass
 import itertools
 import json
@@ -82,44 +114,43 @@ import sys
 import tempfile
 import time
 import traceback
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from xml.sax.saxutils import escape as _xml_escape
 
+# ---------------------------------------------------------------------------
+# Third-party (required at import time)
+# ---------------------------------------------------------------------------
 import torch
 import torch.distributed as dist
 from mpi4py import MPI
 from torch.autograd import DeviceType
 
-# ``cloudpickle`` and ``mpi4py.futures.MPIPoolExecutor`` are only used in the
-# self-spawning launcher path (single ``python3 bench_moe.py`` invocation that
-# pops up its own MPI pool). When started under external mpirun/srun they are
-# never touched, so import them lazily inside ``main()`` to avoid hard
-# dependencies on container images that ship only the minimal mpi4py.
-
+# ---------------------------------------------------------------------------
+# sys.path setup required by the project-internal imports below.
+#
 # ``quantize_utils.py`` lives under ``tests/unittest/_torch/modules/moe/`` and
-# uses pytest-style relative imports such as ``from _torch.helpers import ...``;
-# the project's ``tests/unittest/conftest.py`` puts ``tests/unittest`` on
-# sys.path. Replicate that here so the benchmark works without pytest.
+# uses pytest-style relative imports (e.g. ``from _torch.helpers import ...``).
+# Pytest's ``tests/unittest/conftest.py`` puts ``tests/unittest`` on sys.path;
+# replicate that here so the benchmark works without pytest.
+#
+# Adding the repo root makes ``import tensorrt_llm`` resolve to the in-tree
+# checkout. Only do it when the worktree actually contains compiled bindings,
+# otherwise leave it alone so an installed wheel (e.g. OCI containers) wins.
+# ---------------------------------------------------------------------------
 _TESTS_UNITTEST_DIR = Path(__file__).resolve().parent.parent / "unittest"
 if str(_TESTS_UNITTEST_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_UNITTEST_DIR))
 
-# When invoked as ``python tests/microbenchmarks/bench_moe.py`` (rather than
-# ``python -m`` or via pytest), Python sets ``sys.path[0]`` to the script's
-# directory (``tests/microbenchmarks/``), not the repo root. Adding the repo
-# root first makes ``import tensorrt_llm`` resolve to the in-tree checkout
-# without requiring an installed wheel or a manual ``PYTHONPATH``.
-#
-# Only do this when the in-tree ``tensorrt_llm`` package can be imported as a
-# fully built package (i.e., the worktree contains compiled ``bindings``). On
-# OCI / pre-built container environments where ``tensorrt_llm`` is installed
-# system-wide and the worktree is just a source checkout, leaving the worktree
-# off sys.path is correct: the installed wheel is used and bindings resolve.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if (_REPO_ROOT / "tensorrt_llm" / "bindings").is_dir() and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# ---------------------------------------------------------------------------
+# Project imports (depend on the sys.path setup above)
+# ---------------------------------------------------------------------------
 from _torch.modules.moe.moe_test_utils import (  # noqa: E402
     MoeBackendType,
     MoeModelConfig,
@@ -157,6 +188,37 @@ from tensorrt_llm._utils import (  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig  # noqa: E402
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Optional dependencies. Each is gated by a top-level try/except; callers must
+# check the resulting sentinel before use. This avoids hard dependencies on
+# CUPTI / cxxfilt in minimal containers, and keeps the spawn launcher tolerant
+# of mpi4py images that ship without ``mpi4py.futures``.
+# ---------------------------------------------------------------------------
+try:
+    from cupti import cupti as _cupti  # type: ignore[import-not-found]
+except Exception:
+    _cupti = None  # type: ignore[assignment]
+
+try:
+    import cxxfilt as _cxxfilt  # type: ignore[import-not-found]
+except Exception:
+    _cxxfilt = None  # type: ignore[assignment]
+
+try:
+    from torch.cuda import _get_driver_version as _torch_driver_version  # type: ignore[attr-defined]
+except Exception:
+    _torch_driver_version = None  # type: ignore[assignment]
+
+try:
+    import cloudpickle as _cloudpickle  # type: ignore[import-not-found]
+except Exception:
+    _cloudpickle = None  # type: ignore[assignment]
+
+try:
+    from mpi4py.futures import MPIPoolExecutor as _MPIPoolExecutor  # type: ignore[import-not-found]
+except Exception:
+    _MPIPoolExecutor = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Routing method registry
@@ -1409,6 +1471,108 @@ def _split_slot_count_to_experts(
     return _largest_remainder_split(int(slot_count), weights)
 
 
+def _flatten_plan_slots_for_rank(
+    plan: RoutingPlan,
+    src_rank: int,
+    top_k: int,
+    experts_per_rank: int,
+    moe_ep_size: int,
+) -> List[int]:
+    """Flatten one plan row into expert ids while preserving slot counts."""
+    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    row = list(plan.dispatch_matrix[src_rank])
+    if sum(row) != local_num_tokens * top_k:
+        raise ValueError(
+            f"dispatch_matrix row sum ({sum(row)}) must equal local_num_tokens*top_k "
+            f"({local_num_tokens * top_k}) for rank {src_rank}"
+        )
+
+    flat: List[int] = []
+    for dst in range(moe_ep_size):
+        cell = int(row[dst])
+        if cell == 0:
+            continue
+        target_hist = list(plan.expert_histogram[dst])
+        per_le = _split_slot_count_to_experts(cell, target_hist)
+        for le, cnt in enumerate(per_le):
+            if cnt <= 0:
+                continue
+            expert_id = dst * experts_per_rank + le
+            flat.extend([expert_id] * int(cnt))
+
+    expected = local_num_tokens * top_k
+    if len(flat) != expected:
+        raise ValueError(f"materialiser flat length {len(flat)} != local_num_tokens*top_k={expected}")
+    return flat
+
+
+def _pack_slots_column_major(flat: List[int], local_num_tokens: int, top_k: int) -> List[List[int]]:
+    """Pack flat slots as k-major columns to spread destinations across tokens."""
+    out = [[0] * top_k for _ in range(local_num_tokens)]
+    for i, val in enumerate(flat):
+        k_idx = i // local_num_tokens
+        t_idx = i % local_num_tokens
+        out[t_idx][k_idx] = val
+    return out
+
+
+def _repair_duplicate_experts(out: List[List[int]], top_k: int) -> None:
+    """Best-effort repair so each token row has distinct selected experts."""
+    max_passes = 4
+    local_num_tokens = len(out)
+    for _pass in range(max_passes):
+        any_repair = False
+        for t in range(local_num_tokens):
+            seen: Dict[int, int] = {}
+            for k in range(top_k):
+                eid = out[t][k]
+                if eid in seen:
+                    # Prefer swapping with the same k slot in another row; this
+                    # preserves per-k distribution better than reshuffling the row.
+                    target_k = k
+                    swapped = False
+                    for t2 in range(local_num_tokens):
+                        if t2 == t:
+                            continue
+                        partner = out[t2][target_k]
+                        if partner == eid:
+                            continue
+                        if partner in seen:
+                            continue
+                        out[t][target_k], out[t2][target_k] = partner, eid
+                        swapped = True
+                        any_repair = True
+                        break
+                    if not swapped:
+                        # Last-resort intra-row swap. Some pathological plans
+                        # cannot be repaired, and tests intentionally document
+                        # those duplicate-producing cases.
+                        for k2 in range(top_k):
+                            if k2 == k:
+                                continue
+                            alt = out[t][k2]
+                            if alt == eid or alt in seen:
+                                continue
+                            out[t][k], out[t][k2] = alt, eid
+                            any_repair = True
+                            break
+                    seen[out[t][k]] = k
+                else:
+                    seen[eid] = k
+        if not any_repair:
+            break
+
+
+def _make_uniform_topk_scales(
+    local_num_tokens: int,
+    top_k: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.full((local_num_tokens, top_k), 1.0 / max(top_k, 1), dtype=dtype, device=device)
+
+
 def _materialize_selected_experts_for_rank(
     plan: RoutingPlan,
     src_rank: int,
@@ -1437,87 +1601,12 @@ def _materialize_selected_experts_for_rank(
         scales = torch.zeros((0, top_k), dtype=scale_dtype, device=device)
         return ids, scales
 
-    row = list(plan.dispatch_matrix[src_rank])
-    if sum(row) != local_num_tokens * top_k:
-        raise ValueError(
-            f"dispatch_matrix row sum ({sum(row)}) must equal local_num_tokens*top_k "
-            f"({local_num_tokens * top_k}) for rank {src_rank}"
-        )
-
-    flat: List[int] = []
-    for dst in range(moe_ep_size):
-        cell = int(row[dst])
-        if cell == 0:
-            continue
-        target_hist = list(plan.expert_histogram[dst])
-        per_le = _split_slot_count_to_experts(cell, target_hist)
-        for le, cnt in enumerate(per_le):
-            if cnt <= 0:
-                continue
-            expert_id = dst * experts_per_rank + le
-            flat.extend([expert_id] * int(cnt))
-
-    if len(flat) != local_num_tokens * top_k:
-        raise ValueError(
-            f"materialiser flat length {len(flat)} != local_num_tokens*top_k={local_num_tokens * top_k}"
-        )
-
-    # Reshape column-major: pos i -> (token_idx=i%num_tokens, k_idx=i//num_tokens).
-    out = [[0] * top_k for _ in range(local_num_tokens)]
-    for i, val in enumerate(flat):
-        k_idx = i // local_num_tokens
-        t_idx = i % local_num_tokens
-        out[t_idx][k_idx] = val
-
-    # Repair duplicates: for any token with duplicated expert ids, swap one of
-    # the duplicates with a different expert id from another token.
-    max_passes = 4
-    for _pass in range(max_passes):
-        any_repair = False
-        for t in range(local_num_tokens):
-            seen: Dict[int, int] = {}
-            for k in range(top_k):
-                eid = out[t][k]
-                if eid in seen:
-                    # Find a swap partner: another row whose (k slot) has a
-                    # different expert id and that does not introduce a new
-                    # duplicate.
-                    target_k = k
-                    swapped = False
-                    for t2 in range(local_num_tokens):
-                        if t2 == t:
-                            continue
-                        partner = out[t2][target_k]
-                        if partner == eid:
-                            continue
-                        if partner in seen:
-                            continue
-                        out[t][target_k], out[t2][target_k] = partner, eid
-                        swapped = True
-                        any_repair = True
-                        break
-                    if not swapped:
-                        # Try swapping the k-th slot with a different k slot
-                        # inside the same row.
-                        for k2 in range(top_k):
-                            if k2 == k:
-                                continue
-                            alt = out[t][k2]
-                            if alt == eid or alt in seen:
-                                continue
-                            out[t][k], out[t][k2] = alt, eid
-                            any_repair = True
-                            break
-                    seen[out[t][k]] = k
-                else:
-                    seen[eid] = k
-        if not any_repair:
-            break
+    flat = _flatten_plan_slots_for_rank(plan, src_rank, top_k, experts_per_rank, moe_ep_size)
+    out = _pack_slots_column_major(flat, local_num_tokens, top_k)
+    _repair_duplicate_experts(out, top_k)
 
     ids = torch.tensor(out, dtype=torch.int32, device=device)
-    scales = torch.full(
-        (local_num_tokens, top_k), 1.0 / max(top_k, 1), dtype=scale_dtype, device=device
-    )
+    scales = _make_uniform_topk_scales(local_num_tokens, top_k, device=device, dtype=scale_dtype)
     return ids, scales
 
 
@@ -1586,6 +1675,60 @@ _NATIVE_PROJECTION_CAPABILITIES: Dict[str, str] = {
 }
 
 
+def _classify_native_projection(
+    *,
+    routing_method,
+    ids: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+) -> Tuple[str, str]:
+    """Return projection status/reason for a native routing method."""
+    method_name = type(routing_method).__name__
+    capability = _NATIVE_PROJECTION_CAPABILITIES.get(method_name, "unsupported")
+    status = "exact"
+    reason = "high/low logits drive top-k to plan"
+
+    if capability == "exact":
+        return status, reason
+    if capability == "exact_ids":
+        return (
+            status,
+            "expert ids exactly realised; selected_scales follow native routing kernel and are not "
+            "matrix-controlled",
+        )
+    if capability == "top1_exact":
+        if top_k > 1:
+            return (
+                "projected",
+                "Llama4 native realisation is only exact for top1; multi-target plans are projected",
+            )
+        return status, reason
+    if capability == "exact_with_zero_bias":
+        return status, "MiniMax2 exact realisation assumes zero score-correction bias"
+    if capability == "projected_or_exact":
+        routing_impl = getattr(routing_method, "routing_impl", None)
+        n_group = getattr(routing_impl, "n_group", 1) if routing_impl is not None else 1
+        topk_group = getattr(routing_impl, "topk_group", 1) if routing_impl is not None else 1
+        if n_group > 1 and topk_group >= 1:
+            experts_per_group = num_experts // n_group
+            ids_cpu = ids.detach().cpu().tolist()
+            for row in ids_cpu:
+                groups = {int(eid) // experts_per_group for eid in row}
+                if len(groups) > topk_group:
+                    return (
+                        "projected",
+                        f"DeepSeekV3 grouped routing: row needs experts in {len(groups)} groups "
+                        f"but topk_group={topk_group}",
+                    )
+        return status, reason
+    if capability == "unsupported":
+        return (
+            "projected",
+            f"{method_name} native logits realisation is unsupported in v1; falling back to high/low logits",
+        )
+    return "projected", f"{method_name}: unknown capability"
+
+
 def _project_router_logits_for_plan(
     plan: RoutingPlan,
     src_rank: int,
@@ -1615,9 +1758,6 @@ def _project_router_logits_for_plan(
             "no local tokens; trivial logits",
         )
 
-    method_name = type(routing_method).__name__
-    capability = _NATIVE_PROJECTION_CAPABILITIES.get(method_name, "unsupported")
-
     # Materialise target experts using the canonical plan, then construct
     # logits that drive the routing kernels towards those experts.
     ids, _ = _materialize_selected_experts_for_rank(
@@ -1642,55 +1782,30 @@ def _project_router_logits_for_plan(
     )
     logits[row_idx, ids.long()] = score_per_k.unsqueeze(0).expand_as(ids).to(dtype)
 
-    status = "exact"
-    reason = "high/low logits drive top-k to plan"
-
-    if capability == "exact":
-        pass
-    elif capability == "exact_ids":
-        reason = (
-            "expert ids exactly realised; selected_scales follow native routing kernel and are not "
-            "matrix-controlled"
-        )
-    elif capability == "top1_exact":
-        # Llama4 only uses top1 routing semantically; if the plan asks for top-k
-        # > 1 we cannot exactly express the same workload via native logits.
-        if top_k > 1:
-            status = "projected"
-            reason = (
-                "Llama4 native realisation is only exact for top1; multi-target plans are projected"
-            )
-    elif capability == "exact_with_zero_bias":
-        # MiniMax2 selects via ``sigmoid(logits) + bias``; with zero bias the
-        # ids are still exact but final scales come from a bias-less sigmoid.
-        reason = "MiniMax2 exact realisation assumes zero score-correction bias"
-    elif capability == "projected_or_exact":
-        # DeepSeekV3 grouped routing: every selected expert must belong to one
-        # of the top ``topk_group`` groups (out of ``n_group``). Detect a
-        # violation by counting groups per token.
-        routing_impl = getattr(routing_method, "routing_impl", None)
-        n_group = getattr(routing_impl, "n_group", 1) if routing_impl is not None else 1
-        topk_group = getattr(routing_impl, "topk_group", 1) if routing_impl is not None else 1
-        if n_group > 1 and topk_group >= 1:
-            experts_per_group = num_experts // n_group
-            ids_cpu = ids.detach().cpu().tolist()
-            for row in ids_cpu:
-                groups = {int(eid) // experts_per_group for eid in row}
-                if len(groups) > topk_group:
-                    status = "projected"
-                    reason = (
-                        f"DeepSeekV3 grouped routing: row needs experts in {len(groups)} groups "
-                        f"but topk_group={topk_group}"
-                    )
-                    break
-    elif capability == "unsupported":
-        status = "projected"
-        reason = f"{method_name} native logits realisation is unsupported in v1; falling back to high/low logits"
-    else:
-        status = "projected"
-        reason = f"{method_name}: unknown capability"
-
+    status, reason = _classify_native_projection(
+        routing_method=routing_method, ids=ids, num_experts=num_experts, top_k=top_k
+    )
     return logits, status, reason
+
+
+def _align_topk_to_batch(
+    local: torch.Tensor, scales: torch.Tensor, batch_rows: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Align materialised routing tensors to runtime batch rows.
+
+    CUDA graph capture may pad or trim the local batch dimension. Repeating the
+    final row is only used for over-allocation and keeps the synthetic routing
+    payload well-formed without changing the steady-state path.
+    """
+    if local.shape[0] == batch_rows:
+        return local, scales
+    if local.shape[0] >= batch_rows:
+        return local[:batch_rows], scales[:batch_rows]
+    pad_rows = batch_rows - local.shape[0]
+    return (
+        torch.cat([local, local[-1:].expand(pad_rows, -1).clone()], dim=0),
+        torch.cat([scales, scales[-1:].expand(pad_rows, -1).clone()], dim=0),
+    )
 
 
 def _make_supplied_topk_run_moe(
@@ -1719,20 +1834,7 @@ def _make_supplied_topk_run_moe(
                 do_finalize,
                 moe_output,
             )
-        local = materialized_ids
-        scales = materialized_scales
-        # If the engine resized the local batch (e.g. CUDA graph padding), align
-        # to the runtime ``x.shape[0]`` so we never index out of bounds.
-        if local.shape[0] != x.shape[0]:
-            if local.shape[0] >= x.shape[0]:
-                local = local[: x.shape[0]]
-                scales = scales[: x.shape[0]]
-            else:
-                # Pad by repeating the last row; rare, only happens when the
-                # backend over-allocates the batch dimension.
-                pad_rows = x.shape[0] - local.shape[0]
-                local = torch.cat([local, local[-1:].expand(pad_rows, -1).clone()], dim=0)
-                scales = torch.cat([scales, scales[-1:].expand(pad_rows, -1).clone()], dim=0)
+        local, scales = _align_topk_to_batch(materialized_ids, materialized_scales, x.shape[0])
         local = local.to(device=x.device, dtype=torch.int32)
         scales = scales.to(device=x.device)
         final_hidden_states = run_moe_orig(x, local, scales, x_sf, None, do_finalize, moe_output)
@@ -1765,14 +1867,8 @@ def _make_supplied_topk_apply(
             pass
         local = materialized_ids
         scales = materialized_scales
-        if router_logits is not None and local.shape[0] != router_logits.shape[0]:
-            if local.shape[0] >= router_logits.shape[0]:
-                local = local[: router_logits.shape[0]]
-                scales = scales[: router_logits.shape[0]]
-            else:
-                pad_rows = router_logits.shape[0] - local.shape[0]
-                local = torch.cat([local, local[-1:].expand(pad_rows, -1).clone()], dim=0)
-                scales = torch.cat([scales, scales[-1:].expand(pad_rows, -1).clone()], dim=0)
+        if router_logits is not None:
+            local, scales = _align_topk_to_batch(local, scales, router_logits.shape[0])
         device = router_logits.device if router_logits is not None else local.device
         moe_module._routing_results_replaced_at = "make_supplied_topk_apply"
         return local.to(device=device, dtype=torch.int32), scales.to(device=device)
@@ -2027,12 +2123,23 @@ def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str
 
 
 def _try_init_cupti():
-    """Initialize CUPTI before any CUDA context. Mirrors bench_moe_comm."""
+    """Initialize CUPTI activity tracking before any CUDA context is created.
+
+    Returns a 4-tuple ``(cupti_module, kernels_list, events_list, ok)``. When
+    the ``cupti`` Python package is missing or registration fails the function
+    degrades gracefully to ``(None, [], [], False)`` and the caller falls back
+    to PyTorch-event-only timing without kernel breakdown.
+
+    The two activity kinds we register are:
+      - ``CONCURRENT_KERNEL``: every kernel actually executed on the GPU,
+        including those replayed from a captured CUDA graph (Kineto cannot see
+        these because there is no Python frame during replay).
+      - ``CUDA_EVENT``: device-side timestamps for ``cudaEventRecord`` calls;
+        we use them to delimit which kernels fall inside each timed iteration.
+    """
+    if _cupti is None:
+        return None, [], [], False
     try:
-        from functools import partial as _partial
-
-        from cupti import cupti as _cupti
-
         _cupti_kernels: List[Tuple[str, int, int]] = []
         _cupti_events: List[int] = []
 
@@ -2050,7 +2157,8 @@ def _try_init_cupti():
         _cupti.activity_enable(_cupti.ActivityKind.CUDA_EVENT)
         _cupti.activity_enable_cuda_event_device_timestamps(1)
         _cupti.activity_register_callbacks(
-            _buf_requested, _partial(_buf_completed, _cupti_kernels, _cupti_events)
+            _buf_requested,
+            functools.partial(_buf_completed, _cupti_kernels, _cupti_events),
         )
         return _cupti, _cupti_kernels, _cupti_events, True
     except Exception:
@@ -2058,10 +2166,11 @@ def _try_init_cupti():
 
 
 def _demangle_names(names: List[str]) -> Dict[str, str]:
+    """Demangle C++ symbol names via ``cxxfilt`` when available."""
+    if _cxxfilt is None:
+        return {n: n for n in names}
     try:
-        import cxxfilt
-
-        return {n: cxxfilt.demangle(n) for n in names}
+        return {n: _cxxfilt.demangle(n) for n in names}
     except Exception:
         return {n: n for n in names}
 
@@ -2624,6 +2733,290 @@ def _build_routing_control_block(
     return block
 
 
+@dataclass
+class _RoutingInputs:
+    """Inputs derived from routing control for one (case, rank).
+
+    ``router_logits`` is the tensor that will be passed to ``moe.forward``; in
+    forced mode it is left unchanged because the routing kernels are bypassed.
+    ``materialized_ids`` / ``materialized_scales`` are only populated in forced
+    mode and are consumed by ``_maybe_install_routing_control_patch``.
+    """
+
+    router_logits: torch.Tensor
+    materialized_ids: Optional[torch.Tensor] = None
+    materialized_scales: Optional[torch.Tensor] = None
+    realization_status: str = "exact"
+    realization_reason: str = "balanced default"
+    routing_path: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+def _short_circuit(result: RunResult, status: str, reason: str) -> RunResult:
+    """Stamp ``status``/``reason`` on ``result`` and broadcast across ranks.
+
+    Every early-return path in ``_run_one_candidate`` must go through this
+    helper so the per-rank status allgather completes on all ranks and the
+    output row remains coherent.
+    """
+    result.status = status
+    result.skip_reason = reason
+    result.status_per_rank = _gather_status_per_rank(status)
+    return result
+
+
+def _initial_instrumentation(
+    analysis: Tuple[str, ...],
+    config: ConfigSpec,
+    cupti_ctx: Optional[Any],
+) -> Dict[str, Any]:
+    return {
+        "level": ",".join(sorted(analysis)) if analysis else "summary",
+        "cuda_graph": bool(config.cuda_graph),
+        "cupti_available": bool(cupti_ctx is not None and cupti_ctx[3]),
+        "phase_timing_available": False,
+        "kernel_breakdown_available": "kernels" in analysis,
+        "autotune_status": "not_run",
+        "latency_source": "cuda_event_external" if config.cuda_graph else "cuda_event_eager",
+    }
+
+
+def _pick_enable_perfect_router(rc_spec: RoutingControlSpec, rc_active: bool) -> bool:
+    """Decide whether to enable ``ENABLE_PERFECT_ROUTER`` for one case.
+
+    Forced routing always disables the perfect router (we are bypassing the
+    routing kernels entirely). Native routing enables it only on the balanced
+    workload, where the synthetic logits naturally produce balanced top-k.
+    """
+    if not rc_active:
+        return True
+    if rc_spec.routing_mode == "forced":
+        return False
+    return (
+        rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
+    )
+
+
+def _build_empty_routing_control_block_for_rejection(
+    *,
+    rc_spec: RoutingControlSpec,
+    routing_plan: RoutingPlan,
+    model: ModelSpec,
+    moe_ep_size: int,
+    per_rank: List[int],
+    num_chunks: Optional[int],
+    rejected_reason: str,
+    enable_perfect_router: bool,
+    act_dtype: torch.dtype,
+) -> Dict[str, Any]:
+    experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+    return _build_routing_control_block(
+        spec=rc_spec,
+        plan=routing_plan,
+        observed_slot=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
+        observed_token=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
+        observed_hist=[[0] * experts_per_rank for _ in range(int(moe_ep_size))],
+        routing_path=None,
+        realization_status="rejected",
+        realization_reason=rejected_reason,
+        enable_perfect_router=enable_perfect_router,
+        max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
+        num_chunks_observed=num_chunks,
+        warnings=[],
+        scale_dtype=act_dtype,
+        moe_ep_size=int(moe_ep_size),
+        dump_full=bool(rc_spec.routing_dump_matrix),
+        routing_mode=rc_spec.routing_mode,
+    )
+
+
+@dataclass
+class _RoutingSkip:
+    """Encodes a routing-control skip with optional dashboard annotation.
+
+    ``skip_reason`` is the human-readable reason written to the result row.
+    ``rejected_reason`` is set only for ``projection_policy=reject`` skips, in
+    which case the caller still emits a ``routing_control`` block carrying the
+    untruncated projection reason.
+    """
+
+    skip_reason: str
+    rejected_reason: Optional[str] = None
+
+
+def _select_routing_inputs(
+    *,
+    moe,
+    model: ModelSpec,
+    rc_spec: RoutingControlSpec,
+    routing_plan: RoutingPlan,
+    rank: int,
+    moe_ep_size: int,
+    base_router_logits: torch.Tensor,
+    device: torch.device,
+    act_dtype: torch.dtype,
+    routing_logits_dtype: torch.dtype,
+) -> Tuple[Optional[_RoutingInputs], Optional[_RoutingSkip]]:
+    """Produce the router_logits / materialised top-k tensors for routing control.
+
+    Returns ``(inputs, None)`` on success or ``(None, skip)`` to abort. The
+    skip object distinguishes a plain error (materialise / projection) from a
+    ``projection_policy=reject`` rejection that the dashboard wants to see.
+    """
+    experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+    ep_axis_rank = rank if rank < int(moe_ep_size) else (rank % int(moe_ep_size))
+
+    if rc_spec.routing_mode == "forced":
+        try:
+            ids, scales = _materialize_selected_experts_for_rank(
+                routing_plan,
+                src_rank=ep_axis_rank,
+                top_k=int(model.top_k),
+                experts_per_rank=experts_per_rank,
+                moe_ep_size=int(moe_ep_size),
+                device=device,
+                scale_dtype=act_dtype,
+            )
+        except Exception as exc:
+            return None, _RoutingSkip(
+                f"routing materialise error: {type(exc).__name__}: {exc}"
+            )
+        inner_backend = getattr(moe, "backend", moe)
+        routing_path = (
+            "supplied_topk_run_moe"
+            if isinstance(inner_backend, TRTLLMGenFusedMoE)
+            else "supplied_topk_apply"
+        )
+        return (
+            _RoutingInputs(
+                router_logits=base_router_logits,
+                materialized_ids=ids,
+                materialized_scales=scales,
+                realization_status="forced_exact",
+                realization_reason=(
+                    "forced routing_mode: top-k ids and uniform 1/top_k scales materialised "
+                    "from RoutingPlan; native fused scoring is intentionally bypassed"
+                ),
+                routing_path=routing_path,
+            ),
+            None,
+        )
+
+    # Native mode: synthesise router_logits that drive the production routing
+    # kernel toward the plan; the path is "logits_native" when the projection
+    # is exact and "logits_projected" when the routing method cannot represent
+    # the plan exactly.
+    try:
+        new_logits, projection_status, projection_reason = _project_router_logits_for_plan(
+            routing_plan,
+            src_rank=ep_axis_rank,
+            routing_method=moe.routing_method,
+            num_experts=int(model.num_experts),
+            top_k=int(model.top_k),
+            experts_per_rank=experts_per_rank,
+            moe_ep_size=int(moe_ep_size),
+            device=device,
+            dtype=routing_logits_dtype,
+        )
+    except Exception as exc:
+        return None, _RoutingSkip(
+            f"native logits projection error: {type(exc).__name__}: {exc}"
+        )
+
+    if projection_status != "exact" and rc_spec.projection_policy == "reject":
+        return None, _RoutingSkip(
+            skip_reason=(
+                f"routing_realization rejected by projection_policy=reject: {projection_reason}"
+            ),
+            rejected_reason=projection_reason,
+        )
+
+    warnings: List[str] = []
+    if projection_status != "exact":
+        warnings.append(f"routing_realization={projection_status}: {projection_reason}")
+
+    return (
+        _RoutingInputs(
+            router_logits=new_logits,
+            realization_status=projection_status,
+            realization_reason=projection_reason,
+            routing_path=(
+                "logits_native" if projection_status == "exact" else "logits_projected"
+            ),
+            warnings=warnings,
+        ),
+        None,
+    )
+
+
+def _observe_routing_plan(
+    *,
+    routing_plan: RoutingPlan,
+    model: ModelSpec,
+    moe_ep_size: int,
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Materialise the plan on every EP source rank and aggregate the totals.
+
+    We re-materialise on rank 0 (CPU) for *every* EP source instead of relying
+    on MPI gather: in DTP/TTP modes multiple world ranks share an EP rank, so
+    a naive allgather would double-count.
+    """
+    experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+    per_rank_ids: List[Any] = []
+    for src in range(int(moe_ep_size)):
+        try:
+            src_ids, _ = _materialize_selected_experts_for_rank(
+                routing_plan,
+                src_rank=src,
+                top_k=int(model.top_k),
+                experts_per_rank=experts_per_rank,
+                moe_ep_size=int(moe_ep_size),
+                device=torch.device("cpu"),
+                scale_dtype=torch.float32,
+            )
+        except Exception:
+            src_ids = torch.empty((0, int(model.top_k)), dtype=torch.int32)
+        per_rank_ids.append(src_ids)
+    return _observe_routing_metrics(routing_plan, per_rank_ids, experts_per_rank, int(moe_ep_size))
+
+
+def _finalize_routing_control_block(
+    *,
+    result: RunResult,
+    rc_spec: RoutingControlSpec,
+    routing_plan: RoutingPlan,
+    routing_inputs: _RoutingInputs,
+    model: ModelSpec,
+    moe_ep_size: int,
+    per_rank: List[int],
+    enable_perfect_router: bool,
+    act_dtype: torch.dtype,
+) -> None:
+    observed_slot, observed_token, observed_hist = _observe_routing_plan(
+        routing_plan=routing_plan,
+        model=model,
+        moe_ep_size=int(moe_ep_size),
+    )
+    result.routing_control = _build_routing_control_block(
+        spec=rc_spec,
+        plan=routing_plan,
+        observed_slot=observed_slot,
+        observed_token=observed_token,
+        observed_hist=observed_hist,
+        routing_path=routing_inputs.routing_path,
+        realization_status=routing_inputs.realization_status,
+        realization_reason=routing_inputs.realization_reason,
+        enable_perfect_router=enable_perfect_router,
+        max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
+        num_chunks_observed=result.num_chunks,
+        warnings=routing_inputs.warnings,
+        scale_dtype=act_dtype,
+        moe_ep_size=int(moe_ep_size),
+        dump_full=bool(rc_spec.routing_dump_matrix),
+        routing_mode=rc_spec.routing_mode,
+    )
+
+
 def _run_one_candidate(
     *,
     model: ModelSpec,
@@ -2643,49 +3036,46 @@ def _run_one_candidate(
     """Build, autotune, and time one ``ConfigSpec`` candidate.
 
     Always returns a ``RunResult``; failures are encoded in the ``status`` /
-    ``skip_reason`` fields so the caller can write a row even for the failed
-    case.
+    ``skip_reason`` fields so the caller can write a row even for a failed
+    case. Every early-return path goes through ``_short_circuit`` so the
+    per-rank status allgather completes on every rank.
+
+    Pipeline:
+        Step 1  Resolve EP/TP layout and routing plan (if routing-control)
+        Step 2  Build mapping, configure AutoTuner, force comm method
+        Step 3  Build the MoE module and validate the actual backend
+        Step 4  Synthesise inputs and (if routing-control) pick routing inputs
+        Step 5  Run autotune and time the forward (eager or CUDA graph)
+        Step 6  Aggregate latency / kernels / bottleneck and routing observation
     """
     result = RunResult(model=model, workload=workload, config=config)
     rc_spec = workload.routing_control
     rc_active = rc_spec.is_active
 
+    # ---- Step 1: layout + routing plan ----------------------------------
     # Resolve EP-axis ``moe_ep_size`` from the candidate now so routing-plan
-    # building can use it. The mapping object created later will agree.
+    # building can use it; the Mapping object built later will agree.
     try:
         moe_ep_size, _moe_tp_size, _enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
-        result.status = "skipped"
-        result.skip_reason = str(exc)
-        result.status_per_rank = _gather_status_per_rank("skipped")
-        return result
+        return _short_circuit(result, "skipped", str(exc))
 
     # Routing-control's dispatch_matrix axis is ``moe_ep_size`` while
     # ``per_rank_num_tokens`` follows the world (DP source) axis. When the two
-    # axes disagree (DTP / TTP / CUSTOM with ``moe_ep_size != world_size``) the
-    # plan would either crash inside ``_build_routing_plan`` (slot total
-    # mismatch) or silently drop the tokens of world ranks beyond
-    # ``moe_ep_size``. Skip cleanly so dashboards do not record meaningless
-    # latencies for an unsupported combination.
+    # disagree (DTP/TTP/CUSTOM with ``moe_ep_size != world_size``) the plan
+    # either crashes inside ``_build_routing_plan`` or silently drops the
+    # tokens of world ranks beyond ``moe_ep_size``. Skip cleanly.
     if rc_active and int(moe_ep_size) != int(world_size):
-        reason = (
+        return _short_circuit(
+            result,
+            "skipped",
             f"routing-control requires moe_ep_size == world_size "
             f"(got moe_ep_size={moe_ep_size}, world_size={world_size}); "
             "the dispatch_matrix axis would not align with the per-rank token "
-            "distribution. Use parallel_mode in {DEP, TEP} or drop routing-control."
+            "distribution. Use parallel_mode in {DEP, TEP} or drop routing-control.",
         )
-        result.status = "skipped"
-        result.skip_reason = reason
-        result.status_per_rank = _gather_status_per_rank("skipped")
-        return result
 
     routing_plan: Optional[RoutingPlan] = None
-    materialized_ids: Optional[torch.Tensor] = None
-    materialized_scales: Optional[torch.Tensor] = None
-    routing_realization_status: Optional[str] = None
-    routing_realization_reason: Optional[str] = None
-    routing_warnings: List[str] = []
-
     if rc_active:
         try:
             routing_plan = _build_routing_plan(
@@ -2699,16 +3089,12 @@ def _run_one_candidate(
         except Exception as exc:
             reason = f"routing plan error: {type(exc).__name__}: {exc}"
             _maybe_print_rank0(f"[bench_moe] {reason}")
-            result.status = "skipped"
-            result.skip_reason = reason
-            result.status_per_rank = _gather_status_per_rank("skipped")
-            return result
+            return _short_circuit(result, "skipped", reason)
         per_rank = list(routing_plan.per_rank_num_tokens)
-        # Pad ``per_rank`` to ``world_size`` when ``moe_ep_size < world_size``;
-        # MoE-replicated source ranks share the same EP-axis bucket.
+        # Pad with zeros when EP < world; MoE-replicated source ranks share
+        # the same EP-axis bucket.
         if len(per_rank) < world_size:
-            base = per_rank + [0] * (world_size - len(per_rank))
-            per_rank = base
+            per_rank = per_rank + [0] * (world_size - len(per_rank))
     else:
         per_rank = _per_rank_tokens(workload, world_size)
 
@@ -2716,25 +3102,13 @@ def _run_one_candidate(
     local_num_tokens = per_rank[rank] if rank < len(per_rank) else 0
     all_rank_num_tokens = list(per_rank)
 
-    instrumentation: Dict[str, Any] = {
-        "level": ",".join(sorted(analysis)) if analysis else "summary",
-        "cuda_graph": bool(config.cuda_graph),
-        "cupti_available": bool(cupti_ctx is not None and cupti_ctx[3]),
-        "phase_timing_available": False,
-        "kernel_breakdown_available": "kernels" in analysis,
-        "autotune_status": "not_run",
-        "latency_source": "cuda_event_external" if config.cuda_graph else "cuda_event_eager",
-    }
-    result.instrumentation = instrumentation
+    result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx)
 
-    # Build mapping for this candidate.
+    # ---- Step 2: mapping + AutoTuner + comm env -------------------------
     try:
         mapping = _build_mapping_from_config(config, world_size)
     except ValueError as exc:
-        result.status = "skipped"
-        result.skip_reason = str(exc)
-        result.status_per_rank = _gather_status_per_rank("skipped")
-        return result
+        return _short_circuit(result, "skipped", str(exc))
 
     result.moe_ep_size = int(mapping.moe_ep_size)
     result.moe_tp_size = int(mapping.moe_tp_size)
@@ -2743,26 +3117,14 @@ def _run_one_candidate(
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()
 
-    # Force comm method via env var (per-case).
     prev_force_comm = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
     _force_comm_env(config.comm_method, prev_force_comm)
 
-    # ``enable_perfect_router`` selection per design table.
-    if rc_active:
-        # ``forced`` always disables perfect router; ``native`` enables it
-        # only for ``balanced_alltoall`` + ``balanced``.
-        if rc_spec.routing_mode == "forced":
-            enable_perfect_router = False
-        else:
-            enable_perfect_router = (
-                rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
-            )
-    else:
-        enable_perfect_router = True
+    enable_perfect_router = _pick_enable_perfect_router(rc_spec, rc_active)
 
     moe = None
-    local_status = "success"
     try:
+        # ---- Step 3: build MoE module and validate ----------------------
         try:
             moe, _ = _build_moe_module(
                 model=model,
@@ -2780,10 +3142,7 @@ def _run_one_candidate(
         except Exception as exc:
             reason = f"build error: {type(exc).__name__}: {exc}"
             _maybe_print_rank0(f"[bench_moe] build failed: {reason}")
-            result.status = "failed"
-            result.skip_reason = reason
-            result.status_per_rank = _gather_status_per_rank("failed")
-            return result
+            return _short_circuit(result, "failed", reason)
 
         result.actual_backend = _backend_name_from_module(moe)
         result.scheduler_kind = _scheduler_kind_name(moe)
@@ -2793,11 +3152,9 @@ def _run_one_candidate(
         if result.actual_backend != config.backend.upper():
             reason = f"requested backend {config.backend!r} fell back to {result.actual_backend!r}"
             _maybe_print_rank0(f"[bench_moe] {reason}")
-            result.status = "skipped"
-            result.skip_reason = reason
-            result.status_per_rank = _gather_status_per_rank("skipped")
-            return result
+            return _short_circuit(result, "skipped", reason)
 
+        # ---- Step 4: synthetic inputs + routing-control routing inputs --
         x, router_logits = _make_inputs(
             local_num_tokens,
             model.hidden_size,
@@ -2807,100 +3164,44 @@ def _run_one_candidate(
             device,
         )
 
-        routing_path: Optional[str] = None
+        routing_inputs: Optional[_RoutingInputs] = None
         if rc_active and routing_plan is not None:
-            experts_per_rank = int(model.num_experts) // int(moe_ep_size)
-            ep_axis_rank = rank if rank < int(moe_ep_size) else (rank % int(moe_ep_size))
-            if rc_spec.routing_mode == "forced":
-                try:
-                    materialized_ids, materialized_scales = _materialize_selected_experts_for_rank(
-                        routing_plan,
-                        src_rank=ep_axis_rank,
-                        top_k=int(model.top_k),
-                        experts_per_rank=experts_per_rank,
+            routing_inputs, rc_skip = _select_routing_inputs(
+                moe=moe,
+                model=model,
+                rc_spec=rc_spec,
+                routing_plan=routing_plan,
+                rank=rank,
+                moe_ep_size=int(moe_ep_size),
+                base_router_logits=router_logits,
+                device=device,
+                act_dtype=act_dtype,
+                routing_logits_dtype=routing_logits_dtype,
+            )
+            if routing_inputs is None:
+                assert rc_skip is not None
+                _maybe_print_rank0(f"[bench_moe] {rc_skip.skip_reason}")
+                # projection_policy=reject: keep a routing_control block on the
+                # row so dashboards still see the rejected case.
+                if rc_skip.rejected_reason is not None:
+                    result.routing_control = _build_empty_routing_control_block_for_rejection(
+                        rc_spec=rc_spec,
+                        routing_plan=routing_plan,
+                        model=model,
                         moe_ep_size=int(moe_ep_size),
-                        device=device,
-                        scale_dtype=act_dtype,
-                    )
-                except Exception as exc:
-                    reason = f"routing materialise error: {type(exc).__name__}: {exc}"
-                    _maybe_print_rank0(f"[bench_moe] {reason}")
-                    result.status = "skipped"
-                    result.skip_reason = reason
-                    result.status_per_rank = _gather_status_per_rank("skipped")
-                    return result
-                routing_realization_status = "forced_exact"
-                routing_realization_reason = (
-                    "forced routing_mode: top-k ids and uniform 1/top_k scales materialised "
-                    "from RoutingPlan; native fused scoring is intentionally bypassed"
-                )
-                inner_backend = getattr(moe, "backend", moe)
-                if isinstance(inner_backend, TRTLLMGenFusedMoE):
-                    routing_path = "supplied_topk_run_moe"
-                else:
-                    routing_path = "supplied_topk_apply"
-            else:
-                try:
-                    new_logits, projection_status, projection_reason = (
-                        _project_router_logits_for_plan(
-                            routing_plan,
-                            src_rank=ep_axis_rank,
-                            routing_method=moe.routing_method,
-                            num_experts=int(model.num_experts),
-                            top_k=int(model.top_k),
-                            experts_per_rank=experts_per_rank,
-                            moe_ep_size=int(moe_ep_size),
-                            device=device,
-                            dtype=routing_logits_dtype,
-                        )
-                    )
-                except Exception as exc:
-                    reason = f"native logits projection error: {type(exc).__name__}: {exc}"
-                    _maybe_print_rank0(f"[bench_moe] {reason}")
-                    result.status = "skipped"
-                    result.skip_reason = reason
-                    result.status_per_rank = _gather_status_per_rank("skipped")
-                    return result
-                if projection_status != "exact" and rc_spec.projection_policy == "reject":
-                    routing_realization_status = "rejected"
-                    routing_realization_reason = projection_reason
-                    result.status = "skipped"
-                    result.skip_reason = (
-                        f"routing_realization rejected by projection_policy=reject: "
-                        f"{projection_reason}"
-                    )
-                    result.status_per_rank = _gather_status_per_rank("skipped")
-                    # Still record routing-control summary so dashboards see the case.
-                    result.routing_control = _build_routing_control_block(
-                        spec=rc_spec,
-                        plan=routing_plan,
-                        observed_slot=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
-                        observed_token=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
-                        observed_hist=[[0] * experts_per_rank for _ in range(int(moe_ep_size))],
-                        routing_path=None,
-                        realization_status="rejected",
-                        realization_reason=projection_reason,
+                        per_rank=per_rank,
+                        num_chunks=result.num_chunks,
+                        rejected_reason=rc_skip.rejected_reason,
                         enable_perfect_router=enable_perfect_router,
-                        max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
-                        num_chunks_observed=result.num_chunks,
-                        warnings=routing_warnings,
-                        scale_dtype=act_dtype,
-                        moe_ep_size=int(moe_ep_size),
-                        dump_full=bool(rc_spec.routing_dump_matrix),
-                        routing_mode=rc_spec.routing_mode,
+                        act_dtype=act_dtype,
                     )
-                    return result
-                router_logits = new_logits
-                routing_realization_status = projection_status
-                routing_realization_reason = projection_reason
-                routing_path = (
-                    "logits_native" if projection_status == "exact" else "logits_projected"
-                )
-                if projection_status != "exact":
-                    routing_warnings.append(
-                        f"routing_realization={projection_status}: {projection_reason}"
-                    )
+                return _short_circuit(result, "skipped", rc_skip.skip_reason)
+            router_logits = routing_inputs.router_logits
 
+        materialized_ids = routing_inputs.materialized_ids if routing_inputs else None
+        materialized_scales = routing_inputs.materialized_scales if routing_inputs else None
+
+        # ---- Step 5: autotune + timed forward ---------------------------
         with _maybe_install_routing_control_patch(
             moe,
             materialized_ids,
@@ -2909,11 +3210,7 @@ def _run_one_candidate(
         ):
             try:
                 autotune_status = _run_autotune(
-                    moe,
-                    x,
-                    router_logits,
-                    all_rank_num_tokens,
-                    bool(fast_autotune),
+                    moe, x, router_logits, all_rank_num_tokens, bool(fast_autotune)
                 )
             except Exception as exc:
                 autotune_status = f"failed:{type(exc).__name__}: {exc}"
@@ -2944,87 +3241,52 @@ def _run_one_candidate(
             except Exception as exc:
                 reason = f"timed phase error: {type(exc).__name__}: {exc}"
                 _maybe_print_rank0(f"[bench_moe] {reason}\n{traceback.format_exc()}")
-                local_status = "failed"
-                result.status = "failed"
-                result.skip_reason = reason
-                result.status_per_rank = _gather_status_per_rank(local_status)
-                return result
+                return _short_circuit(result, "failed", reason)
 
-        # Refresh actual_comm_method after the first forward (the factory may
-        # swap moe.comm to AllGatherReduceScatter inside dispatch).
+        # ---- Step 6: aggregate latency, kernels, routing observation ----
+        # The comm factory may swap moe.comm to AllGatherReduceScatter inside
+        # dispatch, so refresh ``actual_comm_method`` after the first forward.
         result.actual_comm_method = _comm_method_name(moe)
 
         per_rank_iters = _gather_per_iteration_times(fwd_times_us)
         result.latency_us = _build_latency_block(per_rank_iters)
 
         if "kernels" in analysis:
-            kb_payload = _gather_kernel_breakdown(detailed_stats)
-            result.kernel_breakdown = kb_payload
+            result.kernel_breakdown = _gather_kernel_breakdown(detailed_stats)
         else:
             result.kernel_breakdown = {"moe_forward_kernels": [], "other_kernels": []}
 
         # Phase markers live in moe_scheduler.py (Phase 5 of the design); not
-        # implemented yet, so emit empty agg/per_rank with a stable shape.
+        # implemented yet, so emit an empty agg/per_rank with a stable shape.
         result.phase_times_us = {"agg": {}, "per_rank": {}}
         result.overlap = {"overlap_us": None, "overlap_ratio": None}
         result.bottleneck = _classify_bottleneck(
             result.phase_times_us["agg"], result.kernel_breakdown, result.latency_us["score"]
         )
 
-        if rc_active and routing_plan is not None:
-            experts_per_rank = int(model.num_experts) // int(moe_ep_size)
-            # Observation uses the canonical plan to materialise *every* EP
-            # source independently. This avoids MPI gather double-counting in
-            # mapping modes where multiple world ranks share the same EP rank
-            # (e.g. DTP/TTP with moe_ep_size < world_size), and lets the rank-0
-            # writer report consistent slot/token/histogram numbers regardless
-            # of which world rank executed which EP axis.
-            per_rank_ids: List[Any] = []
-            for src in range(int(moe_ep_size)):
-                try:
-                    src_ids, _ = _materialize_selected_experts_for_rank(
-                        routing_plan,
-                        src_rank=src,
-                        top_k=int(model.top_k),
-                        experts_per_rank=experts_per_rank,
-                        moe_ep_size=int(moe_ep_size),
-                        device=torch.device("cpu"),
-                        scale_dtype=torch.float32,
-                    )
-                except Exception:
-                    src_ids = torch.empty((0, int(model.top_k)), dtype=torch.int32)
-                per_rank_ids.append(src_ids)
-            observed_slot, observed_token, observed_hist = _observe_routing_metrics(
-                routing_plan, per_rank_ids, experts_per_rank, int(moe_ep_size)
-            )
-            result.routing_control = _build_routing_control_block(
-                spec=rc_spec,
-                plan=routing_plan,
-                observed_slot=observed_slot,
-                observed_token=observed_token,
-                observed_hist=observed_hist,
-                routing_path=routing_path,
-                realization_status=routing_realization_status or "exact",
-                realization_reason=routing_realization_reason or "balanced default",
-                enable_perfect_router=enable_perfect_router,
-                max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
-                num_chunks_observed=result.num_chunks,
-                warnings=routing_warnings,
-                scale_dtype=act_dtype,
+        if rc_active and routing_plan is not None and routing_inputs is not None:
+            _finalize_routing_control_block(
+                result=result,
+                rc_spec=rc_spec,
+                routing_plan=routing_plan,
+                routing_inputs=routing_inputs,
+                model=model,
                 moe_ep_size=int(moe_ep_size),
-                dump_full=bool(rc_spec.routing_dump_matrix),
-                routing_mode=rc_spec.routing_mode,
+                per_rank=per_rank,
+                enable_perfect_router=enable_perfect_router,
+                act_dtype=act_dtype,
             )
 
-        result.status_per_rank = _gather_status_per_rank(local_status)
+        result.status_per_rank = _gather_status_per_rank("success")
         return result
     finally:
+        # Always free GPU memory and restore the per-case env var so the next
+        # candidate runs from a clean state.
         if moe is not None:
             try:
                 moe.destroy()
             except Exception:
                 pass
-        # Restore TRTLLM_FORCE_COMM_METHOD.
         if prev_force_comm is None:
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
         else:
@@ -3071,6 +3333,31 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
         },
         "routing_control": result.routing_control or None,
     }
+
+
+def _make_skipped_run_result(
+    *,
+    model: ModelSpec,
+    workload: WorkloadSpec,
+    config: ConfigSpec,
+    world_size: int,
+    analysis: Tuple[str, ...],
+    reason: str,
+) -> RunResult:
+    """Build a worker-level skipped row without entering MPI collectives."""
+    r = RunResult(model=model, workload=workload, config=config)
+    r.status = "skipped"
+    r.skip_reason = reason
+    r.per_rank_num_tokens = _per_rank_tokens(workload, world_size)
+    r.status_per_rank = {f"rank{i}": "skipped" for i in range(world_size)}
+    r.instrumentation = {
+        "level": ",".join(sorted(analysis)) if analysis else "summary",
+        "cuda_graph": bool(config.cuda_graph),
+        "cupti_available": False,
+        "phase_timing_available": False,
+        "kernel_breakdown_available": False,
+    }
+    return r
 
 
 def _build_rankings(results: List[RunResult]) -> List[Dict[str, Any]]:
@@ -3163,12 +3450,11 @@ def _build_environment_block(world_size: int, cuda_graph_default: bool) -> Dict[
     except Exception:
         pass
     driver_version = None
-    try:
-        from torch.cuda import _get_driver_version  # type: ignore
-
-        driver_version = _get_driver_version()
-    except Exception:
-        pass
+    if _torch_driver_version is not None:
+        try:
+            driver_version = _torch_driver_version()
+        except Exception:
+            pass
 
     try:
         host = socket.gethostname()
@@ -3195,6 +3481,400 @@ def _build_environment_block(world_size: int, cuda_graph_default: bool) -> Dict[
         "memory_type": "unknown",
         "clock_locked": False,
         "cuda_graph_default": bool(cuda_graph_default),
+    }
+
+
+def _excel_safe_sheet_name(name: str, used: set) -> str:
+    invalid = set('[]:*?/\\')
+    base = "".join("_" if ch in invalid else ch for ch in str(name)).strip() or "sheet"
+    base = base[:31]
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        tail = f"_{suffix}"
+        candidate = f"{base[: 31 - len(tail)]}{tail}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _excel_col_name(index: int) -> str:
+    out = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+
+def _excel_cell_xml(row_idx: int, col_idx: int, value: Any) -> str:
+    ref = f"{_excel_col_name(col_idx)}{row_idx}"
+    if value is None:
+        return f'<c r="{ref}"/>'
+    if isinstance(value, bool):
+        text = "TRUE" if value else "FALSE"
+        return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+            text = str(value)
+            return f'<c r="{ref}" t="inlineStr"><is><t>{_xml_escape(text)}</t></is></c>'
+        return f'<c r="{ref}"><v>{value}</v></c>'
+    text = str(value)
+    preserve = ' xml:space="preserve"' if text != text.strip() else ""
+    return f'<c r="{ref}" t="inlineStr"><is><t{preserve}>{_xml_escape(text)}</t></is></c>'
+
+
+def _excel_sheet_xml(rows: List[List[Any]]) -> str:
+    body: List[str] = []
+    for row_idx, row in enumerate(rows, start=1):
+        cells = "".join(_excel_cell_xml(row_idx, col_idx, value) for col_idx, value in enumerate(row))
+        body.append(f'<row r="{row_idx}">{cells}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>'
+        + "".join(body)
+        + "</sheetData></worksheet>"
+    )
+
+
+def _write_xlsx_workbook(path: str, sheets: List[Tuple[str, List[List[Any]]]]) -> None:
+    """Write a minimal XLSX workbook using only the Python standard library."""
+    used_names: set = set()
+    named_sheets = [(_excel_safe_sheet_name(name, used_names), rows) for name, rows in sheets]
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    workbook_sheets = []
+    workbook_rels = []
+    content_overrides = []
+    for idx, (name, _rows) in enumerate(named_sheets, start=1):
+        workbook_sheets.append(f'<sheet name="{_xml_escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>')
+        workbook_rels.append(
+            f'<Relationship Id="rId{idx}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{idx}.xml"/>'
+        )
+        content_overrides.append(
+            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + "".join(content_overrides)
+        + "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        "<sheets>"
+        + "".join(workbook_sheets)
+        + "</sheets></workbook>"
+    )
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(workbook_rels)
+        + "</Relationships>"
+    )
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        for idx, (_name, rows) in enumerate(named_sheets, start=1):
+            zf.writestr(f"xl/worksheets/sheet{idx}.xml", _excel_sheet_xml(rows))
+
+
+def _latency_rank_value(row: Dict[str, Any], rank_name: str, metric: str) -> Optional[float]:
+    per_rank = ((row.get("latency_us") or {}).get("per_rank") or {}).get(rank_name) or {}
+    value = per_rank.get(metric)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _flatten_result_for_analysis(row: Dict[str, Any]) -> Dict[str, Any]:
+    workload = row.get("workload") or {}
+    requested = row.get("requested_config") or {}
+    actual = row.get("actual_config") or {}
+    instrumentation = row.get("instrumentation") or {}
+    latency = row.get("latency_us") or {}
+    routing_actual = ((row.get("routing_control") or {}).get("actual") or {})
+    dispatch_summary = routing_actual.get("observed_dispatch_matrix_summary") or {}
+    hist_summary = routing_actual.get("observed_expert_histogram_summary") or {}
+    kernel_breakdown = row.get("kernel_breakdown") or {}
+    return {
+        "num_tokens": workload.get("num_tokens"),
+        "per_rank_num_tokens": json.dumps(workload.get("per_rank_num_tokens")),
+        "requested_backend": requested.get("backend"),
+        "requested_comm_method": requested.get("comm_method"),
+        "requested_parallel_mode": requested.get("parallel_mode"),
+        "requested_cuda_graph": requested.get("cuda_graph"),
+        "requested_low_precision_combine": requested.get("use_low_precision_moe_combine"),
+        "actual_backend": actual.get("backend"),
+        "actual_comm_method": actual.get("comm_method"),
+        "scheduler_kind": actual.get("scheduler_kind"),
+        "actual_moe_ep_size": actual.get("moe_ep_size"),
+        "actual_moe_tp_size": actual.get("moe_tp_size"),
+        "actual_attention_dp": actual.get("enable_attention_dp"),
+        "num_chunks": actual.get("num_chunks"),
+        "status": row.get("status"),
+        "skip_reason": row.get("skip_reason"),
+        "score_us": latency.get("score"),
+        "score_type": latency.get("score_type"),
+        "rank0_mean_us": _latency_rank_value(row, "rank0", "mean"),
+        "rank1_mean_us": _latency_rank_value(row, "rank1", "mean"),
+        "rank2_mean_us": _latency_rank_value(row, "rank2", "mean"),
+        "rank3_mean_us": _latency_rank_value(row, "rank3", "mean"),
+        "rank0_p90_us": _latency_rank_value(row, "rank0", "p90"),
+        "rank1_p90_us": _latency_rank_value(row, "rank1", "p90"),
+        "rank2_p90_us": _latency_rank_value(row, "rank2", "p90"),
+        "rank3_p90_us": _latency_rank_value(row, "rank3", "p90"),
+        "autotune_status": instrumentation.get("autotune_status"),
+        "latency_source": instrumentation.get("latency_source"),
+        "analysis_level": instrumentation.get("level"),
+        "kernel_breakdown_available": instrumentation.get("kernel_breakdown_available"),
+        "bottleneck": row.get("bottleneck"),
+        "moe_forward_kernel_count": len(kernel_breakdown.get("moe_forward_kernels") or []),
+        "other_kernel_count": len(kernel_breakdown.get("other_kernels") or []),
+        "routing_path": routing_actual.get("routing_path"),
+        "routing_realization_status": (routing_actual.get("routing_realization") or {}).get("status"),
+        "routing_observation_source": routing_actual.get("observation_source"),
+        "routing_off_diagonal_ratio": dispatch_summary.get("off_diagonal_ratio"),
+        "routing_active_experts": hist_summary.get("active_experts"),
+    }
+
+
+_ANALYSIS_COLUMNS: Tuple[str, ...] = (
+    "num_tokens",
+    "requested_parallel_mode",
+    "requested_backend",
+    "requested_comm_method",
+    "requested_cuda_graph",
+    "requested_low_precision_combine",
+    "actual_backend",
+    "actual_comm_method",
+    "scheduler_kind",
+    "actual_moe_ep_size",
+    "actual_moe_tp_size",
+    "actual_attention_dp",
+    "num_chunks",
+    "status",
+    "skip_reason",
+    "score_us",
+    "score_type",
+    "rank0_mean_us",
+    "rank1_mean_us",
+    "rank2_mean_us",
+    "rank3_mean_us",
+    "rank0_p90_us",
+    "rank1_p90_us",
+    "rank2_p90_us",
+    "rank3_p90_us",
+    "autotune_status",
+    "latency_source",
+    "analysis_level",
+    "kernel_breakdown_available",
+    "bottleneck",
+    "moe_forward_kernel_count",
+    "other_kernel_count",
+    "routing_path",
+    "routing_realization_status",
+    "routing_observation_source",
+    "routing_off_diagonal_ratio",
+    "routing_active_experts",
+    "per_rank_num_tokens",
+)
+
+
+def _analysis_table_rows(flat_rows: List[Dict[str, Any]]) -> List[List[Any]]:
+    return [list(_ANALYSIS_COLUMNS)] + [[row.get(col) for col in _ANALYSIS_COLUMNS] for row in flat_rows]
+
+
+def _best_by_workload_rows(rankings: List[Dict[str, Any]]) -> List[List[Any]]:
+    rows: List[List[Any]] = [
+        [
+            "num_tokens",
+            "parallel_mode",
+            "backend",
+            "requested_backend",
+            "comm_method",
+            "cuda_graph",
+            "score_us",
+            "status",
+            "skip_reason",
+            "autotune_status",
+        ]
+    ]
+    for ranking in rankings:
+        best = ranking.get("best") or {}
+        rows.append(
+            [
+                ranking.get("num_tokens"),
+                ranking.get("parallel_mode"),
+                best.get("backend"),
+                best.get("requested_backend"),
+                best.get("comm_method"),
+                best.get("cuda_graph"),
+                best.get("score_us"),
+                best.get("status"),
+                best.get("skip_reason"),
+                best.get("autotune_status"),
+            ]
+        )
+    return rows
+
+
+def _status_summary_rows(flat_rows: List[Dict[str, Any]]) -> List[List[Any]]:
+    counts: Dict[Tuple[Any, Any, Any, Any], Dict[str, Any]] = {}
+    for row in flat_rows:
+        key = (
+            row.get("num_tokens"),
+            row.get("requested_backend"),
+            row.get("requested_comm_method"),
+            row.get("status"),
+        )
+        entry = counts.setdefault(key, {"count": 0, "reasons": set()})
+        entry["count"] += 1
+        if row.get("skip_reason"):
+            entry["reasons"].add(str(row["skip_reason"]))
+    out: List[List[Any]] = [["num_tokens", "requested_backend", "requested_comm_method", "status", "count", "reasons"]]
+    for (num_tokens, backend, comm_method, status), entry in sorted(
+        counts.items(),
+        key=lambda item: (str(item[0][0]), str(item[0][1]), str(item[0][2]), str(item[0][3])),
+    ):
+        out.append(
+            [
+                num_tokens,
+                backend,
+                comm_method,
+                status,
+                entry["count"],
+                " | ".join(sorted(entry["reasons"])),
+            ]
+        )
+    return out
+
+
+def _workload_sheets(flat_rows: List[Dict[str, Any]]) -> List[Tuple[str, List[List[Any]]]]:
+    grouped: Dict[Any, List[Dict[str, Any]]] = {}
+    for row in flat_rows:
+        grouped.setdefault(row.get("num_tokens"), []).append(row)
+    sheets: List[Tuple[str, List[List[Any]]]] = []
+    for num_tokens, rows in sorted(grouped.items(), key=lambda item: str(item[0])):
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                row.get("score_us") is None,
+                row.get("score_us") if row.get("score_us") is not None else 0.0,
+                str(row.get("requested_backend")),
+                str(row.get("requested_comm_method")),
+            ),
+        )
+        sheets.append((f"workload_{num_tokens}", _analysis_table_rows(sorted_rows)))
+    return sheets
+
+
+def _build_analysis_workbook_sheets(payload: Dict[str, Any]) -> List[Tuple[str, List[List[Any]]]]:
+    rows = payload.get("results") or []
+    flat_rows = [_flatten_result_for_analysis(row) for row in rows]
+    return [
+        ("all_results", _analysis_table_rows(flat_rows)),
+        ("best_by_workload", _best_by_workload_rows(payload.get("rankings") or [])),
+        ("status_summary", _status_summary_rows(flat_rows)),
+        *_workload_sheets(flat_rows),
+    ]
+
+
+def _default_analysis_workbook_path(output_file: Optional[str]) -> Optional[str]:
+    if not output_file:
+        return None
+    root, _ext = os.path.splitext(output_file)
+    return f"{root}.analysis.xlsx"
+
+
+def _write_analysis_workbook(payload: Dict[str, Any], path: str) -> None:
+    _write_xlsx_workbook(path, _build_analysis_workbook_sheets(payload))
+
+
+@dataclass(frozen=True)
+class _BenchmarkContext:
+    model: ModelSpec
+    workloads: List[WorkloadSpec]
+    base_config: ConfigSpec
+    search: SearchSpec
+    analysis: Tuple[str, ...]
+    act_dtype: torch.dtype
+    routing_logits_dtype: torch.dtype
+
+
+def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
+    analysis = _parse_analysis(args.analysis)
+    model = _resolve_model_from_args(args)
+    workloads = _resolve_workloads_from_args(args)
+    base_config = _resolve_base_config_from_args(args)
+    search = _resolve_search_from_args(args, base_config)
+    act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    routing_logits_dtype = (
+        torch.float32 if model.routing_method_cls is DeepSeekV3MoeRoutingMethod else act_dtype
+    )
+    return _BenchmarkContext(
+        model=model,
+        workloads=workloads,
+        base_config=base_config,
+        search=search,
+        analysis=analysis,
+        act_dtype=act_dtype,
+        routing_logits_dtype=routing_logits_dtype,
+    )
+
+
+def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int) -> Dict[str, Any]:
+    return {
+        "benchmark": "bench_moe",
+        "launcher": launcher,
+        "model": ctx.model.to_dict(),
+        "search": ctx.search.to_dict(),
+        "world_size": world_size,
+        "analysis": list(ctx.analysis) or ["summary"],
+        "workloads": [
+            w.to_dict(per_rank_num_tokens=_per_rank_tokens(w, world_size)) for w in ctx.workloads
+        ],
+        "base_config": ctx.base_config.to_dict(),
+    }
+
+
+def _build_report_payload(
+    *,
+    ctx: _BenchmarkContext,
+    results: List[RunResult],
+    world_size: int,
+    cuda_graph_default: bool,
+) -> Dict[str, Any]:
+    return {
+        "benchmark": "bench_moe",
+        "environment": _build_environment_block(world_size, cuda_graph_default),
+        "model": ctx.model.to_dict(),
+        "search": ctx.search.to_dict(),
+        "base_config": ctx.base_config.to_dict(),
+        "results": [_runresult_to_row(r) for r in results],
+        "rankings": _build_rankings(results),
     }
 
 
@@ -3509,6 +4189,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Write the final dashboard JSON report to this path.",
+    )
+    output_group.add_argument(
+        "--analysis_workbook_file",
+        type=str,
+        default=None,
+        help=(
+            "Write an Excel workbook with all candidate rows, per-workload sheets, "
+            "best configs, and status summaries. Defaults to <output_file>.analysis.xlsx."
+        ),
     )
     args = parser.parse_args()
     provided = set()
@@ -4008,6 +4697,8 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
         set_if_unset("time_budget_minutes", float(cfg["time_budget_minutes"]))
     if "output_file" in cfg:
         set_if_unset("output_file", cfg["output_file"])
+    if "analysis_workbook_file" in cfg:
+        set_if_unset("analysis_workbook_file", cfg["analysis_workbook_file"])
     return args
 
 
@@ -4018,11 +4709,11 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
 
 def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: str) -> None:
     args = _maybe_load_config_file(args)
-    analysis = _parse_analysis(args.analysis)
+    ctx = _resolve_benchmark_context(args)
 
     # CUPTI MUST be initialized before the CUDA context is created.
     _early_cupti_ctx: Optional[Any] = None
-    if args.cuda_graph and "kernels" in analysis:
+    if args.cuda_graph and "kernels" in ctx.analysis:
         _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
         if _cupti_ok:
             _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
@@ -4037,31 +4728,9 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    model = _resolve_model_from_args(args)
-    workloads = _resolve_workloads_from_args(args)
-    base_config = _resolve_base_config_from_args(args)
-    search = _resolve_search_from_args(args, base_config)
-
-    act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    routing_logits_dtype = (
-        torch.float32 if model.routing_method_cls is DeepSeekV3MoeRoutingMethod else act_dtype
-    )
-
     # Early header (rank 0) for stdout consumers.
-    header = {
-        "benchmark": "bench_moe",
-        "launcher": launcher,
-        "model": model.to_dict(),
-        "search": search.to_dict(),
-        "world_size": world_size,
-        "analysis": list(analysis) or ["summary"],
-        "workloads": [
-            w.to_dict(per_rank_num_tokens=_per_rank_tokens(w, world_size)) for w in workloads
-        ],
-        "base_config": base_config.to_dict(),
-    }
     if rank == 0:
-        print(json.dumps(header, indent=2), flush=True)
+        print(json.dumps(_build_worker_header(ctx, launcher, world_size), indent=2), flush=True)
 
     results: List[RunResult] = []
     skipped_global: List[Tuple[WorkloadSpec, ConfigSpec, str]] = []
@@ -4070,31 +4739,27 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     if args.time_budget_minutes is not None and args.time_budget_minutes > 0:
         deadline = time.monotonic() + args.time_budget_minutes * 60.0
 
-    for workload in workloads:
+    for workload in ctx.workloads:
         candidates, skipped = expand_and_prune(
-            base_config=base_config,
-            search=search,
-            model=model,
+            base_config=ctx.base_config,
+            search=ctx.search,
+            model=ctx.model,
             world_size=world_size,
-            act_dtype=act_dtype,
+            act_dtype=ctx.act_dtype,
             max_configs=args.max_configs,
         )
 
         # Record every pruned candidate as a skipped result row so dashboards
         # see the full search space.
         for cand, reason in skipped.items():
-            r = RunResult(model=model, workload=workload, config=cand)
-            r.status = "skipped"
-            r.skip_reason = reason
-            r.per_rank_num_tokens = _per_rank_tokens(workload, world_size)
-            r.status_per_rank = {f"rank{i}": "skipped" for i in range(world_size)}
-            r.instrumentation = {
-                "level": ",".join(sorted(analysis)) if analysis else "summary",
-                "cuda_graph": bool(cand.cuda_graph),
-                "cupti_available": False,
-                "phase_timing_available": False,
-                "kernel_breakdown_available": False,
-            }
+            r = _make_skipped_run_result(
+                model=ctx.model,
+                workload=workload,
+                config=cand,
+                world_size=world_size,
+                analysis=ctx.analysis,
+                reason=reason,
+            )
             results.append(r)
             skipped_global.append((workload, cand, reason))
 
@@ -4104,11 +4769,14 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                     "[bench_moe] --time_budget_minutes exceeded; remaining candidates "
                     "will be reported as skipped."
                 )
-                r = RunResult(model=model, workload=workload, config=cand)
-                r.status = "skipped"
-                r.skip_reason = "time_budget_exceeded"
-                r.per_rank_num_tokens = _per_rank_tokens(workload, world_size)
-                r.status_per_rank = {f"rank{i}": "skipped" for i in range(world_size)}
+                r = _make_skipped_run_result(
+                    model=ctx.model,
+                    workload=workload,
+                    config=cand,
+                    world_size=world_size,
+                    analysis=ctx.analysis,
+                    reason="time_budget_exceeded",
+                )
                 results.append(r)
                 continue
 
@@ -4119,18 +4787,18 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             _maybe_print_rank0(f"[bench_moe] running {case_label}")
 
             r = _run_one_candidate(
-                model=model,
+                model=ctx.model,
                 workload=workload,
                 config=cand,
                 world_size=world_size,
                 rank=rank,
                 device=device,
-                act_dtype=act_dtype,
-                routing_logits_dtype=routing_logits_dtype,
+                act_dtype=ctx.act_dtype,
+                routing_logits_dtype=ctx.routing_logits_dtype,
                 warmup=int(args.warmup),
                 iters=int(args.iters),
                 fast_autotune=bool(args.fast_autotune),
-                analysis=analysis,
+                analysis=ctx.analysis,
                 cupti_ctx=_early_cupti_ctx,
             )
             results.append(r)
@@ -4138,17 +4806,9 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 print(json.dumps(_runresult_to_row(r), indent=2), flush=True)
 
     if rank == 0:
-        rows = [_runresult_to_row(r) for r in results]
-        rankings = _build_rankings(results)
-        out_payload = {
-            "benchmark": "bench_moe",
-            "environment": _build_environment_block(world_size, bool(args.cuda_graph)),
-            "model": model.to_dict(),
-            "search": search.to_dict(),
-            "base_config": base_config.to_dict(),
-            "results": rows,
-            "rankings": rankings,
-        }
+        out_payload = _build_report_payload(
+            ctx=ctx, results=results, world_size=world_size, cuda_graph_default=bool(args.cuda_graph)
+        )
         if args.output_file:
             out_dir = os.path.dirname(args.output_file)
             if out_dir:
@@ -4156,16 +4816,26 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             with open(args.output_file, "w") as f:
                 json.dump(out_payload, f, indent=2)
             print(f"Report written to {args.output_file}", flush=True)
+            workbook_file = getattr(args, "analysis_workbook_file", None) or _default_analysis_workbook_path(
+                args.output_file
+            )
+            if workbook_file:
+                _write_analysis_workbook(out_payload, workbook_file)
+                print(f"Analysis workbook written to {workbook_file}", flush=True)
         else:
             # Echo a one-shot summary block at the end so headless invocations
             # still produce machine-readable output on stdout.
             print(
                 json.dumps(
-                    {"rankings": rankings},
+                    {"rankings": out_payload["rankings"]},
                     indent=2,
                 ),
                 flush=True,
             )
+            workbook_file = getattr(args, "analysis_workbook_file", None)
+            if workbook_file:
+                _write_analysis_workbook(out_payload, workbook_file)
+                print(f"Analysis workbook written to {workbook_file}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4239,13 +4909,21 @@ def main() -> None:
         _run_benchmark_worker_under_current_mpi(args, launcher="inline_single_rank")
         return
 
-    import cloudpickle
-    from mpi4py.futures import MPIPoolExecutor
+    if _cloudpickle is None or _MPIPoolExecutor is None:
+        missing = [
+            name
+            for name, mod in (("cloudpickle", _cloudpickle), ("mpi4py.futures", _MPIPoolExecutor))
+            if mod is None
+        ]
+        raise RuntimeError(
+            f"--world_size > 1 self-spawn launcher requires {', '.join(missing)}; "
+            "either install the missing package(s) or run the benchmark under mpirun/srun."
+        )
 
-    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    _cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(  # type: ignore[attr-defined]
-        cloudpickle.dumps,
-        cloudpickle.loads,
+        _cloudpickle.dumps,
+        _cloudpickle.loads,
         pickle.HIGHEST_PROTOCOL,
     )
 
@@ -4265,8 +4943,8 @@ def main() -> None:
             flush=True,
         )
 
-    args_blob = cloudpickle.dumps(args)
-    executor = MPIPoolExecutor(max_workers=world_size, env=_WORKER_ENV)
+    args_blob = _cloudpickle.dumps(args)
+    executor = _MPIPoolExecutor(max_workers=world_size, env=_WORKER_ENV)
     try:
         _ = list(executor.map(_spawn_worker_main, [args_blob] * world_size))
     finally:

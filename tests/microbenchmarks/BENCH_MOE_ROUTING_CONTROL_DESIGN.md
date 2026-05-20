@@ -23,64 +23,25 @@
 
 ## 当前状态
 
-`WorkloadSpec` 目前的 workload knob 混合了几个不同概念：
+`WorkloadSpec` 现在只保留 `num_tokens` 和显式 `routing_control`：
 
 ```python
 @dataclass(frozen=True)
 class WorkloadSpec:
     num_tokens: int
-    rank_imbalance_ratio: float = 0.0
-    expert_distribution: str = "balanced_patch"
-    expert_hotspot_ratio: float = 0.0
+    routing_control: RoutingControlSpec = field(default_factory=RoutingControlSpec)
 ```
 
-`rank_imbalance_ratio` 当前控制的是全局输入 token 如何切分到 source ranks：
+旧的 `rank_imbalance_ratio` / `expert_distribution` / `expert_hotspot_ratio`
+/ `force_balance_patch` CLI 已移除，避免同一 workload shape 有多套入口。
+用户需要直接表达三个独立轴：
 
-```python
-def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
-    ratio = float(workload.rank_imbalance_ratio)
-    return _distribute_tokens(int(workload.num_tokens), world_size, ratio)
-```
+- Source-rank token count：默认由 `num_tokens` 均分；需要倾斜时显式传 `--per_rank_num_tokens 128 128 512 128`。
+- Source→target dispatch traffic：显式传 `--comm_pattern ...`。
+- Target-rank 内 expert histogram：显式传 `--expert_pattern ...`。
 
-### `rank_imbalance_ratio` 的用途和用法
-
-`rank_imbalance_ratio` 是历史 workload knob，语义是 **source rank local token count skew**，不是 communication target skew。
-
-它的输入范围是 `[0, 1]`：
-
-- `0.0`：全局 `num_tokens` 尽量均匀切到所有 ranks；余数放到 rank0。
-- `1.0`：rank0 拿走全部 `num_tokens`，其他 ranks 的 local token 数为 0。
-- `(0, 1)`：在均匀切分和 rank0 全热点之间插值。
-
-例如 `world_size=4`、`num_tokens=16`：
-
-```text
-rank_imbalance_ratio=0.0 -> per_rank_num_tokens=[4, 4, 4, 4]
-rank_imbalance_ratio=0.5 -> per_rank_num_tokens=[10, 2, 2, 2]
-rank_imbalance_ratio=1.0 -> per_rank_num_tokens=[16, 0, 0, 0]
-```
-
-它适合研究：
-
-- source rank 本地 routing / quantize / dispatch pack 工作量不均衡；
-- `max(all_rank_num_tokens)` 变化带来的 workspace、padding、chunking 变化；
-- slowest-rank synchronization 和 source-side tail latency。
-
-它不适合用来研究：
-
-- target rank receive hotspot；
-- `src -> dst` pair hotspot；
-- expert 内部 token histogram skew。
-
-这些通信和 compute 形态应该由 `comm_pattern`、`expert_pattern` 或显式 `dispatch_matrix` / `expert_histogram` 控制。新设计中保留 `rank_imbalance_ratio` 只是为了兼容旧命令；新用法应优先使用 `--per_rank_num_tokens` 来显式表达 source-rank token 分布。
-
-这对研究 source-side skew 和 slowest-rank synchronization 有价值，但它不能直接控制 dispatch traffic matrix：
-
-```text
-dispatch_matrix[src_rank][dst_rank]
-```
-
-当前 expert hotspot 控制是通过 layerwise benchmark helper patch routing 实现的。它可以影响 expert selection，但不会把生成出的 source-to-target matrix 或 expert histogram 作为一等 benchmark 数据暴露出来。
+这样 `dispatch_matrix[src][dst]` 和 `expert_histogram[dst][local_expert]`
+都来自同一套 routing-control plan，不再依赖 legacy helper patch 的隐式映射。
 
 ## 性能模型
 
@@ -139,10 +100,11 @@ hot experts:      [1024, 0, 0, 0]
 --expert_pattern hotspot,active_experts=2
 --expert_pattern file:path/to/histogram.json
 
---routing_scenario balanced_baseline|receiver_hotspot_75|pair_hotspot_50|local_only_baseline
---per_rank_num_tokens 128,128,512,128
+--per_rank_num_tokens 128 128 512 128
 --routing_dump_matrix
 ```
+
+用户必须显式提供 `--comm_pattern` 和 `--expert_pattern`（默认值分别为 `balanced_alltoall` 和 `balanced`）。早期版本曾提供 `--routing_scenario` preset 把常用组合压缩成一个名字，已在后续重构中移除：合并语义（preset 默认值 vs 用户显式值）容易让"用户传了一个等于默认值的 flag"被静默吞掉，且 4 个 preset 用 4 个原子 flag 完全可以表达，没有保留必要。
 
 `--comm_pattern` 的输入矩阵总是按 **slot traffic** 解释：
 
@@ -181,14 +143,6 @@ benchmark 也必须在输出里报告 distinct-token traffic，但输入文件�
 - 仅对 `routing_mode=native` 生效。
 - 当 requested pattern 无法被当前 routing type 精确表达时，直接跳过该 case，并给出清晰原因。
 - 适合用户不希望 benchmark 静默改变请求 workload 的调试场景。
-
-`--routing_scenario`
-
-- 是常用组合的 preset，展开后仍然落到 `routing_mode`、`projection_policy`、`comm_pattern` 和 `expert_pattern`。
-- `balanced_baseline` 等价于 `routing_mode=native --comm_pattern balanced_alltoall --expert_pattern balanced`。
-- `receiver_hotspot_75` 等价于 `routing_mode=native --projection_policy project --comm_pattern receiver_hotspot,hotness=0.75,rank=0`。
-- `pair_hotspot_50` 等价于 `routing_mode=native --projection_policy project --comm_pattern pair_hotspot,hotness=0.5,src=0,dst=1`。
-- `local_only_baseline` 等价于 `routing_mode=native --projection_policy reject --comm_pattern local_only`。
 
 ### 通信模式
 
@@ -331,7 +285,7 @@ v1 中 routing control 与 `eplb_mode != off` 互斥并 reject。
 benchmark 应该支持：
 
 ```bash
---per_rank_num_tokens 128,128,512,128
+--per_rank_num_tokens 128 128 512 128
 ```
 
 以及 JSON config：
@@ -610,11 +564,8 @@ num_tokens: int
 routing_control: RoutingControlSpec
 ```
 
-过渡期保留旧 knobs 作为 deprecated aliases：
-
-- `rank_imbalance_ratio` 映射为 source-token-skew compatibility mode，并应在 actual output 中报告为 `per_rank_num_tokens`。
-- `expert_hotspot_ratio` 映射为 `expert_pattern=hotspot,hotness=<value>`。
-- `force_balance_patch` 等价于 `routing_mode=forced --comm_pattern balanced_alltoall --expert_pattern balanced`。这是为了保留旧路径的性能语义：历史上 forced balance patch 会绕过部分 native routing 行为。
+旧 knobs 不再作为 deprecated aliases 保留。Source-token skew、expert hotspot
+和 forced supplied-topk 都必须通过 `routing_control` 的显式字段表达。
 
 ### Matrix Generation
 
@@ -731,7 +682,7 @@ GPU validation 单独做：
 ## 已关闭的设计决策
 
 1. 输入 `dispatch_matrix` 文件解释为 slot traffic。actual output 默认记录 summary；启用 `--routing_dump_matrix` 时记录完整 slot traffic 和 distinct-token traffic。
-2. `rank_imbalance_ratio` 过渡期保留为 source-token skew 的兼容 alias，但新文档应该推荐 `per_rank_num_tokens`。
+2. `rank_imbalance_ratio` 已移除；source-token skew 统一使用 `per_rank_num_tokens`。
 3. 如果 planning helpers 被抽出文件，helper tests 应放在 `tests/unittest/_torch/modules/moe/`；如果 helpers 仍是 `bench_moe.py` 私有实现，则可以放在 benchmark 旁边。
 4. v1 中 routing control 与 `eplb_mode != off` 互斥。
 5. v1 中 `scale_distribution` 固定为 `uniform`，不作为用户输入。
