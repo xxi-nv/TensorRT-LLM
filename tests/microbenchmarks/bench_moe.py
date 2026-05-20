@@ -24,7 +24,7 @@ JSON suitable for dashboard ingestion.
 The search space is:
 
 ```text
-backend x communication x EPLB x parallel mode x CUDA graph x combine precision
+backend x communication x parallel mode x CUDA graph x combine precision
 ```
 
 For each ``(model, num_tokens, workload modifier)`` point the benchmark
@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import copy
 import ctypes
 import getpass
 import itertools
@@ -71,7 +70,6 @@ import sys
 import tempfile
 import time
 import traceback
-import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -137,10 +135,6 @@ from tensorrt_llm._torch.modules.fused_moe.interface import (  # noqa: E402
     MoESchedulerKind,
     MoEWeightLoadingMode,
 )
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (  # noqa: E402
-    MoeLoadBalancer,
-    MoeLoadBalancerIterContext,
-)
 from tensorrt_llm._utils import (  # noqa: E402
     local_mpi_rank,
     mpi_allgather,
@@ -148,21 +142,15 @@ from tensorrt_llm._utils import (  # noqa: E402
     mpi_rank,
     mpi_world_size,
 )
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig  # noqa: E402
-from tensorrt_llm.tools.layer_wise_benchmarks.runner import (  # noqa: E402
-    BalanceMethod,
-    make_balanced_routing_method,
-    make_balanced_run_moe,
-    make_forward_impl_check,
-)
+from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Output schema version
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +288,7 @@ class RoutingControlSpec:
     projection_policy: str = "project"  # "project" | "reject"
     comm_pattern: str = "balanced_alltoall"
     expert_pattern: str = "balanced"
+    routing_pattern_file: Optional[str] = None
     per_rank_num_tokens: Optional[Tuple[int, ...]] = None
     routing_dump_matrix: bool = False
     seed: int = 0
@@ -310,6 +299,7 @@ class RoutingControlSpec:
             "projection_policy": self.projection_policy,
             "comm_pattern": self.comm_pattern,
             "expert_pattern": self.expert_pattern,
+            "routing_pattern_file": self.routing_pattern_file,
             "per_rank_num_tokens": (
                 list(int(v) for v in self.per_rank_num_tokens)
                 if self.per_rank_num_tokens is not None
@@ -323,14 +313,14 @@ class RoutingControlSpec:
     def is_active(self) -> bool:
         """True when this spec asks for non-default routing behaviour.
 
-        Used to decide whether to dispatch through the new routing-control
-        path or fall back to legacy ``expert_hotspot_ratio`` / balanced-patch
-        behaviour.
+        Used to decide whether to dispatch through routing-control planning or
+        keep the normal benchmark path.
         """
         return (
             self.routing_mode != "native"
             or self.comm_pattern != "balanced_alltoall"
             or self.expert_pattern != "balanced"
+            or self.routing_pattern_file is not None
             or self.per_rank_num_tokens is not None
         )
 
@@ -340,17 +330,11 @@ class WorkloadSpec:
     """Workload for one timing case after the model is fixed."""
 
     num_tokens: int
-    rank_imbalance_ratio: float = 0.0
-    expert_distribution: str = "balanced_patch"  # "balanced_patch" | "hotspot"
-    expert_hotspot_ratio: float = 0.0
     routing_control: RoutingControlSpec = field(default_factory=RoutingControlSpec)
 
     def to_dict(self, per_rank_num_tokens: Optional[List[int]] = None) -> Dict[str, Any]:
         return {
             "num_tokens": int(self.num_tokens),
-            "rank_imbalance_ratio": float(self.rank_imbalance_ratio),
-            "expert_distribution": self.expert_distribution,
-            "expert_hotspot_ratio": float(self.expert_hotspot_ratio),
             "per_rank_num_tokens": (
                 [int(v) for v in per_rank_num_tokens] if per_rank_num_tokens is not None else None
             ),
@@ -368,12 +352,8 @@ class ConfigSpec:
     moe_tp_size: Optional[int] = None
     enable_attention_dp: Optional[bool] = None
     comm_method: str = "AUTO"
-    eplb_mode: str = "off"  # "off" | "static" | "dynamic"
-    num_slots: Optional[int] = None
-    layer_updates_per_iter: Optional[int] = None
     cuda_graph: bool = True
     use_low_precision_moe_combine: bool = False
-    per_case_subprocess: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -383,12 +363,8 @@ class ConfigSpec:
             "moe_tp_size": self.moe_tp_size,
             "enable_attention_dp": self.enable_attention_dp,
             "comm_method": self.comm_method,
-            "eplb_mode": self.eplb_mode,
-            "num_slots": self.num_slots,
-            "layer_updates_per_iter": self.layer_updates_per_iter,
             "cuda_graph": bool(self.cuda_graph),
             "use_low_precision_moe_combine": bool(self.use_low_precision_moe_combine),
-            "per_case_subprocess": bool(self.per_case_subprocess),
         }
 
 
@@ -396,11 +372,10 @@ class ConfigSpec:
 class SearchSpec:
     """Description of which ConfigSpec axes to expand into candidates."""
 
-    mode: str = "none"  # "none" | "backend" | "comm" | "parallel" | "eplb" | "full"
+    mode: str = "none"  # "none" | "backend" | "comm" | "parallel" | "full" | comma-joined axes
     backends: Tuple[str, ...] = ()
     parallel_modes: Tuple[str, ...] = ()
     comm_methods: Tuple[str, ...] = ()
-    eplb_modes: Tuple[str, ...] = ()
     cuda_graph_options: Tuple[bool, ...] = ()
     combine_precision_options: Tuple[bool, ...] = ()
 
@@ -410,7 +385,6 @@ class SearchSpec:
             "backends": list(self.backends),
             "parallel_modes": list(self.parallel_modes),
             "comm_methods": list(self.comm_methods),
-            "eplb_modes": list(self.eplb_modes),
             "cuda_graph_options": [bool(v) for v in self.cuda_graph_options],
             "combine_precision_options": [bool(v) for v in self.combine_precision_options],
         }
@@ -647,37 +621,35 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def _distribute_tokens(total: int, world_size: int, ratio: float) -> List[int]:
-    """Distribute ``total`` global tokens across ``world_size`` ranks.
-
-    ``ratio == 0`` -> evenly distributed (remainder on rank 0).
-    ``ratio == 1`` -> rank 0 takes everything; other ranks get 0.
-    """
-    if world_size <= 0 or total < 0 or not (0.0 <= ratio <= 1.0):
-        raise ValueError(f"invalid args: total={total}, world_size={world_size}, ratio={ratio}")
+def _distribute_tokens(total: int, world_size: int) -> List[int]:
+    """Distribute ``total`` global tokens evenly across ``world_size`` ranks."""
+    if world_size <= 0 or total < 0:
+        raise ValueError(f"invalid args: total={total}, world_size={world_size}")
     if world_size == 1:
         return [total]
-
     base = total // world_size
-    if ratio == 0.0:
-        out = [base] * world_size
-        out[0] += total - base * world_size
-        return out
-    rank0 = base + round((total - base) * ratio)
-    rank0 = min(rank0, total)
-    rest_total = total - rank0
-    others = rest_total // (world_size - 1)
-    out = [rank0] + [others] * (world_size - 1)
-    out[1] += rest_total - others * (world_size - 1)
+    out = [base] * world_size
+    out[0] += total - base * world_size
     return out
 
 
 def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
     """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
-    # ``num_tokens`` is always global; ``rank_imbalance_ratio`` controls how much
-    # of the balanced share moves to rank 0.
-    ratio = float(workload.rank_imbalance_ratio)
-    return _distribute_tokens(int(workload.num_tokens), world_size, ratio)
+    per_rank = workload.routing_control.per_rank_num_tokens
+    if per_rank is None:
+        return _distribute_tokens(int(workload.num_tokens), world_size)
+    out = [int(v) for v in per_rank]
+    if len(out) != world_size:
+        raise ValueError(
+            f"per_rank_num_tokens has length {len(out)}, expected world_size={world_size}"
+        )
+    if sum(out) != int(workload.num_tokens):
+        raise ValueError(
+            f"sum(per_rank_num_tokens)={sum(out)} must equal num_tokens={workload.num_tokens}"
+        )
+    if any(v < 0 for v in out):
+        raise ValueError("per_rank_num_tokens entries must be >= 0")
+    return out
 
 
 def _make_inputs(
@@ -801,54 +773,14 @@ def _build_pretrained_config(
     return pc
 
 
-def _resolve_eplb_internals(
-    config: ConfigSpec, model: ModelSpec, mapping: Mapping
-) -> Tuple[bool, int, int]:
-    """Map ``eplb_mode`` to ``(enable_eplb, num_slots, layer_updates_per_iter)``.
-
-    ``static`` enables the load balancer with ``layer_updates_per_iter=0`` and
-    a friendly slot default; ``dynamic`` enables runtime updates with a larger
-    slot capacity. An explicit ``num_slots`` / ``layer_updates_per_iter`` on
-    the ConfigSpec overrides the friendly defaults.
-    """
-    if config.eplb_mode == "off":
-        return False, -1, -1
-
-    ep_size = max(int(mapping.moe_ep_size), 1)
-    num_experts = int(model.num_experts)
-
-    def _round_up(value: int, multiple: int) -> int:
-        if multiple <= 0:
-            return value
-        return ((value + multiple - 1) // multiple) * multiple
-
-    if config.eplb_mode == "static":
-        default_slots = _round_up(num_experts + ep_size, ep_size)
-        layer_updates = 0
-    elif config.eplb_mode == "dynamic":
-        default_slots = _round_up(num_experts * 2, ep_size)
-        layer_updates = 1
-    else:
-        raise ValueError(f"Unknown eplb_mode={config.eplb_mode!r}")
-
-    num_slots = int(config.num_slots) if config.num_slots is not None else default_slots
-    if config.layer_updates_per_iter is not None:
-        layer_updates = int(config.layer_updates_per_iter)
-    return True, num_slots, layer_updates
-
-
 def _build_model_config(
     *,
     model: ModelSpec,
-    config: ConfigSpec,
     mapping: Mapping,
     moe_backend: str,
     use_cuda_graph: bool,
     max_num_tokens: int,
     use_low_precision_moe_combine: bool,
-    enable_eplb: bool,
-    num_slots: int,
-    layer_updates_per_iter: int,
     dtype: torch.dtype,
 ) -> ModelConfig:
     """Build ``ModelConfig`` plumbed into ``create_moe``."""
@@ -861,22 +793,12 @@ def _build_model_config(
         QuantConfig(quant_algo=None) if quant_algo is None else QuantConfig(quant_algo=quant_algo)
     )
 
-    moe_load_balancer_config = (
-        MoeLoadBalancerConfig(
-            num_slots=num_slots,
-            layer_updates_per_iter=layer_updates_per_iter,
-        )
-        if enable_eplb
-        else None
-    )
-
     return ModelConfig(
         pretrained_config=pretrained_config,
         mapping=mapping,
         quant_config=quant_config,
         moe_backend=moe_backend,
         moe_disable_finalize_fusion=False,
-        moe_load_balancer=moe_load_balancer_config,
         max_num_tokens=max(int(max_num_tokens), 1),
         use_cuda_graph=use_cuda_graph,
         use_low_precision_moe_combine=use_low_precision_moe_combine,
@@ -949,9 +871,6 @@ def _build_moe_module(
     use_cuda_graph: bool,
     max_num_tokens: int,
     use_low_precision_moe_combine: bool,
-    enable_eplb: bool,
-    num_slots: int,
-    layer_updates_per_iter: int,
     enable_perfect_router: bool,
     dtype: torch.dtype,
     routing_logits_dtype: torch.dtype,
@@ -959,8 +878,7 @@ def _build_moe_module(
 ):
     """Build a fresh ``ConfigurableMoE`` for one ``(backend, num_tokens)`` case.
 
-    Returns ``(moe_module, moe_load_balancer or None, initial_expert_ids or None,
-    routing_logits_dtype)``.
+    Returns ``(moe_module, routing_logits_dtype)``.
     """
     if enable_perfect_router:
         os.environ["ENABLE_PERFECT_ROUTER"] = "1"
@@ -980,15 +898,11 @@ def _build_moe_module(
 
     model_config = _build_model_config(
         model=model,
-        config=config,
         mapping=mapping,
         moe_backend=moe_backend,
         use_cuda_graph=use_cuda_graph,
         max_num_tokens=max_num_tokens,
         use_low_precision_moe_combine=use_low_precision_moe_combine,
-        enable_eplb=enable_eplb,
-        num_slots=num_slots,
-        layer_updates_per_iter=layer_updates_per_iter,
         dtype=dtype,
     )
 
@@ -1023,64 +937,35 @@ def _build_moe_module(
         quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
     )
 
-    if enable_eplb:
-        model_config.moe_load_balancer.setup(
-            ep_rank=mapping.moe_ep_rank, ep_size=mapping.moe_ep_size
-        )
-        moe_load_balancer = MoeLoadBalancer(
-            ep_rank=mapping.moe_ep_rank,
-            ep_size=mapping.moe_ep_size,
-            layer_updates_per_iter=model_config.moe_load_balancer.layer_updates_per_iter,
-        )
-    else:
-        moe_load_balancer = None
-
-    eplb_ctx = moe_load_balancer if moe_load_balancer is not None else contextlib.nullcontext()
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
-    with eplb_ctx:
-        moe = create_moe(
-            routing_method=routing_method,
-            num_experts=mc.num_experts,
-            hidden_size=mc.hidden_size,
-            intermediate_size=mc.intermediate_size,
-            dtype=dtype,
-            reduce_results=True,
-            model_config=model_config,
-            weight_loading_mode=weight_loading_mode,
-            bias=swiglu_gptoss_style,
-            swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-            swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-            swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+    moe = create_moe(
+        routing_method=routing_method,
+        num_experts=mc.num_experts,
+        hidden_size=mc.hidden_size,
+        intermediate_size=mc.intermediate_size,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=model_config,
+        weight_loading_mode=weight_loading_mode,
+        bias=swiglu_gptoss_style,
+        swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
+        swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
+        swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+    )
+
+    if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(
+            moe, **quant_kwargs
         )
+    else:
+        weights = quantize_util.create_weights(**quant_kwargs)
 
-        if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-            weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(
-                moe, **quant_kwargs
-            )
-        else:
-            weights = quantize_util.create_weights(**quant_kwargs)
+    moe.load_weights([weights])
+    moe.post_load_weights()
+    moe.cuda(f"cuda:{torch.cuda.current_device()}")
 
-        if enable_eplb:
-            for key, value in weights.items():
-                if isinstance(value, torch.Tensor):
-                    weights[key] = value.to("cpu")
-
-        moe.load_weights([weights])
-        moe.post_load_weights()
-        moe.cuda(f"cuda:{torch.cuda.current_device()}")
-
-        initial_expert_ids = None
-        if moe_load_balancer is not None:
-            moe_load_balancer.register_weight_slots_after_to_cuda()
-            moe_load_balancer.finalize_model()
-            moe_load_balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
-            if moe_load_balancer.single_layer_load_balancers:
-                initial_expert_ids = copy.deepcopy(
-                    moe_load_balancer.single_layer_load_balancers[0].get_old_rank_expert_ids()
-                )
-
-    return moe, moe_load_balancer, initial_expert_ids, routing_logits_dtype
+    return moe, routing_logits_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -1158,38 +1043,10 @@ _COMM_PATTERN_NAMES: Tuple[str, ...] = (
 _EXPERT_PATTERN_NAMES: Tuple[str, ...] = ("balanced", "hotspot")
 
 
-_ROUTING_SCENARIOS: Dict[str, Dict[str, str]] = {
-    "balanced_baseline": {
-        "routing_mode": "native",
-        "projection_policy": "project",
-        "comm_pattern": "balanced_alltoall",
-        "expert_pattern": "balanced",
-    },
-    "receiver_hotspot_75": {
-        "routing_mode": "native",
-        "projection_policy": "project",
-        "comm_pattern": "receiver_hotspot,hotness=0.75,rank=0",
-        "expert_pattern": "balanced",
-    },
-    "pair_hotspot_50": {
-        "routing_mode": "native",
-        "projection_policy": "project",
-        "comm_pattern": "pair_hotspot,hotness=0.5,src=0,dst=1",
-        "expert_pattern": "balanced",
-    },
-    "local_only_baseline": {
-        "routing_mode": "native",
-        "projection_policy": "reject",
-        "comm_pattern": "local_only",
-        "expert_pattern": "balanced",
-    },
-}
-
-
 def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:
     """Parse ``name,k1=v1,k2=v2`` into ``(name, {k1: v1, k2: v2})``.
 
-    A spec starting with ``file:`` is returned as ``("file", {"path": <rest>})``.
+    File-based routing control is handled by ``--routing_pattern_file``.
     """
     raw = str(spec).strip()
     if not raw:
@@ -1212,11 +1069,9 @@ def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:
 def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     name, raw = _parse_pattern_spec(spec)
     if name == "file":
-        return "file", {"path": raw["path"]}
+        raise ValueError("comm_pattern no longer accepts file:<path>; use --routing_pattern_file")
     if name not in _COMM_PATTERN_NAMES:
-        raise ValueError(
-            f"unknown comm_pattern {name!r}; supported: {_COMM_PATTERN_NAMES} or 'file:<path>'"
-        )
+        raise ValueError(f"unknown comm_pattern {name!r}; supported: {_COMM_PATTERN_NAMES}")
     kwargs: Dict[str, Any] = {}
     if "hotness" in raw:
         kwargs["hotness"] = float(raw["hotness"])
@@ -1241,11 +1096,9 @@ def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
 def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     name, raw = _parse_pattern_spec(spec)
     if name == "file":
-        return "file", {"path": raw["path"]}
+        raise ValueError("expert_pattern no longer accepts file:<path>; use --routing_pattern_file")
     if name not in _EXPERT_PATTERN_NAMES:
-        raise ValueError(
-            f"unknown expert_pattern {name!r}; supported: {_EXPERT_PATTERN_NAMES} or 'file:<path>'"
-        )
+        raise ValueError(f"unknown expert_pattern {name!r}; supported: {_EXPERT_PATTERN_NAMES}")
     kwargs: Dict[str, Any] = {}
     if "hotness" in raw:
         kwargs["hotness"] = float(raw["hotness"])
@@ -1260,30 +1113,6 @@ def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
             "expert_pattern hotspot requires hotness=<ratio> or active_experts=<count>"
         )
     return name, kwargs
-
-
-def _resolve_scenario(scenario: Optional[str], spec: RoutingControlSpec) -> RoutingControlSpec:
-    """Expand a routing-scenario preset into a concrete ``RoutingControlSpec``.
-
-    Explicit fields on ``spec`` win over preset defaults so users can layer
-    fine-grained overrides on top of a scenario name.
-    """
-    if scenario is None or scenario == "":
-        return spec
-    if scenario not in _ROUTING_SCENARIOS:
-        raise ValueError(
-            f"unknown routing_scenario {scenario!r}; supported: {sorted(_ROUTING_SCENARIOS)}"
-        )
-    preset = _ROUTING_SCENARIOS[scenario]
-    # Default fields from RoutingControlSpec(): allow preset to set them when
-    # caller left them at default; explicit non-default values on ``spec`` win.
-    default = RoutingControlSpec()
-    overrides: Dict[str, Any] = {}
-    for key, value in preset.items():
-        current = getattr(spec, key)
-        if current == getattr(default, key):
-            overrides[key] = value
-    return replace(spec, **overrides)
 
 
 # --- per-rank token / dispatch matrix / expert histogram builders ----------
@@ -1326,12 +1155,11 @@ def _build_per_rank_num_tokens(
     spec: RoutingControlSpec,
     num_tokens: int,
     world_size: int,
-    legacy_rank_imbalance_ratio: float = 0.0,
 ) -> List[int]:
     """Resolve ``per_rank_num_tokens`` for a workload.
 
-    Priority order: explicit ``spec.per_rank_num_tokens`` > legacy
-    ``rank_imbalance_ratio`` > uniform split.
+    Explicit ``spec.per_rank_num_tokens`` wins; otherwise tokens are split
+    evenly across ranks with any remainder on rank 0.
     """
     if spec.per_rank_num_tokens is not None:
         per_rank = [int(v) for v in spec.per_rank_num_tokens]
@@ -1346,7 +1174,7 @@ def _build_per_rank_num_tokens(
                 f"sum(per_rank_num_tokens)={sum(per_rank)} must equal num_tokens={num_tokens}"
             )
         return per_rank
-    return _distribute_tokens(int(num_tokens), world_size, float(legacy_rank_imbalance_ratio))
+    return _distribute_tokens(int(num_tokens), world_size)
 
 
 def _build_dispatch_matrix(
@@ -1448,8 +1276,6 @@ def _load_dispatch_matrix_file(path: str, ep_size: int) -> List[List[int]]:
     """Load and validate a ``file:<path>`` slot dispatch matrix."""
     with open(path) as f:
         payload = json.load(f)
-    if str(payload.get("schema", "")) != "v1":
-        raise ValueError(f"dispatch matrix {path!r}: unsupported schema {payload.get('schema')!r}")
     if int(payload.get("ep_size", -1)) != ep_size:
         raise ValueError(
             f"dispatch matrix {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
@@ -1470,8 +1296,6 @@ def _load_expert_histogram_file(path: str, ep_size: int, experts_per_rank: int) 
     """Load and validate a ``file:<path>`` expert histogram."""
     with open(path) as f:
         payload = json.load(f)
-    if str(payload.get("schema", "")) != "v1":
-        raise ValueError(f"expert histogram {path!r}: unsupported schema {payload.get('schema')!r}")
     if int(payload.get("ep_size", -1)) != ep_size:
         raise ValueError(
             f"expert histogram {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
@@ -1493,6 +1317,16 @@ def _load_expert_histogram_file(path: str, ep_size: int, experts_per_rank: int) 
     return [[int(v) for v in row] for row in histogram]
 
 
+def _load_routing_pattern_file(
+    path: str, ep_size: int, experts_per_rank: int
+) -> Tuple[List[List[int]], List[List[int]]]:
+    """Load a single file that fixes both dispatch traffic and expert histogram."""
+    return (
+        _load_dispatch_matrix_file(path, ep_size),
+        _load_expert_histogram_file(path, ep_size, experts_per_rank),
+    )
+
+
 def _build_routing_plan(
     spec: RoutingControlSpec,
     num_tokens: int,
@@ -1500,7 +1334,6 @@ def _build_routing_plan(
     top_k: int,
     num_experts: int,
     moe_ep_size: int,
-    legacy_rank_imbalance_ratio: float = 0.0,
 ) -> RoutingPlan:
     """Translate a ``RoutingControlSpec`` into a canonical normalised plan."""
     if moe_ep_size <= 0 or num_experts % moe_ep_size != 0:
@@ -1510,20 +1343,22 @@ def _build_routing_plan(
     experts_per_rank = num_experts // moe_ep_size
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
-    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size, legacy_rank_imbalance_ratio)
+    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size)
     # ``moe_ep_size`` may be smaller than ``world_size`` when MoE is replicated
     # across attention DP slots; the dispatch matrix indexing follows the EP
     # axis, but materialisation is still per source rank. For the v1 dispatch
     # matrix abstraction we use ``moe_ep_size`` as both axes.
-    if spec.comm_pattern.startswith("file:"):
-        dispatch_matrix = _load_dispatch_matrix_file(spec.comm_pattern[len("file:") :], moe_ep_size)
-    else:
-        dispatch_matrix = _build_dispatch_matrix(spec.comm_pattern, per_rank, top_k, moe_ep_size)
-    if spec.expert_pattern.startswith("file:"):
-        expert_histogram = _load_expert_histogram_file(
-            spec.expert_pattern[len("file:") :], moe_ep_size, experts_per_rank
+    if spec.routing_pattern_file:
+        if spec.comm_pattern != "balanced_alltoall" or spec.expert_pattern != "balanced":
+            raise ValueError(
+                "--routing_pattern_file cannot be combined with non-default "
+                "--comm_pattern or --expert_pattern"
+            )
+        dispatch_matrix, expert_histogram = _load_routing_pattern_file(
+            spec.routing_pattern_file, moe_ep_size, experts_per_rank
         )
     else:
+        dispatch_matrix = _build_dispatch_matrix(spec.comm_pattern, per_rank, top_k, moe_ep_size)
         expert_histogram = _build_expert_histogram(
             spec.expert_pattern, dispatch_matrix, experts_per_rank, moe_ep_size
         )
@@ -1940,99 +1775,6 @@ def _make_supplied_topk_apply(
     return supplied_apply
 
 
-# ---------------------------------------------------------------------------
-# Routing-imbalance patch
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _PatchState:
-    moe: Any
-    routing_target: Any
-    apply_method_orig: Any
-    run_moe_orig: Any
-    forward_impl_orig: Any
-
-
-@contextlib.contextmanager
-def _maybe_install_balance_patch(
-    moe,
-    mapping: Mapping,
-    num_experts: int,
-    top_k: int,
-    expert_hotspot_ratio: float,
-    force_balance_patch: bool,
-):
-    """Patch routing/run_moe for synthetic per-expert hot-spot imbalance.
-
-    A pass-through context manager when both ``expert_hotspot_ratio`` and
-    ``force_balance_patch`` are unset. When active, follows the runner.py
-    pattern and restores all overridden methods on exit.
-    """
-    if expert_hotspot_ratio == 0.0 and not force_balance_patch:
-        yield
-        return
-
-    if expert_hotspot_ratio == 0.0:
-        balance_method = BalanceMethod.Balanced
-        balance_ratio = 1.0
-    else:
-        balance_method = BalanceMethod.ImbalancedExperts
-        # Inverse semantics: ``balance_ratio=0`` is fully imbalanced.
-        balance_ratio = 1.0 - expert_hotspot_ratio
-
-    dp_size = mapping.dp_size
-    dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
-    ep_size = mapping.moe_ep_size
-
-    routing_target = moe
-    apply_method_orig = routing_target.routing_method.apply
-    routing_target.routing_method.apply = make_balanced_routing_method(
-        routing_target,
-        apply_method_orig,
-        num_experts,
-        balance_method,
-        balance_ratio,
-        dp_size,
-        dp_rank,
-        ep_size,
-    )
-
-    inner_backend = getattr(moe, "backend", moe)
-    run_moe_orig = None
-    if isinstance(inner_backend, TRTLLMGenFusedMoE):
-        run_moe_orig = inner_backend.run_moe
-        inner_backend.run_moe = make_balanced_run_moe(
-            inner_backend,
-            run_moe_orig,
-            top_k,
-            num_experts,
-            balance_method,
-            balance_ratio,
-            dp_size,
-            dp_rank,
-            ep_size,
-        )
-
-    forward_impl_orig = moe.forward_impl
-    moe.forward_impl = make_forward_impl_check(moe, forward_impl_orig)
-
-    state = _PatchState(
-        moe=moe,
-        routing_target=routing_target,
-        apply_method_orig=apply_method_orig,
-        run_moe_orig=run_moe_orig,
-        forward_impl_orig=forward_impl_orig,
-    )
-    try:
-        yield
-    finally:
-        state.routing_target.routing_method.apply = state.apply_method_orig
-        if state.run_moe_orig is not None:
-            getattr(moe, "backend", moe).run_moe = state.run_moe_orig
-        state.moe.forward_impl = state.forward_impl_orig
-
-
 @contextlib.contextmanager
 def _maybe_install_routing_control_patch(
     moe,
@@ -2090,20 +1832,38 @@ def _run_autotune(
     x: torch.Tensor,
     router_logits: torch.Tensor,
     all_rank_num_tokens: List[int],
-    eplb: Optional[MoeLoadBalancer],
     fast_autotune: bool,
-) -> None:
-    """One untimed forward pass under ``autotune(...)`` to populate kernel caches."""
+) -> str:
+    """One untimed forward pass under ``autotune(...)`` to populate kernel caches.
+
+    Returns an autotune status string, one of:
+      - ``"success"``       : ran with the project default tuner settings
+      - ``"success:fast"``  : ran with ``--fast_autotune`` overrides (lower quality)
+      - ``"failed:<reason>"``: the autotune pass raised; caller decides whether to
+                              trust the subsequent timings
+
+    The function always restores ``AutoTuner`` singleton state on exit so that
+    ``--fast_autotune`` set for one case does not leak into the next.
+    """
+    tuner = AutoTuner.get()
+    saved_warmup = tuner.warmup
+    saved_repeat = tuner.repeat
+    saved_stream_delay = tuner.stream_delay_micro_secs
     if fast_autotune:
-        AutoTuner.get().warmup = 0
-        AutoTuner.get().repeat = 1
-        AutoTuner.get().stream_delay_micro_secs = 10
+        tuner.warmup = 0
+        tuner.repeat = 1
+        tuner.stream_delay_micro_secs = 10
 
     cache_path = os.path.join(tempfile.gettempdir(), "bench_moe_autotuner_cache.json")
-    iter_ctx = MoeLoadBalancerIterContext(eplb) if eplb is not None else contextlib.nullcontext()
-    with torch.inference_mode(), autotune(cache_path=cache_path), iter_ctx:
-        moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
-    torch.cuda.synchronize()
+    try:
+        with torch.inference_mode(), autotune(cache_path=cache_path):
+            moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+        torch.cuda.synchronize()
+        return "success:fast" if fast_autotune else "success"
+    finally:
+        tuner.warmup = saved_warmup
+        tuner.repeat = saved_repeat
+        tuner.stream_delay_micro_secs = saved_stream_delay
 
 
 # ---------------------------------------------------------------------------
@@ -2126,36 +1886,74 @@ def _time_moe_forward_eager(
     *,
     warmup: int,
     iters: int,
-    eplb: Optional[MoeLoadBalancer],
     flush_l2: bool = True,
+    collect_kernels: bool = True,
 ) -> Tuple[List[float], Dict[str, Any]]:
-    """Time eager ``ConfigurableMoE.forward`` with Kineto + ``record_function``."""
+    """Time eager ``ConfigurableMoE.forward``.
+
+    Latency is ALWAYS measured with pure ``torch.cuda.Event`` records so the
+    reported ``score_us`` is comparable across ``cuda_graph`` and eager paths
+    (the CUDA-Graph path also uses external CUDA events for its per-iter
+    window). When ``collect_kernels=True`` a separate, shorter profiler pass is
+    run only to gather the kernel breakdown; profiler-derived numbers are not
+    used to score the candidate.
+    """
     device = x.device if x.numel() > 0 else torch.device("cuda")
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
 
     def _do_forward():
-        ctx = MoeLoadBalancerIterContext(eplb) if eplb is not None else contextlib.nullcontext()
-        with torch.inference_mode(), ctx:
+        with torch.inference_mode():
             _ = moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
 
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
-        record_shapes=False,
-        with_stack=False,
-    ) as prof:
-        _sync()
-        for _ in range(warmup):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            _do_forward()
-        for _ in range(iters):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            with torch.profiler.record_function("moe_forward"):
-                _do_forward()
-
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     _sync()
-    return _parse_profiler_events_moe(list(prof.events()))
+    for _ in range(warmup):
+        if l2_buffer is not None:
+            l2_buffer.zero_()
+        _do_forward()
+    for i in range(iters):
+        if l2_buffer is not None:
+            l2_buffer.zero_()
+        starts[i].record()
+        _do_forward()
+        ends[i].record()
+    _sync()
+    forward_times_us = [starts[i].elapsed_time(ends[i]) * 1e3 for i in range(iters)]
+
+    detailed_stats: Dict[str, Any] = {
+        "moe_forward_kernels": [],
+        "other_kernels": [],
+    }
+    if not collect_kernels:
+        return forward_times_us, detailed_stats
+
+    # Separate profiler-only pass for kernel breakdown. Use a small fixed iter
+    # count (capped by ``iters``) so the profiler overhead does not dominate
+    # the case wall-clock budget. The latencies produced here are intentionally
+    # discarded; only the kernel categorisation is kept.
+    breakdown_iters = max(1, min(iters, 3))
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+            record_shapes=False,
+            with_stack=False,
+        ) as prof:
+            _sync()
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+            _do_forward()  # one warmup under profiler
+            for _ in range(breakdown_iters):
+                if l2_buffer is not None:
+                    l2_buffer.zero_()
+                with torch.profiler.record_function("moe_forward"):
+                    _do_forward()
+        _sync()
+        _, detailed_stats = _parse_profiler_events_moe(list(prof.events()))
+    except Exception as exc:
+        # Breakdown is best-effort; do not fail the case if Kineto misbehaves.
+        _maybe_print_rank0(f"[bench_moe] kernel breakdown skipped: {type(exc).__name__}: {exc}")
+    return forward_times_us, detailed_stats
 
 
 def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str, Any]]:
@@ -2356,7 +2154,7 @@ def _time_moe_forward_cuda_graph(
         _cupti_events = []
         _cupti_available = False
 
-    # ---- 1. Shape-discovery eager pass ----
+    # ---- 1. Pre-capture eager pass for shape discovery and lazy initialization.
     with torch.inference_mode():
         eager_out = moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
     if not isinstance(eager_out, torch.Tensor):
@@ -2389,10 +2187,6 @@ def _time_moe_forward_cuda_graph(
 
     big_graph = torch.cuda.CUDAGraph()
     with torch.inference_mode(), torch.cuda.graph(big_graph):
-        for _ in range(warmup):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
         for i in range(iters):
             if l2_buffer is not None:
                 l2_buffer.zero_()
@@ -2406,6 +2200,15 @@ def _time_moe_forward_cuda_graph(
         _cupti_events.clear()
 
     _sync()
+    for _ in range(warmup):
+        big_graph.replay()
+    _sync()
+
+    if _cupti_available:
+        _cupti.activity_flush_all(0)
+        _cupti_kernels.clear()
+        _cupti_events.clear()
+
     big_graph.replay()
     _sync()
 
@@ -2540,10 +2343,7 @@ def _classify_bottleneck(
             "score", 0.0
         ) or phase_times_us_agg.get("fused_comm_backend_run_moe", {}).get("score", 0.0)
         routing_us = phase_times_us_agg.get("routing", {}).get("score", 0.0)
-        eplb_us = sum(
-            v.get("score", 0.0) for k, v in phase_times_us_agg.items() if k.startswith("eplb_")
-        )
-        total = comm_us + gemm_us + routing_us + eplb_us
+        total = comm_us + gemm_us + routing_us
         if total <= 0:
             return None
         if comm_us / total > 0.5:
@@ -2552,8 +2352,6 @@ def _classify_bottleneck(
             return "compute_bound"
         if routing_us / total > 0.4:
             return "routing_bound"
-        if eplb_us / total > 0.4:
-            return "eplb_bound"
         return "unknown"
 
     # No phase markers: inspect kernel breakdown for a rough hint.
@@ -2594,28 +2392,26 @@ def expand_search(
     """Cartesian-product candidate generation, then explicit pruning.
 
     ``base_config`` carries the *non-search* fields (cuda_graph default,
-    combine precision default, eplb num_slots overrides). Search axes
+    combine precision default). Search axes
     explicitly listed on ``search`` override the base values.
     """
     backends = _expand_axis(search.backends, base_config.backend)
     parallel_modes = _expand_axis(search.parallel_modes, base_config.parallel_mode)
     comm_methods = _expand_axis(search.comm_methods, base_config.comm_method)
-    eplb_modes = _expand_axis(search.eplb_modes, base_config.eplb_mode)
     cuda_graph_options = _expand_axis(search.cuda_graph_options, base_config.cuda_graph)
     combine_options = _expand_axis(
         search.combine_precision_options, base_config.use_low_precision_moe_combine
     )
 
     candidates: List[ConfigSpec] = []
-    for backend, pmode, comm, eplb, cgraph, combine in itertools.product(
-        backends, parallel_modes, comm_methods, eplb_modes, cuda_graph_options, combine_options
+    for backend, pmode, comm, cgraph, combine in itertools.product(
+        backends, parallel_modes, comm_methods, cuda_graph_options, combine_options
     ):
         candidate = replace(
             base_config,
             backend=str(backend).upper(),
             parallel_mode=str(pmode).upper(),
             comm_method=str(comm).upper(),
-            eplb_mode=str(eplb).lower(),
             cuda_graph=bool(cgraph),
             use_low_precision_moe_combine=bool(combine),
         )
@@ -2629,7 +2425,7 @@ def is_candidate_valid(
     world_size: int,
     act_dtype: torch.dtype,
 ) -> Tuple[bool, Optional[str]]:
-    """Return ``(ok, reason)`` based on backend / mapping / EPLB / comm gates."""
+    """Return ``(ok, reason)`` based on backend / mapping / comm gates."""
     # Backend can_implement gate.
     ok, reason = _check_backend_can_implement(
         config.backend, model.quant_algo_enum, act_dtype, model.swiglu_gptoss_style
@@ -2642,10 +2438,6 @@ def is_candidate_valid(
         moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
         return False, str(exc)
-
-    # EPLB / CUDA Graph compatibility.
-    if config.eplb_mode == "dynamic" and config.cuda_graph:
-        return False, "dynamic EPLB is incompatible with CUDA Graph timing"
 
     # Forced communication on non-DP / MoE-TP paths.
     forced = config.comm_method.upper()
@@ -2734,12 +2526,24 @@ def _build_routing_control_block(
     scale_dtype: torch.dtype,
     moe_ep_size: int,
     dump_full: bool,
+    routing_mode: str,
 ) -> Dict[str, Any]:
     """Compose the ``routing_control`` block for a result row.
 
     Always includes ``requested`` and an ``actual`` summary; full slot/token
     matrices and histograms are included only when ``dump_full`` is set, to
     avoid JSON bloat during large sweeps.
+
+    NOTE on ``observed_*`` fields: the dispatch / histogram numbers reported
+    here are derived from a deterministic re-materialisation of the canonical
+    ``RoutingPlan`` -- they describe *the plan the bench asked the kernel to
+    realise*, not what the kernel actually emitted at runtime. The
+    ``actual.observation_source`` field documents this. In ``forced`` mode the
+    kernel is patched to consume the exact materialised top-k, so plan ==
+    kernel output by construction. In ``native`` mode the kernel routes via
+    projected logits and may produce slightly different top-k due to fp ties,
+    quantisation, or projection-status='projected'; a warning is added so the
+    consumer does not over-trust the slot/histogram numbers.
     """
     requested_slot = [list(row) for row in plan.dispatch_matrix]
     max_abs, max_rel = _observe_summary(requested_slot, observed_slot)
@@ -2754,12 +2558,21 @@ def _build_routing_control_block(
     hist_max = max(flat_hist) if flat_hist else 0
     active_experts = sum(1 for v in flat_hist if v > 0)
 
+    warnings_out = list(warnings)
+    if routing_mode != "forced":
+        warnings_out.append(
+            "observed_* fields are derived from RoutingPlan re-materialisation, "
+            "not from the kernel's actual selected_experts output; in native mode "
+            "the real top-k may differ from the plan."
+        )
+
     block: Dict[str, Any] = {
         "requested": {
             "routing_mode": spec.routing_mode,
             "projection_policy": spec.projection_policy,
             "comm_pattern": spec.comm_pattern,
             "expert_pattern": spec.expert_pattern,
+            "routing_pattern_file": spec.routing_pattern_file,
             "per_rank_num_tokens": list(plan.per_rank_num_tokens),
             "seed": int(spec.seed),
         },
@@ -2778,6 +2591,11 @@ def _build_routing_control_block(
             if isinstance(num_chunks_observed, int)
             else None,
             "use_dp_padding": False,
+            # "plan_exact": forced mode (kernel is patched to the materialised
+            # plan, so observed == plan by construction).
+            # "plan_simulation": native mode (numbers are a deterministic
+            # re-materialisation of the plan, NOT the kernel's actual top-k).
+            "observation_source": ("plan_exact" if routing_mode == "forced" else "plan_simulation"),
             "observed_dispatch_matrix_summary": {
                 "row_sums": row_sums,
                 "col_sums": col_sums,
@@ -2795,7 +2613,7 @@ def _build_routing_control_block(
                 "dtype": str(scale_dtype),
                 "seed": int(spec.seed),
             },
-            "warnings": list(warnings),
+            "warnings": warnings_out,
         },
     }
     if dump_full:
@@ -2821,7 +2639,6 @@ def _run_one_candidate(
     fast_autotune: bool,
     analysis: Tuple[str, ...],
     cupti_ctx: Optional[Any],
-    force_balance_patch: bool,
 ) -> RunResult:
     """Build, autotune, and time one ``ConfigSpec`` candidate.
 
@@ -2843,11 +2660,19 @@ def _run_one_candidate(
         result.status_per_rank = _gather_status_per_rank("skipped")
         return result
 
-    # EPLB mutex (design says v1 rejects routing control with eplb_mode != off).
-    if rc_active and config.eplb_mode != "off":
+    # Routing-control's dispatch_matrix axis is ``moe_ep_size`` while
+    # ``per_rank_num_tokens`` follows the world (DP source) axis. When the two
+    # axes disagree (DTP / TTP / CUSTOM with ``moe_ep_size != world_size``) the
+    # plan would either crash inside ``_build_routing_plan`` (slot total
+    # mismatch) or silently drop the tokens of world ranks beyond
+    # ``moe_ep_size``. Skip cleanly so dashboards do not record meaningless
+    # latencies for an unsupported combination.
+    if rc_active and int(moe_ep_size) != int(world_size):
         reason = (
-            "routing_control is mutually exclusive with eplb_mode != off in v1; "
-            "EPLB slot remapping is not yet supported"
+            f"routing-control requires moe_ep_size == world_size "
+            f"(got moe_ep_size={moe_ep_size}, world_size={world_size}); "
+            "the dispatch_matrix axis would not align with the per-rank token "
+            "distribution. Use parallel_mode in {DEP, TEP} or drop routing-control."
         )
         result.status = "skipped"
         result.skip_reason = reason
@@ -2870,7 +2695,6 @@ def _run_one_candidate(
                 top_k=int(model.top_k),
                 num_experts=int(model.num_experts),
                 moe_ep_size=int(moe_ep_size),
-                legacy_rank_imbalance_ratio=float(workload.rank_imbalance_ratio),
             )
         except Exception as exc:
             reason = f"routing plan error: {type(exc).__name__}: {exc}"
@@ -2898,6 +2722,8 @@ def _run_one_candidate(
         "cupti_available": bool(cupti_ctx is not None and cupti_ctx[3]),
         "phase_timing_available": False,
         "kernel_breakdown_available": "kernels" in analysis,
+        "autotune_status": "not_run",
+        "latency_source": "cuda_event_external" if config.cuda_graph else "cuda_event_eager",
     }
     result.instrumentation = instrumentation
 
@@ -2917,15 +2743,6 @@ def _run_one_candidate(
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()
 
-    # Resolve EPLB internals.
-    try:
-        enable_eplb, num_slots, layer_updates = _resolve_eplb_internals(config, model, mapping)
-    except ValueError as exc:
-        result.status = "skipped"
-        result.skip_reason = str(exc)
-        result.status_per_rank = _gather_status_per_rank("skipped")
-        return result
-
     # Force comm method via env var (per-case).
     prev_force_comm = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
     _force_comm_env(config.comm_method, prev_force_comm)
@@ -2941,17 +2758,13 @@ def _run_one_candidate(
                 rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
             )
     else:
-        enable_perfect_router = (
-            workload.expert_distribution == "balanced_patch"
-            and workload.expert_hotspot_ratio == 0.0
-            and not force_balance_patch
-        )
+        enable_perfect_router = True
 
-    moe = moe_load_balancer = None
+    moe = None
     local_status = "success"
     try:
         try:
-            moe, moe_load_balancer, _initial_expert_ids, _ = _build_moe_module(
+            moe, _ = _build_moe_module(
                 model=model,
                 config=config,
                 mapping=mapping,
@@ -2959,9 +2772,6 @@ def _run_one_candidate(
                 use_cuda_graph=bool(config.cuda_graph),
                 max_num_tokens=max(int(local_num_tokens), 1),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
-                enable_eplb=enable_eplb,
-                num_slots=int(num_slots),
-                layer_updates_per_iter=int(layer_updates),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
                 routing_logits_dtype=routing_logits_dtype,
@@ -3077,6 +2887,7 @@ def _run_one_candidate(
                         scale_dtype=act_dtype,
                         moe_ep_size=int(moe_ep_size),
                         dump_full=bool(rc_spec.routing_dump_matrix),
+                        routing_mode=rc_spec.routing_mode,
                     )
                     return result
                 router_logits = new_logits
@@ -3090,35 +2901,24 @@ def _run_one_candidate(
                         f"routing_realization={projection_status}: {projection_reason}"
                     )
 
-        with (
-            _maybe_install_balance_patch(
-                moe,
-                mapping,
-                model.num_experts,
-                model.top_k,
-                float(workload.expert_hotspot_ratio)
-                if workload.expert_distribution == "hotspot" and not rc_active
-                else 0.0,
-                bool(force_balance_patch) and not rc_active,
-            ),
-            _maybe_install_routing_control_patch(
-                moe,
-                materialized_ids,
-                materialized_scales,
-                active=(rc_active and rc_spec.routing_mode == "forced"),
-            ),
+        with _maybe_install_routing_control_patch(
+            moe,
+            materialized_ids,
+            materialized_scales,
+            active=(rc_active and rc_spec.routing_mode == "forced"),
         ):
             try:
-                _run_autotune(
+                autotune_status = _run_autotune(
                     moe,
                     x,
                     router_logits,
                     all_rank_num_tokens,
-                    moe_load_balancer,
                     bool(fast_autotune),
                 )
             except Exception as exc:
+                autotune_status = f"failed:{type(exc).__name__}: {exc}"
                 _maybe_print_rank0(f"[bench_moe] autotune skipped: {type(exc).__name__}: {exc}")
+            result.instrumentation["autotune_status"] = autotune_status
 
             try:
                 if config.cuda_graph:
@@ -3139,7 +2939,7 @@ def _run_one_candidate(
                         all_rank_num_tokens,
                         warmup=int(warmup),
                         iters=int(iters),
-                        eplb=moe_load_balancer,
+                        collect_kernels="kernels" in analysis,
                     )
             except Exception as exc:
                 reason = f"timed phase error: {type(exc).__name__}: {exc}"
@@ -3213,6 +3013,7 @@ def _run_one_candidate(
                 scale_dtype=act_dtype,
                 moe_ep_size=int(moe_ep_size),
                 dump_full=bool(rc_spec.routing_dump_matrix),
+                routing_mode=rc_spec.routing_mode,
             )
 
         result.status_per_rank = _gather_status_per_rank(local_status)
@@ -3221,11 +3022,6 @@ def _run_one_candidate(
         if moe is not None:
             try:
                 moe.destroy()
-            except Exception:
-                pass
-        if moe_load_balancer is not None:
-            try:
-                moe_load_balancer.shutdown()
             except Exception:
                 pass
         # Restore TRTLLM_FORCE_COMM_METHOD.
@@ -3289,17 +3085,20 @@ def _build_rankings(results: List[RunResult]) -> List[Dict[str, Any]]:
         ranking_entries: List[Dict[str, Any]] = []
         for r in items:
             score = r.latency_us.get("score") if r.latency_us else None
+            autotune_status = (
+                r.instrumentation.get("autotune_status") if r.instrumentation else None
+            )
             ranking_entries.append(
                 {
                     "backend": r.actual_backend or r.config.backend,
                     "requested_backend": r.config.backend,
                     "comm_method": r.actual_comm_method,
-                    "eplb_mode": r.config.eplb_mode,
                     "cuda_graph": r.config.cuda_graph,
                     "use_low_precision_moe_combine": r.config.use_low_precision_moe_combine,
                     "score_us": float(score) if isinstance(score, (int, float)) else None,
                     "status": r.status,
                     "skip_reason": r.skip_reason,
+                    "autotune_status": autotune_status,
                 }
             )
         ranking_entries.sort(
@@ -3308,8 +3107,20 @@ def _build_rankings(results: List[RunResult]) -> List[Dict[str, Any]]:
                 e["score_us"] if e["score_us"] is not None else 0.0,
             )
         )
+        # ``best`` excludes cases whose autotune pass failed: their score is
+        # likely a not-yet-tuned slow path and would mislead the
+        # "which config is fastest" question.
         best = next(
-            (e for e in ranking_entries if e["score_us"] is not None and e["status"] == "success"),
+            (
+                e
+                for e in ranking_entries
+                if e["score_us"] is not None
+                and e["status"] == "success"
+                and not (
+                    isinstance(e.get("autotune_status"), str)
+                    and e["autotune_status"].startswith("failed")
+                )
+            ),
             None,
         )
         rankings.append(
@@ -3392,73 +3203,100 @@ def _build_environment_block(world_size: int, cuda_graph_default: bool) -> Dict[
 # ---------------------------------------------------------------------------
 
 
-_DEPRECATED_HELP = " (deprecated; see new flag in --help)"
-
-
 def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    group = parser.add_argument_group("Search and sweep")
+    group.add_argument(
         "--search",
         type=lambda s: str(s).lower(),
-        default="none",
-        choices=("none", "backend", "comm", "parallel", "eplb", "full"),
-        help="Search preset; expands the corresponding axis of the candidate space.",
+        nargs="+",
+        default=("none",),
+        help=(
+            "Expand one or more runtime axes. Examples: --search backend --backend ALL; "
+            "--search backend comm; --search full. Comma-separated input is also accepted."
+        ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--max_configs",
         type=int,
         default=None,
-        help="Truncate the valid candidate list to at most this many entries.",
+        help="Run at most this many valid candidate configs after pruning. Example: --max_configs 32.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--time_budget_minutes",
         type=float,
         default=None,
-        help="Stop launching new candidates once this wall-clock budget elapses.",
-    )
-    parser.add_argument(
-        "--per_case_subprocess",
-        action="store_true",
-        help=(
-            "Recommended for large dashboard sweeps: runs each candidate in a "
-            "fresh worker process. Currently a no-op stub that warns; falls "
-            "back to in-process execution."
-        ),
+        help="Stop launching new candidates after this wall-clock budget. Example: --time_budget_minutes 30.",
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MoE module microbenchmark (MPI). Times ConfigurableMoE.forward."
+        description="MoE module microbenchmark (MPI). Times ConfigurableMoE.forward.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    launch_group = parser.add_argument_group("Launch")
+    launch_group.add_argument(
         "--world_size",
         type=int,
         default=None,
         help="Number of MPI worker ranks to spawn (ignored under external mpirun).",
     )
 
-    # ---- Model / shape ----
-    parser.add_argument(
+    model_group = parser.add_argument_group("Model and shape")
+    model_group.add_argument(
         "--model",
         type=str,
         default=None,
         choices=sorted(BUILT_IN_MODELS.keys()),
-        help="Named model spec (overridable via individual flags below).",
+        help=(
+            "Built-in model shape. Examples: deepseek_v3, qwen1.5_moe. "
+            "Omit only when passing all custom shape fields below."
+        ),
     )
-    parser.add_argument("--num_experts", type=int, default=None)
-    parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--hidden_size", type=int, default=None)
-    parser.add_argument("--intermediate_size", type=int, default=None)
-    parser.add_argument("--n_group", type=int, default=None)
-    parser.add_argument("--topk_group", type=int, default=None)
-    parser.add_argument(
+    model_group.add_argument(
+        "--num_experts",
+        type=int,
+        default=None,
+        help="Custom-shape total expert count. Required when --model is omitted.",
+    )
+    model_group.add_argument(
+        "--top_k",
+        type=int,
+        default=None,
+        help="Custom-shape experts selected per token. Required when --model is omitted.",
+    )
+    model_group.add_argument(
+        "--hidden_size",
+        type=int,
+        default=None,
+        help="Custom-shape hidden size. Required when --model is omitted.",
+    )
+    model_group.add_argument(
+        "--intermediate_size",
+        type=int,
+        default=None,
+        help="Custom-shape MoE intermediate size. Required when --model is omitted.",
+    )
+    model_group.add_argument(
+        "--n_group",
+        type=int,
+        default=None,
+        help="DeepSeek-style routing group count for custom grouped routing.",
+    )
+    model_group.add_argument(
+        "--topk_group",
+        type=int,
+        default=None,
+        help="DeepSeek-style number of routing groups kept per token.",
+    )
+    model_group.add_argument(
         "--quant",
         type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
         default=None,
         choices=[q.name for q in QuantAlgo],
-        help="Quantization algorithm.",
+        help="Quantization algorithm. Example: --quant FP8_BLOCK_SCALES.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--routing_method",
         type=lambda s: str(s).upper(),
         default="AUTO",
@@ -3469,59 +3307,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # ---- Workload ----
-    parser.add_argument(
+    workload_group = parser.add_argument_group("Workload shape")
+    workload_group.add_argument(
+        "--balanced_total_num_tokens",
         "--num_tokens",
+        dest="balanced_total_num_tokens",
         type=int,
         nargs="+",
         required=False,
-        help="Global token counts to sweep; each value is split across ranks.",
-    )
-    parser.add_argument(
-        "--rank_imbalance_ratio",
-        type=float,
-        default=0.0,
-        help="In [0, 1]. 0=balanced rank split; 1=all global tokens on rank 0.",
-    )
-    parser.add_argument(
-        "--rank_hotspot_ratio",
-        type=float,
-        default=None,
-        help="Deprecated alias for --rank_imbalance_ratio." + _DEPRECATED_HELP,
-    )
-    parser.add_argument(
-        "--tokens_per_rank_imbalance_ratio",
-        type=float,
-        default=None,
-        help="Deprecated alias for --rank_imbalance_ratio." + _DEPRECATED_HELP,
-    )
-    parser.add_argument(
-        "--expert_distribution",
-        type=lambda s: str(s).lower(),
-        default="balanced_patch",
-        choices=("balanced_patch", "hotspot"),
-        help="Synthetic expert assignment used for routing logits.",
-    )
-    parser.add_argument(
-        "--expert_hotspot_ratio",
-        type=float,
-        default=0.0,
-        help="In [0, 1]. 0=balanced; >0 concentrates tokens on hot experts.",
-    )
-    parser.add_argument(
-        "--experts_hot_imbalane_ratio",
-        type=float,
-        default=None,
-        help="Deprecated alias for --expert_hotspot_ratio." + _DEPRECATED_HELP,
-    )
-    parser.add_argument(
-        "--force_balance_patch",
-        action="store_true",
-        help="Force the balanced routing patch even when expert_hotspot_ratio == 0.",
+        help=(
+            "Global token counts to sweep. Each value is balanced across ranks "
+            "with any remainder on rank 0. Example: --balanced_total_num_tokens 64 256 1024."
+        ),
     )
 
-    # ---- Routing control (see BENCH_MOE_ROUTING_CONTROL_DESIGN.md) ----
-    parser.add_argument(
+    routing_group = parser.add_argument_group("Routing control")
+    routing_group.add_argument(
         "--routing_mode",
         type=lambda s: str(s).lower(),
         default="native",
@@ -3531,7 +3332,7 @@ def parse_args() -> argparse.Namespace:
             "forced: supply top-k ids/scales directly (skips fused scoring)."
         ),
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--projection_policy",
         type=lambda s: str(s).lower(),
         default="project",
@@ -3541,173 +3342,177 @@ def parse_args() -> argparse.Namespace:
             "the closest legal projection and warn; reject: skip the case instead."
         ),
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--comm_pattern",
         type=str,
         default="balanced_alltoall",
         help=(
             "Source-to-target slot dispatch pattern. Examples: balanced_alltoall, "
             "receiver_hotspot,hotness=0.75,rank=0, pair_hotspot,hotness=0.5,src=0,dst=1, "
-            "local_only, ring, file:path/to/matrix.json"
+            "local_only, ring."
         ),
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--expert_pattern",
         type=str,
         default="balanced",
         help=(
             "Per-target-rank local expert histogram pattern. Examples: balanced, "
-            "hotspot,hotness=0.5, hotspot,active_experts=2, file:path/to/histogram.json"
+            "hotspot,hotness=0.5, hotspot,active_experts=2."
         ),
     )
-    parser.add_argument(
-        "--routing_scenario",
+    routing_group.add_argument(
+        "--routing_pattern_file",
         type=str,
         default=None,
-        choices=sorted(_ROUTING_SCENARIOS),
-        help=(
-            "Routing scenario preset; expands to routing_mode/projection_policy/"
-            "comm_pattern/expert_pattern unless they are explicitly overridden."
-        ),
+        help="JSON file that provides both slot_dispatch_matrix and expert_histogram.",
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--per_rank_num_tokens",
-        type=str,
+        type=int,
+        nargs="+",
         default=None,
         help=(
-            "Explicit per-rank token counts, comma-separated (length must equal "
-            "world_size). Independent of comm_pattern; sum must equal --num_tokens."
+            "Explicit per-rank input token counts. Length must equal world_size "
+            "and sum defines the workload total. Mutually exclusive with --balanced_total_num_tokens."
         ),
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--routing_dump_matrix",
         action="store_true",
         help="Include the full observed slot/token matrix and expert histogram in each result row.",
     )
-    parser.add_argument(
+    routing_group.add_argument(
         "--routing_seed",
         type=int,
         default=0,
-        help="Seed for deterministic routing-plan materialisation.",
+        help="Seed for deterministic routing-plan materialisation; independent from --random_seed.",
     )
 
-    # ---- Parallel mode ----
-    parser.add_argument(
+    parallel_group = parser.add_argument_group("Parallel layout")
+    parallel_group.add_argument(
         "--parallel_mode",
         type=str,
         default="DEP",
         choices=("DEP", "TEP", "DTP", "TTP", "CUSTOM"),
-        help="Parallel mode (combined with world_size).",
+        help=(
+            "Parallel layout. DEP=attention DP + MoE EP; TEP=attention TP + MoE EP; "
+            "DTP/TTP use MoE TP; CUSTOM requires --moe_ep_size and --moe_tp_size."
+        ),
     )
-    parser.add_argument("--moe_ep_size", type=int, default=None)
-    parser.add_argument("--moe_tp_size", type=int, default=None)
-    parser.add_argument("--enable_attention_dp", action="store_true")
-
-    # ---- EPLB ----
-    parser.add_argument(
-        "--eplb_mode",
-        type=lambda s: str(s).lower(),
-        default="off",
-        choices=("off", "static", "dynamic"),
-        help="EPLB mode (replaces --enable_eplb / --layer_updates_per_iter).",
+    parallel_group.add_argument(
+        "--moe_ep_size",
+        type=int,
+        default=None,
+        help="CUSTOM only: MoE expert-parallel size. Must multiply with --moe_tp_size to world_size.",
     )
-    parser.add_argument("--num_slots", type=int, default=None)
-    parser.add_argument("--layer_updates_per_iter", type=int, default=None)
-    parser.add_argument(
-        "--enable_eplb",
+    parallel_group.add_argument(
+        "--moe_tp_size",
+        type=int,
+        default=None,
+        help="CUSTOM only: MoE tensor-parallel size. Must multiply with --moe_ep_size to world_size.",
+    )
+    parallel_group.add_argument(
+        "--enable_attention_dp",
         action="store_true",
-        default=False,
-        help="Deprecated; use --eplb_mode static|dynamic." + _DEPRECATED_HELP,
+        help="CUSTOM only: enable attention data parallelism for the mapping.",
     )
 
-    # ---- Backend ----
-    parser.add_argument(
+    runtime_group = parser.add_argument_group("Runtime backend and communication")
+    runtime_group.add_argument(
         "--backend",
         type=lambda s: str(s).upper(),
         default="TRTLLM",
-        choices=_ALL_BACKENDS + ["BEST", "ALL"],
+        choices=_ALL_BACKENDS + ["ALL"],
         help=(
-            "Backend to bench. ``BEST`` is a deprecated shortcut for "
-            "``--search backend --backend ALL``; ``ALL`` expands to every "
-            "ConfigurableMoE-eligible backend when --search backend is set."
+            "MoE backend to benchmark. Use --search backend --backend ALL to scan all "
+            "ConfigurableMoE-eligible backends."
         ),
     )
-
-    # ---- Communication ----
-    parser.add_argument(
+    runtime_group.add_argument(
         "--comm_method",
         type=lambda s: str(s).upper(),
         default="AUTO",
         choices=_COMM_METHODS,
-        help="Per-case forced communication method (replaces --force_comm_method).",
-    )
-    parser.add_argument(
-        "--force_comm_method",
-        type=lambda s: str(s).upper(),
-        default=None,
-        choices=tuple(_FORCED_COMM_ENV_VALUES.keys()),
-        help="Deprecated alias for --comm_method." + _DEPRECATED_HELP,
+        help="Communication method. AUTO lets TensorRT-LLM select; other values force a specific path.",
     )
 
-    # ---- Timing ----
-    parser.add_argument(
+    timing_group = parser.add_argument_group("Timing")
+    timing_group.add_argument(
         "--no_cuda_graph",
         dest="cuda_graph",
         action="store_false",
         default=True,
-        help=("Disable CUDA-Graph capture and use eager timing. Required for dynamic EPLB."),
+        help="Disable CUDA-Graph capture and use eager timing.",
     )
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--fast_autotune", action="store_true")
-    parser.add_argument(
+    timing_group.add_argument("--warmup", type=int, default=1, help="Warmup iterations per case.")
+    timing_group.add_argument("--iters", type=int, default=5, help="Timed iterations per case.")
+    timing_group.add_argument(
+        "--fast_autotune",
+        action="store_true",
+        help="Use a short autotune pass for smoke tests; may reduce measurement quality.",
+    )
+    timing_group.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
         choices=("bfloat16", "float16"),
+        help="Activation dtype for synthetic inputs.",
     )
-    parser.add_argument("--use_low_precision_moe_combine", action="store_true")
-    parser.add_argument("--random_seed", type=int, default=1234)
+    timing_group.add_argument(
+        "--use_low_precision_moe_combine",
+        action="store_true",
+        help="Use low-precision combine where the selected backend supports it.",
+    )
+    timing_group.add_argument(
+        "--random_seed",
+        type=int,
+        default=1234,
+        help="Seed for synthetic hidden states/router logits; routing-control plans use --routing_seed.",
+    )
 
-    # ---- Analysis ----
-    parser.add_argument(
+    analysis_group = parser.add_argument_group("Analysis")
+    analysis_group.add_argument(
         "--analysis",
-        type=str,
-        default="kernels",
-        help=(
-            "Comma-separated analysis dimensions to enable: 'summary' | "
-            "'phases' | 'kernels' | 'phases,kernels'. Phase markers require "
-            "moe_scheduler.py instrumentation (Phase 5 of the design) and "
-            "currently report phase_timing_available=false."
-        ),
+        nargs="+",
+        default=("kernels",),
+        choices=("none", "kernels"),
+        help="Analysis data to collect. Use --analysis none for latency-only output.",
     )
 
     # ---- Search / sweep ----
     _add_search_arguments(parser)
 
-    # ---- Output / pipeline ----
-    parser.add_argument(
+    output_group = parser.add_argument_group("Output")
+    output_group.add_argument(
+        "-c",
         "--config_file",
         type=str,
         default=None,
-        help="JSON config file describing model / workload / search / output (overrides CLI).",
+        help="JSON config file. CLI flags override matching config-file fields.",
     )
-    parser.add_argument("--output_file", type=str, default=None)
-
-    return parser.parse_args()
+    output_group.add_argument(
+        "-o",
+        "--output_file",
+        type=str,
+        default=None,
+        help="Write the final dashboard JSON report to this path.",
+    )
+    args = parser.parse_args()
+    provided = set()
+    argv = sys.argv[1:]
+    for action in parser._actions:
+        for option in action.option_strings:
+            if option in argv or any(arg.startswith(option + "=") for arg in argv):
+                provided.add(action.dest)
+    args._cli_provided = provided
+    args.search = _parse_search_axes(args.search)
+    return args
 
 
 # ---------------------------------------------------------------------------
 # Spec resolution from CLI args / config file
 # ---------------------------------------------------------------------------
-
-
-def _emit_deprecation(field_name: str, replacement: str) -> None:
-    warnings.warn(
-        f"--{field_name} is deprecated; use --{replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
 
 
 def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
@@ -3769,113 +3574,64 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
 
 
 def _resolve_workloads_from_args(args: argparse.Namespace) -> List[WorkloadSpec]:
-    if not args.num_tokens:
-        raise ValueError("--num_tokens is required (or supply via --config_file)")
-    rank_ratio = args.rank_imbalance_ratio
-    if args.rank_hotspot_ratio is not None:
-        _emit_deprecation("rank_hotspot_ratio", "rank_imbalance_ratio")
-        rank_ratio = float(args.rank_hotspot_ratio)
-    if args.tokens_per_rank_imbalance_ratio is not None:
-        _emit_deprecation("tokens_per_rank_imbalance_ratio", "rank_imbalance_ratio")
-        rank_ratio = float(args.tokens_per_rank_imbalance_ratio)
-    expert_ratio = args.expert_hotspot_ratio
-    if args.experts_hot_imbalane_ratio is not None:
-        _emit_deprecation("experts_hot_imbalane_ratio", "expert_hotspot_ratio")
-        expert_ratio = float(args.experts_hot_imbalane_ratio)
-    expert_distribution = args.expert_distribution
-    if expert_ratio > 0.0 and expert_distribution == "balanced_patch":
-        expert_distribution = "hotspot"
+    balanced_total_num_tokens = getattr(args, "balanced_total_num_tokens", None)
+    if balanced_total_num_tokens is None:
+        balanced_total_num_tokens = getattr(args, "num_tokens", None)
 
-    if not (0.0 <= rank_ratio <= 1.0):
-        raise ValueError("rank_imbalance_ratio must be in [0, 1]")
-    if not (0.0 <= expert_ratio <= 1.0):
-        raise ValueError("expert_hotspot_ratio must be in [0, 1]")
-    if any(t < 0 for t in args.num_tokens):
-        raise ValueError("--num_tokens entries must be >= 0")
-
-    # Resolve RoutingControlSpec from CLI args (with scenario preset overlay).
+    # Resolve RoutingControlSpec from explicit CLI/config fields.
     per_rank_num_tokens: Optional[Tuple[int, ...]] = None
     if getattr(args, "per_rank_num_tokens", None):
-        raw = str(args.per_rank_num_tokens).strip()
-        if raw:
+        if balanced_total_num_tokens:
+            raise ValueError(
+                "--balanced_total_num_tokens and --per_rank_num_tokens are mutually exclusive"
+            )
+        raw = args.per_rank_num_tokens
+        if isinstance(raw, str):
             try:
                 parts = [int(p.strip()) for p in raw.split(",") if p.strip()]
             except ValueError as exc:
-                raise ValueError(
-                    f"--per_rank_num_tokens must be a comma-separated integer list; got {raw!r}"
-                ) from exc
-            per_rank_num_tokens = tuple(parts)
+                raise ValueError(f"--per_rank_num_tokens must be integers; got {raw!r}") from exc
+        else:
+            parts = [int(v) for v in raw]
+        per_rank_num_tokens = tuple(parts)
+        if any(v < 0 for v in per_rank_num_tokens):
+            raise ValueError("--per_rank_num_tokens entries must be >= 0")
+        token_values = [sum(per_rank_num_tokens)]
+    else:
+        if not balanced_total_num_tokens:
+            raise ValueError(
+                "--balanced_total_num_tokens or --per_rank_num_tokens is required "
+                "(or supply via --config_file)"
+            )
+        token_values = [int(t) for t in balanced_total_num_tokens]
+        if any(t < 0 for t in token_values):
+            raise ValueError("--balanced_total_num_tokens entries must be >= 0")
 
-    base_routing_spec = RoutingControlSpec(
+    routing_spec = RoutingControlSpec(
         routing_mode=str(getattr(args, "routing_mode", "native")),
         projection_policy=str(getattr(args, "projection_policy", "project")),
         comm_pattern=str(getattr(args, "comm_pattern", "balanced_alltoall")),
         expert_pattern=str(getattr(args, "expert_pattern", "balanced")),
+        routing_pattern_file=getattr(args, "routing_pattern_file", None),
         per_rank_num_tokens=per_rank_num_tokens,
         routing_dump_matrix=bool(getattr(args, "routing_dump_matrix", False)),
         seed=int(getattr(args, "routing_seed", 0)),
     )
-    routing_spec = _resolve_scenario(getattr(args, "routing_scenario", None), base_routing_spec)
-
-    # Legacy backward-compat translation: if the user opted into
-    # ``force_balance_patch`` without picking a routing mode, treat it as
-    # ``forced + balanced_alltoall + balanced`` per the design.
-    if (
-        getattr(args, "force_balance_patch", False)
-        and routing_spec == RoutingControlSpec()
-        and expert_distribution != "hotspot"
-    ):
-        routing_spec = RoutingControlSpec(
-            routing_mode="forced",
-            comm_pattern="balanced_alltoall",
-            expert_pattern="balanced",
-        )
-
-    # Legacy ``expert_hotspot_ratio`` -> ``expert_pattern=hotspot,hotness=<v>``
-    # only when the new flag was left at its default.
-    if (
-        expert_distribution == "hotspot"
-        and expert_ratio > 0.0
-        and routing_spec.expert_pattern == "balanced"
-    ):
-        routing_spec = replace(
-            routing_spec,
-            expert_pattern=f"hotspot,hotness={float(expert_ratio):.4f}",
-        )
 
     return [
         WorkloadSpec(
             num_tokens=int(t),
-            rank_imbalance_ratio=float(rank_ratio),
-            expert_distribution=expert_distribution,
-            expert_hotspot_ratio=float(expert_ratio),
             routing_control=routing_spec,
         )
-        for t in args.num_tokens
+        for t in token_values
     ]
 
 
 def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
-    # Map deprecated --force_comm_method -> --comm_method.
     comm_method = args.comm_method
-    if args.force_comm_method is not None:
-        _emit_deprecation("force_comm_method", "comm_method")
-        if comm_method == "AUTO":
-            comm_method = args.force_comm_method
 
-    # Map deprecated --enable_eplb -> --eplb_mode.
-    eplb_mode = args.eplb_mode
-    if args.enable_eplb and eplb_mode == "off":
-        _emit_deprecation("enable_eplb", "eplb_mode")
-        # ``layer_updates_per_iter`` legacy semantics: <=0 => static, >0 => dynamic.
-        legacy_layer = args.layer_updates_per_iter if args.layer_updates_per_iter is not None else 0
-        eplb_mode = "dynamic" if int(legacy_layer) > 0 else "static"
-
-    # Backend handling: BEST is mapped later (after parallel_mode is known) by
-    # the caller. Here we just translate BEST -> a placeholder backend so the
-    # base ConfigSpec is concrete.
     backend = args.backend
-    if backend in ("BEST", "ALL"):
+    if backend == "ALL":
         backend = MoeBackendType.CUTLASS.value  # placeholder; overwritten by search expansion
 
     # parallel_mode CUSTOM if explicit EP/TP overrides are present.
@@ -3899,48 +3655,81 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
         moe_tp_size=args.moe_tp_size,
         enable_attention_dp=bool(args.enable_attention_dp) if parallel_mode == "CUSTOM" else None,
         comm_method=comm_method,
-        eplb_mode=eplb_mode,
-        num_slots=args.num_slots,
-        layer_updates_per_iter=args.layer_updates_per_iter,
         cuda_graph=bool(args.cuda_graph),
         use_low_precision_moe_combine=bool(args.use_low_precision_moe_combine),
-        per_case_subprocess=bool(args.per_case_subprocess),
     )
 
 
+_SEARCH_AXES = ("backend", "comm", "parallel")
+_SEARCH_MODES = ("none",) + _SEARCH_AXES + ("full",)
+
+
+def _parse_search_axes(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        parts = [
+            part.strip().lower()
+            for item in value
+            for part in str(item).replace(",", " ").split()
+            if part.strip()
+        ]
+    else:
+        parts = [
+            part.strip().lower() for part in str(value).replace(",", " ").split() if part.strip()
+        ]
+    if not parts:
+        return ("none",)
+
+    out: List[str] = []
+    for part in parts:
+        if part not in _SEARCH_MODES:
+            raise ValueError(f"unknown --search axis {part!r}; valid: {list(_SEARCH_MODES)}")
+        if part not in out:
+            out.append(part)
+
+    if "none" in out and len(out) > 1:
+        raise ValueError("--search none cannot be combined with other axes")
+    if "full" in out and len(out) > 1:
+        raise ValueError("--search full cannot be combined with other axes")
+    return tuple(out)
+
+
 def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec) -> SearchSpec:
-    # ``--backend BEST`` is a compatibility alias for ``--search backend --backend ALL``.
-    mode = args.search
+    search_axes = _parse_search_axes(args.search)
     backends_arg = args.backend
-    if backends_arg == "BEST":
-        _emit_deprecation("backend BEST", "search backend --backend ALL")
-        mode = "backend"
-        backends_arg = "ALL"
+    config_axes = getattr(args, "_config_search_axes", {}) or {}
 
     backends: Tuple[str, ...] = ()
     parallel_modes: Tuple[str, ...] = ()
     comm_methods: Tuple[str, ...] = ()
-    eplb_modes: Tuple[str, ...] = ()
     cuda_graph_options: Tuple[bool, ...] = ()
     combine_options: Tuple[bool, ...] = ()
 
-    if mode == "none":
+    if search_axes == ("none",) and backends_arg == "ALL":
+        search_axes = ("backend",)
+
+    if search_axes == ("none",):
         return SearchSpec(mode="none")
 
-    if mode in ("backend", "full"):
-        if backends_arg == "ALL":
+    full_search = search_axes == ("full",)
+    enabled_axes = set(_SEARCH_AXES if full_search else search_axes)
+    mode = "full" if full_search else ",".join(search_axes)
+
+    if "backend" in enabled_axes:
+        if "backend" in config_axes:
+            backends = tuple(config_axes["backend"])
+        elif backends_arg == "ALL":
             backends = tuple(_ALL_BACKENDS)
         else:
             backends = (backends_arg,)
-    if mode in ("parallel", "full"):
-        parallel_modes = ("DEP", "TEP", "DTP", "TTP")
-    if mode in ("comm", "full"):
-        comm_methods = tuple(_FORCED_COMM_ENV_VALUES.keys()) + ("AUTO",)
-    if mode in ("eplb", "full"):
-        eplb_modes = ("off", "static", "dynamic")
+    if "parallel" in enabled_axes:
+        parallel_modes = tuple(config_axes.get("parallel_mode", ("DEP", "TEP", "DTP", "TTP")))
+    if "comm" in enabled_axes:
+        comm_methods = tuple(
+            config_axes.get("comm_method", tuple(_FORCED_COMM_ENV_VALUES.keys()) + ("AUTO",))
+        )
     # ``cuda_graph`` and ``combine_precision`` axes are reserved for ``full``;
     # leave them empty by default so the base value is used.
-    if mode == "full":
+    if full_search:
         cuda_graph_options = (True, False)
 
     return SearchSpec(
@@ -3948,20 +3737,22 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
         backends=backends,
         parallel_modes=parallel_modes,
         comm_methods=comm_methods,
-        eplb_modes=eplb_modes,
         cuda_graph_options=cuda_graph_options,
         combine_precision_options=combine_options,
     )
 
 
-def _parse_analysis(value: str) -> Tuple[str, ...]:
-    parts = [p.strip().lower() for p in str(value).split(",") if p.strip()]
-    valid = {"summary", "phases", "kernels"}
+def _parse_analysis(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        parts = [str(p).strip().lower() for p in value if str(p).strip()]
+    else:
+        parts = [p.strip().lower() for p in str(value).replace(",", " ").split() if p.strip()]
+    valid = {"none", "kernels"}
     out: List[str] = []
     for p in parts:
         if p not in valid:
             raise ValueError(f"unknown --analysis dimension {p!r}; valid: {sorted(valid)}")
-        if p == "summary":
+        if p == "none":
             continue
         if p not in out:
             out.append(p)
@@ -3969,95 +3760,116 @@ def _parse_analysis(value: str) -> Tuple[str, ...]:
 
 
 def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
-    """Overlay ``--config_file`` JSON onto ``args``; the file wins on conflict."""
+    """Overlay ``--config_file`` JSON onto ``args``; explicit CLI flags win."""
     if not args.config_file:
+        args._config_search_axes = {}
         return args
     with open(args.config_file) as f:
         cfg = json.load(f)
+
+    provided = set(getattr(args, "_cli_provided", set()))
+
+    def set_if_unset(dest: str, value: Any) -> None:
+        if dest not in provided:
+            setattr(args, dest, value)
+
     if "model" in cfg:
-        args.model = cfg["model"]
+        set_if_unset("model", cfg["model"])
     workload_cfg = cfg.get("workload", {}) or {}
-    if "num_tokens" in workload_cfg:
-        args.num_tokens = list(workload_cfg["num_tokens"])
-    if "rank_imbalance_ratio" in workload_cfg:
-        args.rank_imbalance_ratio = float(workload_cfg["rank_imbalance_ratio"])
-    if "rank_hotspot_ratio" in workload_cfg and "rank_imbalance_ratio" not in workload_cfg:
-        _emit_deprecation("workload.rank_hotspot_ratio", "workload.rank_imbalance_ratio")
-        args.rank_imbalance_ratio = float(workload_cfg["rank_hotspot_ratio"])
-    if "expert_distribution" in workload_cfg:
-        args.expert_distribution = workload_cfg["expert_distribution"]
-    if "expert_hotspot_ratio" in workload_cfg:
-        args.expert_hotspot_ratio = float(workload_cfg["expert_hotspot_ratio"])
+    if "balanced_total_num_tokens" in workload_cfg:
+        set_if_unset("balanced_total_num_tokens", list(workload_cfg["balanced_total_num_tokens"]))
+    elif "num_tokens" in workload_cfg:
+        set_if_unset("balanced_total_num_tokens", list(workload_cfg["num_tokens"]))
     if "per_rank_num_tokens" in workload_cfg:
         prnt = workload_cfg["per_rank_num_tokens"]
-        if isinstance(prnt, list):
-            args.per_rank_num_tokens = ",".join(str(int(v)) for v in prnt)
-        else:
-            args.per_rank_num_tokens = str(prnt)
+        set_if_unset(
+            "per_rank_num_tokens",
+            [int(v) for v in prnt] if isinstance(prnt, list) else str(prnt),
+        )
     routing_cfg = workload_cfg.get("routing_control", {}) or {}
     if "routing_mode" in routing_cfg:
-        args.routing_mode = str(routing_cfg["routing_mode"]).lower()
+        set_if_unset("routing_mode", str(routing_cfg["routing_mode"]).lower())
     if "projection_policy" in routing_cfg:
-        args.projection_policy = str(routing_cfg["projection_policy"]).lower()
+        set_if_unset("projection_policy", str(routing_cfg["projection_policy"]).lower())
     if "comm_pattern" in routing_cfg:
-        args.comm_pattern = str(routing_cfg["comm_pattern"])
+        set_if_unset("comm_pattern", str(routing_cfg["comm_pattern"]))
     if "expert_pattern" in routing_cfg:
-        args.expert_pattern = str(routing_cfg["expert_pattern"])
-    if "scenario" in routing_cfg:
-        args.routing_scenario = str(routing_cfg["scenario"])
+        set_if_unset("expert_pattern", str(routing_cfg["expert_pattern"]))
+    if "routing_pattern_file" in routing_cfg:
+        set_if_unset("routing_pattern_file", str(routing_cfg["routing_pattern_file"]))
     if "routing_dump_matrix" in routing_cfg:
-        args.routing_dump_matrix = bool(routing_cfg["routing_dump_matrix"])
+        set_if_unset("routing_dump_matrix", bool(routing_cfg["routing_dump_matrix"]))
     if "seed" in routing_cfg:
-        args.routing_seed = int(routing_cfg["seed"])
+        set_if_unset("routing_seed", int(routing_cfg["seed"]))
     search_cfg = cfg.get("search", {}) or {}
-    # When a search block is present we promote --search to an inferred mode.
+    unsupported_search_keys = set(search_cfg) - {"backend", "parallel_mode", "comm_method"}
+    if unsupported_search_keys:
+        raise ValueError(f"unsupported search key(s): {sorted(unsupported_search_keys)}")
+    config_search_axes: Dict[str, Tuple[str, ...]] = {}
+
+    def normalize_search_axis(key: str, value: Any) -> Optional[Tuple[str, ...]]:
+        if key in provided:
+            return None
+        if key == "backend":
+            if value == "ALL":
+                set_if_unset("backend", "ALL")
+                return None
+            values = (
+                tuple(str(v).upper() for v in value)
+                if isinstance(value, list)
+                else (str(value).upper(),)
+            )
+            if len(values) == 1:
+                if values[0] == "ALL":
+                    set_if_unset("backend", "ALL")
+                    return None
+                set_if_unset("backend", values[0])
+            return values
+        if key == "parallel_mode":
+            values = (
+                tuple(str(v).upper() for v in value)
+                if isinstance(value, list)
+                else (str(value).upper(),)
+            )
+            if len(values) == 1:
+                set_if_unset("parallel_mode", values[0])
+            return values
+        if key == "comm_method":
+            values = (
+                tuple(str(v).upper() for v in value)
+                if isinstance(value, list)
+                else (str(value).upper(),)
+            )
+            if len(values) == 1:
+                set_if_unset("comm_method", values[0])
+            return values
+        return None
+
     if search_cfg:
-        # The simplest mapping: if search lists multiple backends, that's at least
-        # ``backend`` mode; ``full`` if multiple axes specified.
-        axis_count = sum(
-            1
-            for k in ("backend", "parallel_mode", "comm_method", "eplb_mode")
-            if k in search_cfg and isinstance(search_cfg[k], list) and len(search_cfg[k]) > 1
-        )
-        if axis_count >= 2:
-            args.search = "full"
-        elif "backend" in search_cfg:
-            args.search = "backend"
-        elif "parallel_mode" in search_cfg:
-            args.search = "parallel"
-        elif "comm_method" in search_cfg:
-            args.search = "comm"
-        elif "eplb_mode" in search_cfg:
-            args.search = "eplb"
-        if "backend" in search_cfg:
-            backends = search_cfg["backend"]
-            if isinstance(backends, list) and len(backends) == 1:
-                args.backend = str(backends[0]).upper()
-            elif backends == "ALL":
-                args.backend = "ALL"
-        if "parallel_mode" in search_cfg and isinstance(search_cfg["parallel_mode"], list):
-            if len(search_cfg["parallel_mode"]) == 1:
-                args.parallel_mode = search_cfg["parallel_mode"][0]
-        if "comm_method" in search_cfg and isinstance(search_cfg["comm_method"], list):
-            if len(search_cfg["comm_method"]) == 1:
-                args.comm_method = str(search_cfg["comm_method"][0]).upper()
-        if "eplb_mode" in search_cfg and isinstance(search_cfg["eplb_mode"], list):
-            if len(search_cfg["eplb_mode"]) == 1:
-                args.eplb_mode = str(search_cfg["eplb_mode"][0]).lower()
+        for key in ("backend", "parallel_mode", "comm_method"):
+            if key in search_cfg:
+                axis = normalize_search_axis(key, search_cfg[key])
+                if axis:
+                    config_search_axes[key] = axis
+        if "search" not in provided:
+            axes = []
+            if "backend" in search_cfg and "backend" not in provided:
+                axes.append("backend")
+            if "parallel_mode" in search_cfg and "parallel_mode" not in provided:
+                axes.append("parallel")
+            if "comm_method" in search_cfg and "comm_method" not in provided:
+                axes.append("comm")
+            if axes:
+                args.search = tuple(axes)
+    args._config_search_axes = config_search_axes
     if "analysis" in cfg:
-        analysis = cfg["analysis"]
-        if isinstance(analysis, list):
-            args.analysis = ",".join(analysis)
-        else:
-            args.analysis = str(analysis)
-    if "per_case_subprocess" in cfg:
-        args.per_case_subprocess = bool(cfg["per_case_subprocess"])
+        set_if_unset("analysis", cfg["analysis"])
     if "max_configs" in cfg:
-        args.max_configs = int(cfg["max_configs"])
+        set_if_unset("max_configs", int(cfg["max_configs"]))
     if "time_budget_minutes" in cfg:
-        args.time_budget_minutes = float(cfg["time_budget_minutes"])
-    if "output_file" in cfg and not args.output_file:
-        args.output_file = cfg["output_file"]
+        set_if_unset("time_budget_minutes", float(cfg["time_budget_minutes"]))
+    if "output_file" in cfg:
+        set_if_unset("output_file", cfg["output_file"])
     return args
 
 
@@ -4067,9 +3879,12 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: str) -> None:
+    args = _maybe_load_config_file(args)
+    analysis = _parse_analysis(args.analysis)
+
     # CUPTI MUST be initialized before the CUDA context is created.
     _early_cupti_ctx: Optional[Any] = None
-    if args.cuda_graph:
+    if args.cuda_graph and "kernels" in analysis:
         _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
         if _cupti_ok:
             _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
@@ -4084,19 +3899,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    args = _maybe_load_config_file(args)
-
     model = _resolve_model_from_args(args)
     workloads = _resolve_workloads_from_args(args)
     base_config = _resolve_base_config_from_args(args)
     search = _resolve_search_from_args(args, base_config)
-    analysis = _parse_analysis(args.analysis)
-
-    if args.per_case_subprocess:
-        _maybe_print_rank0(
-            "[bench_moe] --per_case_subprocess is currently a no-op stub; "
-            "running all candidates in-process."
-        )
 
     act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     routing_logits_dtype = (
@@ -4171,8 +3977,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
             case_label = (
                 f"backend={cand.backend} parallel_mode={cand.parallel_mode} "
-                f"comm={cand.comm_method} eplb={cand.eplb_mode} "
-                f"num_tokens={workload.num_tokens}"
+                f"comm={cand.comm_method} num_tokens={workload.num_tokens}"
             )
             _maybe_print_rank0(f"[bench_moe] running {case_label}")
 
@@ -4190,7 +3995,6 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 fast_autotune=bool(args.fast_autotune),
                 analysis=analysis,
                 cupti_ctx=_early_cupti_ctx,
-                force_balance_patch=bool(args.force_balance_patch),
             )
             results.append(r)
             if rank == 0:
