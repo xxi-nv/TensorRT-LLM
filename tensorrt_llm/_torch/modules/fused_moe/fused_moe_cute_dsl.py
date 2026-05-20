@@ -25,12 +25,34 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+
+try:
+    from ...custom_ops.cute_dsl_custom_ops import (
+        GroupedGemmInputsHelper,
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+except ImportError:
+    # CUTLASS DSL is unavailable in this environment: the SM100 runner classes
+    # are defined inside ``if IS_CUTLASS_DSL_AVAILABLE:`` in cute_dsl_custom_ops
+    # and therefore don't exist when the import above runs. Provide sentinel
+    # placeholders so the module still loads and non-CuteDsl MoE backends
+    # (TRTLLM, CUTLASS, Triton, Vanilla) continue to work. Constructing a
+    # CuteDsl runner without CUTLASS DSL is a programmer error; the sentinel
+    # raises loudly when instantiated.
+    class _CuteDslUnavailable:
+
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError(
+                "CUTLASS DSL is not available; CuteDslFusedMoE cannot be used "
+                "in this environment.")
+
+    GroupedGemmInputsHelper = _CuteDslUnavailable
+    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner = _CuteDslUnavailable
+    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner = _CuteDslUnavailable
+    Sm100BlockScaledContiguousGroupedGemmRunner = _CuteDslUnavailable
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner = _CuteDslUnavailable
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
