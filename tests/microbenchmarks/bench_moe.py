@@ -206,7 +206,9 @@ except Exception:
     _cxxfilt = None  # type: ignore[assignment]
 
 try:
-    from torch.cuda import _get_driver_version as _torch_driver_version  # type: ignore[attr-defined]
+    from torch.cuda import (
+        _get_driver_version as _torch_driver_version,  # type: ignore[attr-defined]
+    )
 except Exception:
     _torch_driver_version = None  # type: ignore[assignment]
 
@@ -700,23 +702,40 @@ def _distribute_tokens(total: int, world_size: int) -> List[int]:
     return out
 
 
-def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
-    """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
-    per_rank = workload.routing_control.per_rank_num_tokens
-    if per_rank is None:
-        return _distribute_tokens(int(workload.num_tokens), world_size)
+def _validate_per_rank_token_list(
+    per_rank: Iterable[int],
+    *,
+    world_size: int,
+    expected_total: int,
+) -> List[int]:
+    """Validate and normalize an explicit per-rank token list.
+
+    Centralises the length / sum / non-negative checks shared between the
+    ``WorkloadSpec`` path (timing) and the ``RoutingControlSpec`` path (plan
+    construction) so error messages stay identical.
+    """
     out = [int(v) for v in per_rank]
     if len(out) != world_size:
         raise ValueError(
             f"per_rank_num_tokens has length {len(out)}, expected world_size={world_size}"
         )
-    if sum(out) != int(workload.num_tokens):
-        raise ValueError(
-            f"sum(per_rank_num_tokens)={sum(out)} must equal num_tokens={workload.num_tokens}"
-        )
     if any(v < 0 for v in out):
         raise ValueError("per_rank_num_tokens entries must be >= 0")
+    if sum(out) != int(expected_total):
+        raise ValueError(
+            f"sum(per_rank_num_tokens)={sum(out)} must equal num_tokens={expected_total}"
+        )
     return out
+
+
+def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
+    """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
+    per_rank = workload.routing_control.per_rank_num_tokens
+    if per_rank is None:
+        return _distribute_tokens(int(workload.num_tokens), world_size)
+    return _validate_per_rank_token_list(
+        per_rank, world_size=world_size, expected_total=int(workload.num_tokens)
+    )
 
 
 def _make_inputs(
@@ -1133,6 +1152,16 @@ def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:
     return name, kwargs
 
 
+def _pop_hotness_kwarg(raw: Dict[str, str], kwargs: Dict[str, Any], *, label: str) -> None:
+    """Parse the optional ``hotness=<ratio>`` shared by comm/expert patterns."""
+    if "hotness" not in raw:
+        return
+    value = float(raw["hotness"])
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{label} hotness must be in [0, 1]; got {value}")
+    kwargs["hotness"] = value
+
+
 def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     name, raw = _parse_pattern_spec(spec)
     if name == "file":
@@ -1140,16 +1169,10 @@ def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     if name not in _COMM_PATTERN_NAMES:
         raise ValueError(f"unknown comm_pattern {name!r}; supported: {_COMM_PATTERN_NAMES}")
     kwargs: Dict[str, Any] = {}
-    if "hotness" in raw:
-        kwargs["hotness"] = float(raw["hotness"])
-        if not 0.0 <= kwargs["hotness"] <= 1.0:
-            raise ValueError(f"comm_pattern hotness must be in [0, 1]; got {kwargs['hotness']}")
-    if "rank" in raw:
-        kwargs["rank"] = int(raw["rank"])
-    if "src" in raw:
-        kwargs["src"] = int(raw["src"])
-    if "dst" in raw:
-        kwargs["dst"] = int(raw["dst"])
+    _pop_hotness_kwarg(raw, kwargs, label="comm_pattern")
+    for int_key in ("rank", "src", "dst"):
+        if int_key in raw:
+            kwargs[int_key] = int(raw[int_key])
     if name == "receiver_hotspot":
         if "hotness" not in kwargs:
             raise ValueError("receiver_hotspot requires hotness=<ratio>")
@@ -1167,10 +1190,7 @@ def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     if name not in _EXPERT_PATTERN_NAMES:
         raise ValueError(f"unknown expert_pattern {name!r}; supported: {_EXPERT_PATTERN_NAMES}")
     kwargs: Dict[str, Any] = {}
-    if "hotness" in raw:
-        kwargs["hotness"] = float(raw["hotness"])
-        if not 0.0 <= kwargs["hotness"] <= 1.0:
-            raise ValueError(f"expert_pattern hotness must be in [0, 1]; got {kwargs['hotness']}")
+    _pop_hotness_kwarg(raw, kwargs, label="expert_pattern")
     if "active_experts" in raw:
         kwargs["active_experts"] = int(raw["active_experts"])
         if kwargs["active_experts"] <= 0:
@@ -1228,20 +1248,11 @@ def _build_per_rank_num_tokens(
     Explicit ``spec.per_rank_num_tokens`` wins; otherwise tokens are split
     evenly across ranks with any remainder on rank 0.
     """
-    if spec.per_rank_num_tokens is not None:
-        per_rank = [int(v) for v in spec.per_rank_num_tokens]
-        if len(per_rank) != world_size:
-            raise ValueError(
-                f"per_rank_num_tokens has length {len(per_rank)}, expected world_size={world_size}"
-            )
-        if any(v < 0 for v in per_rank):
-            raise ValueError("per_rank_num_tokens entries must be >= 0")
-        if sum(per_rank) != int(num_tokens):
-            raise ValueError(
-                f"sum(per_rank_num_tokens)={sum(per_rank)} must equal num_tokens={num_tokens}"
-            )
-        return per_rank
-    return _distribute_tokens(int(num_tokens), world_size)
+    if spec.per_rank_num_tokens is None:
+        return _distribute_tokens(int(num_tokens), world_size)
+    return _validate_per_rank_token_list(
+        spec.per_rank_num_tokens, world_size=world_size, expected_total=int(num_tokens)
+    )
 
 
 def _build_dispatch_matrix(
@@ -1339,49 +1350,60 @@ def _build_expert_histogram(
     return histogram
 
 
-def _load_dispatch_matrix_file(path: str, ep_size: int) -> List[List[int]]:
-    """Load and validate a ``file:<path>`` slot dispatch matrix."""
+def _load_2d_matrix_json(
+    path: str,
+    *,
+    matrix_key: str,
+    n_rows: int,
+    n_cols: int,
+    label: str,
+    extra_dims: Tuple[Tuple[str, int], ...] = (),
+) -> List[List[int]]:
+    """Load and validate a 2D integer matrix from a JSON sidecar.
+
+    ``extra_dims`` is a list of ``(payload_key, expected_value)`` checks that
+    happen alongside the always-present ``ep_size`` guard, so the dispatch and
+    histogram loaders share their full structural-validation pipeline.
+    """
     with open(path) as f:
         payload = json.load(f)
-    if int(payload.get("ep_size", -1)) != ep_size:
-        raise ValueError(
-            f"dispatch matrix {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
-        )
-    matrix = payload.get("slot_dispatch_matrix")
+    for key, expected in (("ep_size", n_rows),) + tuple(extra_dims):
+        if int(payload.get(key, -1)) != int(expected):
+            raise ValueError(
+                f"{label} {path!r}: {key}={payload.get(key)} mismatches "
+                f"runtime {key}={int(expected)}"
+            )
+    matrix = payload.get(matrix_key)
     if (
         not isinstance(matrix, list)
-        or len(matrix) != ep_size
-        or any(not isinstance(row, list) or len(row) != ep_size for row in matrix)
+        or len(matrix) != n_rows
+        or any(not isinstance(row, list) or len(row) != n_cols for row in matrix)
     ):
-        raise ValueError(
-            f"dispatch matrix {path!r}: slot_dispatch_matrix must be a {ep_size}x{ep_size} integer list"
-        )
+        raise ValueError(f"{label} {path!r}: {matrix_key} must be a {n_rows}x{n_cols} integer list")
     return [[int(v) for v in row] for row in matrix]
+
+
+def _load_dispatch_matrix_file(path: str, ep_size: int) -> List[List[int]]:
+    """Load and validate a ``file:<path>`` slot dispatch matrix."""
+    return _load_2d_matrix_json(
+        path,
+        matrix_key="slot_dispatch_matrix",
+        n_rows=ep_size,
+        n_cols=ep_size,
+        label="dispatch matrix",
+    )
 
 
 def _load_expert_histogram_file(path: str, ep_size: int, experts_per_rank: int) -> List[List[int]]:
     """Load and validate a ``file:<path>`` expert histogram."""
-    with open(path) as f:
-        payload = json.load(f)
-    if int(payload.get("ep_size", -1)) != ep_size:
-        raise ValueError(
-            f"expert histogram {path!r}: ep_size={payload.get('ep_size')} mismatches runtime ep_size={ep_size}"
-        )
-    if int(payload.get("experts_per_rank", -1)) != experts_per_rank:
-        raise ValueError(
-            f"expert histogram {path!r}: experts_per_rank={payload.get('experts_per_rank')} mismatches "
-            f"runtime experts_per_rank={experts_per_rank}"
-        )
-    histogram = payload.get("expert_histogram")
-    if (
-        not isinstance(histogram, list)
-        or len(histogram) != ep_size
-        or any(not isinstance(row, list) or len(row) != experts_per_rank for row in histogram)
-    ):
-        raise ValueError(
-            f"expert histogram {path!r}: expert_histogram must be a {ep_size}x{experts_per_rank} integer list"
-        )
-    return [[int(v) for v in row] for row in histogram]
+    return _load_2d_matrix_json(
+        path,
+        matrix_key="expert_histogram",
+        n_rows=ep_size,
+        n_cols=experts_per_rank,
+        label="expert histogram",
+        extra_dims=(("experts_per_rank", experts_per_rank),),
+    )
 
 
 def _load_routing_pattern_file(
@@ -1502,7 +1524,9 @@ def _flatten_plan_slots_for_rank(
 
     expected = local_num_tokens * top_k
     if len(flat) != expected:
-        raise ValueError(f"materialiser flat length {len(flat)} != local_num_tokens*top_k={expected}")
+        raise ValueError(
+            f"materialiser flat length {len(flat)} != local_num_tokens*top_k={expected}"
+        )
     return flat
 
 
@@ -1972,6 +1996,25 @@ def _run_autotune(
 # ---------------------------------------------------------------------------
 
 
+def _kernel_times_to_summary_list(
+    kernel_times: Dict[str, List[float]],
+) -> List[Dict[str, Any]]:
+    """Convert ``{kernel_name: [times_us]}`` into the dashboard summary shape.
+
+    Sorted by per-kernel mean duration descending; entries keep the raw
+    ``_times`` list so downstream mpi_allgather can recompute per-rank stats.
+    Shared by the Kineto (``_parse_profiler_events_moe``) and CUPTI
+    (``_build_cuda_graph_kernel_stats_cupti``) paths so the wire format stays
+    in lockstep across the two backends.
+    """
+    out = [{"name": n, "count": len(t), "_times": t} for n, t in kernel_times.items()]
+    out.sort(
+        key=lambda entry: (sum(entry["_times"]) / len(entry["_times"])) if entry["_times"] else 0.0,
+        reverse=True,
+    )
+    return out
+
+
 def _l2_flush_buffer(device: torch.device) -> torch.Tensor:
     """Allocate a 2x-L2 flush buffer to clear L2 between iterations."""
     l2_size = torch.cuda.get_device_properties(device).L2_cache_size
@@ -2102,17 +2145,9 @@ def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str
         if _is_gpu_event(evt) and evt.name == "moe_forward":
             forward_times_us.append(evt.device_time)
 
-    def _build(ktimes: Dict[str, List[float]]) -> List[Dict[str, Any]]:
-        out = [{"name": n, "count": len(t), "_times": t} for n, t in ktimes.items()]
-        out.sort(
-            key=lambda x: (sum(x["_times"]) / len(x["_times"])) if x["_times"] else 0.0,
-            reverse=True,
-        )
-        return out
-
     detailed_stats = {
-        "moe_forward_kernels": _build(moe_kernel_times),
-        "other_kernels": _build(other_kernel_times),
+        "moe_forward_kernels": _kernel_times_to_summary_list(moe_kernel_times),
+        "other_kernels": _kernel_times_to_summary_list(other_kernel_times),
     }
     return forward_times_us, detailed_stats
 
@@ -2221,21 +2256,13 @@ def _build_cuda_graph_kernel_stats_cupti(
         else:
             other_kernel_times.setdefault(demangled, []).append(device_time_us)
 
-    def _build(ktimes: Dict[str, List[float]]) -> List[Dict[str, Any]]:
-        result = [{"name": n, "count": len(t), "_times": t} for n, t in ktimes.items()]
-        result.sort(
-            key=lambda x: (sum(x["_times"]) / len(x["_times"])) if x["_times"] else 0.0,
-            reverse=True,
-        )
-        return result
-
     moe_times_us = [
         (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in iter_span
     ]
 
     return {
-        "moe_forward_kernels": _build(moe_kernel_times),
-        "other_kernels": _build(other_kernel_times),
+        "moe_forward_kernels": _kernel_times_to_summary_list(moe_kernel_times),
+        "other_kernels": _kernel_times_to_summary_list(other_kernel_times),
         "moe_times_us": moe_times_us,
     }
 
@@ -2792,9 +2819,7 @@ def _pick_enable_perfect_router(rc_spec: RoutingControlSpec, rc_active: bool) ->
         return True
     if rc_spec.routing_mode == "forced":
         return False
-    return (
-        rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
-    )
+    return rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
 
 
 def _build_empty_routing_control_block_for_rejection(
@@ -2878,9 +2903,7 @@ def _select_routing_inputs(
                 scale_dtype=act_dtype,
             )
         except Exception as exc:
-            return None, _RoutingSkip(
-                f"routing materialise error: {type(exc).__name__}: {exc}"
-            )
+            return None, _RoutingSkip(f"routing materialise error: {type(exc).__name__}: {exc}")
         inner_backend = getattr(moe, "backend", moe)
         routing_path = (
             "supplied_topk_run_moe"
@@ -2919,9 +2942,7 @@ def _select_routing_inputs(
             dtype=routing_logits_dtype,
         )
     except Exception as exc:
-        return None, _RoutingSkip(
-            f"native logits projection error: {type(exc).__name__}: {exc}"
-        )
+        return None, _RoutingSkip(f"native logits projection error: {type(exc).__name__}: {exc}")
 
     if projection_status != "exact" and rc_spec.projection_policy == "reject":
         return None, _RoutingSkip(
@@ -2940,9 +2961,7 @@ def _select_routing_inputs(
             router_logits=new_logits,
             realization_status=projection_status,
             realization_reason=projection_reason,
-            routing_path=(
-                "logits_native" if projection_status == "exact" else "logits_projected"
-            ),
+            routing_path=("logits_native" if projection_status == "exact" else "logits_projected"),
             warnings=warnings,
         ),
         None,
@@ -3485,7 +3504,7 @@ def _build_environment_block(world_size: int, cuda_graph_default: bool) -> Dict[
 
 
 def _excel_safe_sheet_name(name: str, used: set) -> str:
-    invalid = set('[]:*?/\\')
+    invalid = set("[]:*?/\\")
     base = "".join("_" if ch in invalid else ch for ch in str(name)).strip() or "sheet"
     base = base[:31]
     candidate = base
@@ -3527,14 +3546,14 @@ def _excel_cell_xml(row_idx: int, col_idx: int, value: Any) -> str:
 def _excel_sheet_xml(rows: List[List[Any]]) -> str:
     body: List[str] = []
     for row_idx, row in enumerate(rows, start=1):
-        cells = "".join(_excel_cell_xml(row_idx, col_idx, value) for col_idx, value in enumerate(row))
+        cells = "".join(
+            _excel_cell_xml(row_idx, col_idx, value) for col_idx, value in enumerate(row)
+        )
         body.append(f'<row r="{row_idx}">{cells}</row>')
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<sheetData>'
-        + "".join(body)
-        + "</sheetData></worksheet>"
+        "<sheetData>" + "".join(body) + "</sheetData></worksheet>"
     )
 
 
@@ -3550,7 +3569,9 @@ def _write_xlsx_workbook(path: str, sheets: List[Tuple[str, List[List[Any]]]]) -
     workbook_rels = []
     content_overrides = []
     for idx, (name, _rows) in enumerate(named_sheets, start=1):
-        workbook_sheets.append(f'<sheet name="{_xml_escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>')
+        workbook_sheets.append(
+            f'<sheet name="{_xml_escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>'
+        )
         workbook_rels.append(
             f'<Relationship Id="rId{idx}" '
             'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
@@ -3583,9 +3604,7 @@ def _write_xlsx_workbook(path: str, sheets: List[Tuple[str, List[List[Any]]]]) -
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        "<sheets>"
-        + "".join(workbook_sheets)
-        + "</sheets></workbook>"
+        "<sheets>" + "".join(workbook_sheets) + "</sheets></workbook>"
     )
     workbook_rels_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -3615,7 +3634,7 @@ def _flatten_result_for_analysis(row: Dict[str, Any]) -> Dict[str, Any]:
     actual = row.get("actual_config") or {}
     instrumentation = row.get("instrumentation") or {}
     latency = row.get("latency_us") or {}
-    routing_actual = ((row.get("routing_control") or {}).get("actual") or {})
+    routing_actual = (row.get("routing_control") or {}).get("actual") or {}
     dispatch_summary = routing_actual.get("observed_dispatch_matrix_summary") or {}
     hist_summary = routing_actual.get("observed_expert_histogram_summary") or {}
     kernel_breakdown = row.get("kernel_breakdown") or {}
@@ -3654,7 +3673,9 @@ def _flatten_result_for_analysis(row: Dict[str, Any]) -> Dict[str, Any]:
         "moe_forward_kernel_count": len(kernel_breakdown.get("moe_forward_kernels") or []),
         "other_kernel_count": len(kernel_breakdown.get("other_kernels") or []),
         "routing_path": routing_actual.get("routing_path"),
-        "routing_realization_status": (routing_actual.get("routing_realization") or {}).get("status"),
+        "routing_realization_status": (routing_actual.get("routing_realization") or {}).get(
+            "status"
+        ),
         "routing_observation_source": routing_actual.get("observation_source"),
         "routing_off_diagonal_ratio": dispatch_summary.get("off_diagonal_ratio"),
         "routing_active_experts": hist_summary.get("active_experts"),
@@ -3704,7 +3725,9 @@ _ANALYSIS_COLUMNS: Tuple[str, ...] = (
 
 
 def _analysis_table_rows(flat_rows: List[Dict[str, Any]]) -> List[List[Any]]:
-    return [list(_ANALYSIS_COLUMNS)] + [[row.get(col) for col in _ANALYSIS_COLUMNS] for row in flat_rows]
+    return [list(_ANALYSIS_COLUMNS)] + [
+        [row.get(col) for col in _ANALYSIS_COLUMNS] for row in flat_rows
+    ]
 
 
 def _best_by_workload_rows(rankings: List[Dict[str, Any]]) -> List[List[Any]]:
@@ -3754,7 +3777,9 @@ def _status_summary_rows(flat_rows: List[Dict[str, Any]]) -> List[List[Any]]:
         entry["count"] += 1
         if row.get("skip_reason"):
             entry["reasons"].add(str(row["skip_reason"]))
-    out: List[List[Any]] = [["num_tokens", "requested_backend", "requested_comm_method", "status", "count", "reasons"]]
+    out: List[List[Any]] = [
+        ["num_tokens", "requested_backend", "requested_comm_method", "status", "count", "reasons"]
+    ]
     for (num_tokens, backend, comm_method, status), entry in sorted(
         counts.items(),
         key=lambda item: (str(item[0][0]), str(item[0][1]), str(item[0][2]), str(item[0][3])),
@@ -4448,18 +4473,24 @@ _SEARCH_AXES = ("backend", "comm", "parallel")
 _SEARCH_MODES = ("none",) + _SEARCH_AXES + ("full",)
 
 
+def _normalize_csv_tokens(value: Any) -> List[str]:
+    """Normalise a ``nargs='+'`` / comma-separated / scalar input into tokens.
+
+    Splits on commas and whitespace, strips, lowercases, and drops empty
+    fragments. Preserves input order so the caller can deduplicate while
+    keeping a stable axis order in error messages.
+    """
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return [
+        part.strip().lower()
+        for item in items
+        for part in str(item).replace(",", " ").split()
+        if part.strip()
+    ]
+
+
 def _parse_search_axes(value: Any) -> Tuple[str, ...]:
-    if isinstance(value, (list, tuple)):
-        parts = [
-            part.strip().lower()
-            for item in value
-            for part in str(item).replace(",", " ").split()
-            if part.strip()
-        ]
-    else:
-        parts = [
-            part.strip().lower() for part in str(value).replace(",", " ").split() if part.strip()
-        ]
+    parts = _normalize_csv_tokens(value)
     if not parts:
         return ("none",)
 
@@ -4574,10 +4605,7 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
 
 
 def _parse_analysis(value: Any) -> Tuple[str, ...]:
-    if isinstance(value, (list, tuple)):
-        parts = [str(p).strip().lower() for p in value if str(p).strip()]
-    else:
-        parts = [p.strip().lower() for p in str(value).replace(",", " ").split() if p.strip()]
+    parts = _normalize_csv_tokens(value)
     valid = {"none", "kernels"}
     out: List[str] = []
     for p in parts:
@@ -4807,7 +4835,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
     if rank == 0:
         out_payload = _build_report_payload(
-            ctx=ctx, results=results, world_size=world_size, cuda_graph_default=bool(args.cuda_graph)
+            ctx=ctx,
+            results=results,
+            world_size=world_size,
+            cuda_graph_default=bool(args.cuda_graph),
         )
         if args.output_file:
             out_dir = os.path.dirname(args.output_file)
@@ -4816,9 +4847,9 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             with open(args.output_file, "w") as f:
                 json.dump(out_payload, f, indent=2)
             print(f"Report written to {args.output_file}", flush=True)
-            workbook_file = getattr(args, "analysis_workbook_file", None) or _default_analysis_workbook_path(
-                args.output_file
-            )
+            workbook_file = getattr(
+                args, "analysis_workbook_file", None
+            ) or _default_analysis_workbook_path(args.output_file)
             if workbook_file:
                 _write_analysis_workbook(out_payload, workbook_file)
                 print(f"Analysis workbook written to {workbook_file}", flush=True)
