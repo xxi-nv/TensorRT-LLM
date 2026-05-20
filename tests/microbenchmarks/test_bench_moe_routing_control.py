@@ -27,7 +27,9 @@ Run with::
 from __future__ import annotations
 
 import json
+import os
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -73,10 +75,9 @@ def test_parse_comm_pattern_pair_hotspot():
     assert kwargs == {"hotness": 0.5, "src": 0, "dst": 1}
 
 
-def test_parse_comm_pattern_file():
-    name, kwargs = bench_moe._parse_comm_pattern("file:/tmp/matrix.json")
-    assert name == "file"
-    assert kwargs == {"path": "/tmp/matrix.json"}
+def test_parse_comm_pattern_rejects_file_input():
+    with pytest.raises(ValueError):
+        bench_moe._parse_comm_pattern("file:/tmp/matrix.json")
 
 
 def test_parse_comm_pattern_invalid():
@@ -93,43 +94,6 @@ def test_parse_expert_pattern_active_experts():
 def test_parse_expert_pattern_requires_args():
     with pytest.raises(ValueError):
         bench_moe._parse_expert_pattern("hotspot")
-
-
-# ---------------------------------------------------------------------------
-# Scenario resolution
-# ---------------------------------------------------------------------------
-
-
-def test_scenario_balanced_baseline():
-    spec = bench_moe._resolve_scenario("balanced_baseline", RoutingControlSpec())
-    assert spec.routing_mode == "native"
-    assert spec.comm_pattern == "balanced_alltoall"
-    assert spec.expert_pattern == "balanced"
-
-
-def test_scenario_receiver_hotspot_75():
-    spec = bench_moe._resolve_scenario("receiver_hotspot_75", RoutingControlSpec())
-    assert spec.routing_mode == "native"
-    assert spec.projection_policy == "project"
-    assert spec.comm_pattern == "receiver_hotspot,hotness=0.75,rank=0"
-
-
-def test_scenario_local_only_baseline():
-    spec = bench_moe._resolve_scenario("local_only_baseline", RoutingControlSpec())
-    assert spec.projection_policy == "reject"
-    assert spec.comm_pattern == "local_only"
-
-
-def test_scenario_unknown_raises():
-    with pytest.raises(ValueError):
-        bench_moe._resolve_scenario("not_a_scenario", RoutingControlSpec())
-
-
-def test_scenario_explicit_overrides_preserved():
-    base = RoutingControlSpec(comm_pattern="local_only")
-    spec = bench_moe._resolve_scenario("receiver_hotspot_75", base)
-    # Explicit non-default ``comm_pattern`` wins over preset.
-    assert spec.comm_pattern == "local_only"
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +240,9 @@ def test_materialize_balanced_per_rank_shape_and_unique():
         for row in ids.tolist():
             assert len(set(row)) == 4, f"row {row} has duplicates"
         # Scales are uniform 1/top_k.
-        assert torch.allclose(scales, torch.full_like(scales, 0.25, dtype=scales.dtype), atol=1e-6)
+        assert torch.allclose(
+            scales, torch.full_like(scales, 0.25, dtype=scales.dtype), atol=1e-6
+        )
 
 
 def test_materialize_observes_match_plan_after_aggregation():
@@ -321,6 +287,45 @@ def test_explicit_per_rank_num_tokens_drives_max_per_rank():
     assert list(plan.per_rank_num_tokens) == [128, 128, 512, 128]
     # The matrix row sums reflect the explicit per-rank counts.
     assert sum(plan.dispatch_matrix[2]) == 512 * 4
+
+
+def test_routing_pattern_file_drives_dispatch_and_expert_histogram(tmp_path):
+    path = tmp_path / "routing_pattern.json"
+    matrix = [
+        [64, 0, 0, 0],
+        [0, 64, 0, 0],
+        [0, 0, 64, 0],
+        [0, 0, 0, 64],
+    ]
+    histogram = [
+        [64, 0, 0, 0],
+        [0, 64, 0, 0],
+        [0, 0, 64, 0],
+        [0, 0, 0, 64],
+    ]
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "ep_size": 4,
+                "experts_per_rank": 4,
+                "slot_dispatch_matrix": matrix,
+                "expert_histogram": histogram,
+            },
+            f,
+        )
+
+    spec = RoutingControlSpec(routing_pattern_file=str(path))
+    plan = bench_moe._build_routing_plan(
+        spec,
+        num_tokens=64,
+        world_size=4,
+        top_k=4,
+        num_experts=16,
+        moe_ep_size=4,
+    )
+
+    assert plan.dispatch_matrix == tuple(tuple(row) for row in matrix)
+    assert plan.expert_histogram == tuple(tuple(row) for row in histogram)
 
 
 def test_per_rank_num_tokens_length_mismatch_raises():
@@ -394,24 +399,30 @@ def test_dispatch_matrix_file_round_trip(tmp_path):
         [64, 64, 64, 64],
     ]
     with open(path, "w") as f:
-        json.dump({"schema": "v1", "ep_size": 4, "slot_dispatch_matrix": matrix}, f)
+        json.dump({"ep_size": 4, "slot_dispatch_matrix": matrix}, f)
     loaded = bench_moe._load_dispatch_matrix_file(str(path), ep_size=4)
     assert loaded == matrix
 
 
-def test_dispatch_matrix_file_schema_validation(tmp_path):
-    path = tmp_path / "bad.json"
+def test_dispatch_matrix_file_does_not_require_schema(tmp_path):
+    path = tmp_path / "no_schema.json"
+    matrix = [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+    ]
     with open(path, "w") as f:
-        json.dump({"schema": "v0", "ep_size": 4, "slot_dispatch_matrix": []}, f)
-    with pytest.raises(ValueError):
-        bench_moe._load_dispatch_matrix_file(str(path), ep_size=4)
+        json.dump({"ep_size": 4, "slot_dispatch_matrix": matrix}, f)
+
+    assert bench_moe._load_dispatch_matrix_file(str(path), ep_size=4) == matrix
 
 
 def test_dispatch_matrix_file_ep_mismatch(tmp_path):
     path = tmp_path / "wrong_ep.json"
     with open(path, "w") as f:
         json.dump(
-            {"schema": "v1", "ep_size": 2, "slot_dispatch_matrix": [[1, 0], [0, 1]]},
+            {"ep_size": 2, "slot_dispatch_matrix": [[1, 0], [0, 1]]},
             f,
         )
     with pytest.raises(ValueError):
@@ -431,8 +442,212 @@ def test_is_active_when_pattern_changed():
     assert RoutingControlSpec(comm_pattern="local_only").is_active is True
 
 
+def test_is_active_when_routing_pattern_file_set():
+    assert RoutingControlSpec(routing_pattern_file="/tmp/routing_pattern.json").is_active is True
+
+
 def test_is_active_when_per_rank_tokens_set():
     assert RoutingControlSpec(per_rank_num_tokens=(1, 2)).is_active is True
+
+
+def test_resolve_workloads_uses_balanced_total_num_tokens():
+    args = Namespace(
+        balanced_total_num_tokens=[4, 64, 32],
+        num_tokens=None,
+        routing_mode="native",
+        projection_policy="project",
+        comm_pattern="balanced_alltoall",
+        expert_pattern="balanced",
+        routing_pattern_file=None,
+        per_rank_num_tokens=None,
+        routing_dump_matrix=False,
+        routing_seed=0,
+    )
+    workloads = bench_moe._resolve_workloads_from_args(args)
+
+    assert [w.num_tokens for w in workloads] == [4, 64, 32]
+    assert all(w.routing_control.per_rank_num_tokens is None for w in workloads)
+
+
+def test_resolve_workloads_derives_total_from_per_rank_tokens():
+    args = Namespace(
+        balanced_total_num_tokens=None,
+        num_tokens=None,
+        routing_mode="native",
+        projection_policy="project",
+        comm_pattern="balanced_alltoall",
+        expert_pattern="balanced",
+        routing_pattern_file=None,
+        per_rank_num_tokens=[1, 1, 1, 1],
+        routing_dump_matrix=False,
+        routing_seed=0,
+    )
+    workloads = bench_moe._resolve_workloads_from_args(args)
+
+    assert len(workloads) == 1
+    assert workloads[0].num_tokens == 4
+    assert workloads[0].routing_control.per_rank_num_tokens == (1, 1, 1, 1)
+
+
+def test_resolve_workloads_rejects_total_and_per_rank_token_knobs_together():
+    args = Namespace(
+        balanced_total_num_tokens=[4],
+        num_tokens=None,
+        routing_mode="native",
+        projection_policy="project",
+        comm_pattern="balanced_alltoall",
+        expert_pattern="balanced",
+        routing_pattern_file=None,
+        per_rank_num_tokens=[1, 1, 1, 1],
+        routing_dump_matrix=False,
+        routing_seed=0,
+    )
+    with pytest.raises(ValueError):
+        bench_moe._resolve_workloads_from_args(args)
+
+
+def test_resolve_workloads_requires_explicit_expert_pattern_for_hotspot():
+    args = Namespace(
+        balanced_total_num_tokens=[64],
+        num_tokens=[64],
+        routing_mode="native",
+        projection_policy="project",
+        comm_pattern="balanced_alltoall",
+        expert_pattern="hotspot,hotness=0.5",
+        routing_pattern_file=None,
+        per_rank_num_tokens=None,
+        routing_dump_matrix=False,
+        routing_seed=0,
+    )
+    workloads = bench_moe._resolve_workloads_from_args(args)
+    assert len(workloads) == 1
+    assert workloads[0].routing_control.expert_pattern == "hotspot,hotness=0.5"
+
+
+def test_resolve_workloads_rejects_legacy_total_and_per_rank_token_knobs_together():
+    args = Namespace(
+        balanced_total_num_tokens=[64, 128],
+        num_tokens=[64, 128],
+        routing_mode="native",
+        projection_policy="project",
+        comm_pattern="balanced_alltoall",
+        expert_pattern="balanced",
+        routing_pattern_file=None,
+        per_rank_num_tokens=[16, 16, 16, 16],
+        routing_dump_matrix=False,
+        routing_seed=0,
+    )
+    with pytest.raises(ValueError):
+        bench_moe._resolve_workloads_from_args(args)
+
+
+def test_parse_analysis_none_disables_kernel_collection():
+    assert bench_moe._parse_analysis(["none"]) == ()
+    assert bench_moe._parse_analysis("none") == ()
+    assert bench_moe._parse_analysis(["kernels"]) == ("kernels",)
+
+
+def test_parse_search_axes_accepts_space_and_comma_separated_values():
+    assert bench_moe._parse_search_axes(["backend", "comm", "eplb"]) == ("backend", "comm", "eplb")
+    assert bench_moe._parse_search_axes("backend,comm,eplb") == ("backend", "comm", "eplb")
+    assert bench_moe._parse_search_axes(["backend,comm", "eplb"]) == ("backend", "comm", "eplb")
+
+
+def test_parse_search_axes_rejects_conflicting_modes():
+    with pytest.raises(ValueError):
+        bench_moe._parse_search_axes(["none", "backend"])
+    with pytest.raises(ValueError):
+        bench_moe._parse_search_axes(["full", "comm"])
+
+
+def test_resolve_search_combines_cli_axes_without_full_extras():
+    args = Namespace(
+        search=["backend", "comm"],
+        backend="ALL",
+        parallel_mode="DEP",
+        comm_method="AUTO",
+        eplb_mode="off",
+        _config_search_axes={},
+    )
+    search = bench_moe._resolve_search_from_args(
+        args, bench_moe.ConfigSpec(backend="TRTLLM", parallel_mode="DEP")
+    )
+
+    assert search.mode == "backend,comm"
+    assert search.backends == tuple(bench_moe._ALL_BACKENDS)
+    assert search.comm_methods == tuple(bench_moe._FORCED_COMM_ENV_VALUES.keys()) + ("AUTO",)
+    assert search.parallel_modes == ()
+    assert search.eplb_modes == ()
+    assert search.cuda_graph_options == ()
+
+
+def test_config_search_lists_limit_expanded_axes(tmp_path):
+    config_path = tmp_path / "bench_moe_config.json"
+    with open(config_path, "w") as f:
+        json.dump(
+            {
+                "search": {
+                    "backend": ["TRTLLM", "CUTLASS"],
+                    "parallel_mode": ["DEP"],
+                    "comm_method": ["AUTO", "DEEPEP"],
+                    "eplb_mode": ["off"],
+                }
+            },
+            f,
+        )
+
+    args = Namespace(
+        config_file=str(config_path),
+        _cli_provided=set(),
+        search="none",
+        backend="TRTLLM",
+        parallel_mode="DEP",
+        comm_method="AUTO",
+        eplb_mode="off",
+    )
+    args = bench_moe._maybe_load_config_file(args)
+    search = bench_moe._resolve_search_from_args(
+        args, bench_moe.ConfigSpec(backend="TRTLLM", parallel_mode="DEP")
+    )
+
+    assert search.mode == "backend,parallel,comm,eplb"
+    assert search.backends == ("TRTLLM", "CUTLASS")
+    assert search.parallel_modes == ("DEP",)
+    assert search.comm_methods == ("AUTO", "DEEPEP")
+    assert search.eplb_modes == ("off",)
+    assert search.cuda_graph_options == ()
+
+
+def test_config_search_list_respects_cli_override(tmp_path):
+    config_path = tmp_path / "bench_moe_config.json"
+    with open(config_path, "w") as f:
+        json.dump(
+            {
+                "search": {
+                    "backend": ["TRTLLM", "CUTLASS"],
+                    "comm_method": ["AUTO", "DEEPEP"],
+                }
+            },
+            f,
+        )
+
+    args = Namespace(
+        config_file=str(config_path),
+        _cli_provided={"backend"},
+        search="none",
+        backend="DENSEGEMM",
+        parallel_mode="DEP",
+        comm_method="AUTO",
+        eplb_mode="off",
+    )
+    args = bench_moe._maybe_load_config_file(args)
+    search = bench_moe._resolve_search_from_args(
+        args, bench_moe.ConfigSpec(backend="DENSEGEMM", parallel_mode="DEP")
+    )
+
+    assert search.mode == "comm"
+    assert search.backends == ()
+    assert search.comm_methods == ("AUTO", "DEEPEP")
 
 
 def test_observe_summary_matches_exact_plan():
