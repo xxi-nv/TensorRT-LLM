@@ -2658,35 +2658,47 @@ def _gather_status_per_rank(local_status: str) -> Dict[str, str]:
     return {f"rank{i}": s for i, s in enumerate(payload)}
 
 
+@dataclass(frozen=True)
+class _RoutingObservations:
+    """Observation matrices and counters fed into ``_build_routing_control_block``.
+
+    These are the four numbers the consumer cares about: the per-slot dispatch
+    matrix, per-token dispatch matrix, per-rank expert histogram, and the
+    optional ``num_chunks`` counter observed during the run. All come from a
+    deterministic re-materialisation of the canonical ``RoutingPlan`` -- see
+    ``_build_routing_control_block`` for the contract.
+    """
+
+    slot: List[List[int]]
+    token: List[List[int]]
+    hist: List[List[int]]
+    num_chunks: Optional[int] = None
+
+
 def _build_routing_control_block(
     *,
     spec: RoutingControlSpec,
     plan: RoutingPlan,
-    observed_slot: List[List[int]],
-    observed_token: List[List[int]],
-    observed_hist: List[List[int]],
+    observations: _RoutingObservations,
     routing_path: Optional[str],
     realization_status: str,
     realization_reason: str,
     enable_perfect_router: bool,
     max_num_tokens_per_rank: int,
-    num_chunks_observed: Optional[int],
     warnings: List[str],
     scale_dtype: torch.dtype,
     moe_ep_size: int,
-    dump_full: bool,
-    routing_mode: str,
 ) -> Dict[str, Any]:
     """Compose the ``routing_control`` block for a result row.
 
     Always includes ``requested`` and an ``actual`` summary; full slot/token
-    matrices and histograms are included only when ``dump_full`` is set, to
-    avoid JSON bloat during large sweeps.
+    matrices and histograms are included only when ``spec.routing_dump_matrix``
+    is set, to avoid JSON bloat during large sweeps.
 
-    NOTE on ``observed_*`` fields: the dispatch / histogram numbers reported
-    here are derived from a deterministic re-materialisation of the canonical
-    ``RoutingPlan`` -- they describe *the plan the bench asked the kernel to
-    realise*, not what the kernel actually emitted at runtime. The
+    NOTE on ``observations.*`` fields: the dispatch / histogram numbers
+    reported here are derived from a deterministic re-materialisation of the
+    canonical ``RoutingPlan`` -- they describe *the plan the bench asked the
+    kernel to realise*, not what the kernel actually emitted at runtime. The
     ``actual.observation_source`` field documents this. In ``forced`` mode the
     kernel is patched to consume the exact materialised top-k, so plan ==
     kernel output by construction. In ``native`` mode the kernel routes via
@@ -2694,6 +2706,13 @@ def _build_routing_control_block(
     quantisation, or projection-status='projected'; a warning is added so the
     consumer does not over-trust the slot/histogram numbers.
     """
+    routing_mode = spec.routing_mode
+    dump_full = bool(spec.routing_dump_matrix)
+    observed_slot = observations.slot
+    observed_token = observations.token
+    observed_hist = observations.hist
+    num_chunks_observed = observations.num_chunks
+
     requested_slot = [list(row) for row in plan.dispatch_matrix]
     max_abs, max_rel = _observe_summary(requested_slot, observed_slot)
     row_sums = [sum(row) for row in observed_slot]
@@ -2848,23 +2867,25 @@ def _build_empty_routing_control_block_for_rejection(
     act_dtype: torch.dtype,
 ) -> Dict[str, Any]:
     experts_per_rank = int(model.num_experts) // int(moe_ep_size)
+    ep = int(moe_ep_size)
+    empty_observations = _RoutingObservations(
+        slot=[[0] * ep for _ in range(ep)],
+        token=[[0] * ep for _ in range(ep)],
+        hist=[[0] * experts_per_rank for _ in range(ep)],
+        num_chunks=num_chunks,
+    )
     return _build_routing_control_block(
         spec=rc_spec,
         plan=routing_plan,
-        observed_slot=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
-        observed_token=[[0] * int(moe_ep_size) for _ in range(int(moe_ep_size))],
-        observed_hist=[[0] * experts_per_rank for _ in range(int(moe_ep_size))],
+        observations=empty_observations,
         routing_path=None,
         realization_status="rejected",
         realization_reason=rejected_reason,
         enable_perfect_router=enable_perfect_router,
         max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
-        num_chunks_observed=num_chunks,
         warnings=[],
         scale_dtype=act_dtype,
-        moe_ep_size=int(moe_ep_size),
-        dump_full=bool(rc_spec.routing_dump_matrix),
-        routing_mode=rc_spec.routing_mode,
+        moe_ep_size=ep,
     )
 
 
@@ -3029,23 +3050,24 @@ def _finalize_routing_control_block(
         model=model,
         moe_ep_size=int(moe_ep_size),
     )
+    observations = _RoutingObservations(
+        slot=observed_slot,
+        token=observed_token,
+        hist=observed_hist,
+        num_chunks=result.num_chunks,
+    )
     result.routing_control = _build_routing_control_block(
         spec=rc_spec,
         plan=routing_plan,
-        observed_slot=observed_slot,
-        observed_token=observed_token,
-        observed_hist=observed_hist,
+        observations=observations,
         routing_path=routing_inputs.routing_path,
         realization_status=routing_inputs.realization_status,
         realization_reason=routing_inputs.realization_reason,
         enable_perfect_router=enable_perfect_router,
         max_num_tokens_per_rank=max(per_rank) if per_rank else 0,
-        num_chunks_observed=result.num_chunks,
         warnings=routing_inputs.warnings,
         scale_dtype=act_dtype,
         moe_ep_size=int(moe_ep_size),
-        dump_full=bool(rc_spec.routing_dump_matrix),
-        routing_mode=rc_spec.routing_mode,
     )
 
 
