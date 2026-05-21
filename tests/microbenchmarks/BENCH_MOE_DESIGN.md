@@ -5,7 +5,7 @@
 
 > Status: **draft, revised after design review** (see §10 *Default Decisions*).
 >
-> Scope: a new MPI-based microbenchmark `tests/microbenchmarks/bench_moe.py` that
+> Scope: a new MPI-based microbenchmark `tests/microbenchmarks/bench_moe/__main__.py` that
 > times the **whole MoE module** (`ConfigurableMoE.forward`) — routing + dispatch
 > + GroupGEMM + activation + combine — across multiple model profiles, parallel
 > modes, backends, and synthetic load-imbalance configurations.
@@ -361,7 +361,7 @@ Evidence:
 ## 6. CLI Surface (proposed)
 
 ```text
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
     --model deepseek_v3                              # Req 1; or --num_experts/--top_k/--hidden_size/--intermediate_size/--quant
     [--routing_method DEFAULT|RENORMALIZE|RENORMALIZE_NAIVE|LLAMA4_RENORMALIZE|DEEPSEEK_V3|MINIMAX_M2|SIGMOID_RENORM]
     --num_tokens 16 64 256 1024                      # Req 4 (global; per-rank derived)
@@ -387,7 +387,7 @@ python tests/microbenchmarks/bench_moe.py \
 `mpirun` mode (multi-node):
 
 ```bash
-mpirun -n 4 python tests/microbenchmarks/bench_moe.py \
+mpirun -n 4 python tests/microbenchmarks/bench_moe/__main__.py \
     --model deepseek_v3 --backend best --num_tokens 64 256 \
     --parallel_mode DEP --cuda_graph
 ```
@@ -395,7 +395,7 @@ mpirun -n 4 python tests/microbenchmarks/bench_moe.py \
 `MPIPoolExecutor` mode (single-node, single-launcher):
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
     --world_size 4 --model deepseek_v3 --backend best --num_tokens 64 256 \
     --parallel_mode DEP --cuda_graph
 ```
@@ -405,7 +405,7 @@ python tests/microbenchmarks/bench_moe.py \
 ## 7. File Skeleton (single file, ~700–900 LOC, English comments only)
 
 ```text
-tests/microbenchmarks/bench_moe.py
+tests/microbenchmarks/bench_moe/__main__.py
 ├── License header + module docstring (with mpirun & spawn examples)
 ├── Imports
 │     ├── from tensorrt_llm.tools.layer_wise_benchmarks.runner import (

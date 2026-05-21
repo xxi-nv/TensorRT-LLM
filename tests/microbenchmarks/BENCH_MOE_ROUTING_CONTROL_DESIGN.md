@@ -5,7 +5,7 @@
 
 ## 目标
 
-为 `tests/microbenchmarks/bench_moe.py` 增加高级 routing 控制模式，让 benchmark 能有意生成通信流量和 expert 热点程度可控的 MoE routing workload。
+为 `tests/microbenchmarks/bench_moe/__main__.py` 增加高级 routing 控制模式，让 benchmark 能有意生成通信流量和 expert 热点程度可控的 MoE routing workload。
 
 这个目标不是替换模型原生 routing，而是让性能实验可复现：
 
@@ -668,8 +668,8 @@ expert_id = dst_rank * experts_per_rank + local_expert_id
 轻量检查：
 
 ```bash
-python3 -m py_compile tests/microbenchmarks/bench_moe.py
-git diff --check -- tests/microbenchmarks/bench_moe.py tests/microbenchmarks/*.md
+python3 -m py_compile tests/microbenchmarks/bench_moe/__main__.py
+git diff --check -- tests/microbenchmarks/bench_moe/__main__.py tests/microbenchmarks/*.md
 ```
 
 GPU validation 单独做：
