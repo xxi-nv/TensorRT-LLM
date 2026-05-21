@@ -27,7 +27,6 @@ Run with::
 from __future__ import annotations
 
 import json
-import os
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -240,9 +239,7 @@ def test_materialize_balanced_per_rank_shape_and_unique():
         for row in ids.tolist():
             assert len(set(row)) == 4, f"row {row} has duplicates"
         # Scales are uniform 1/top_k.
-        assert torch.allclose(
-            scales, torch.full_like(scales, 0.25, dtype=scales.dtype), atol=1e-6
-        )
+        assert torch.allclose(scales, torch.full_like(scales, 0.25, dtype=scales.dtype), atol=1e-6)
 
 
 def test_materialize_observes_match_plan_after_aggregation():
@@ -575,7 +572,7 @@ def test_resolve_search_combines_cli_axes_without_full_extras():
 
     assert search.mode == "backend,comm"
     assert search.backends == tuple(bench_moe._ALL_BACKENDS)
-    assert search.comm_methods == tuple(bench_moe._FORCED_COMM_ENV_VALUES.keys()) + ("AUTO",)
+    assert search.comm_methods == bench_moe._FORCED_COMM_ENV_VALUES + ("AUTO",)
     assert search.parallel_modes == ()
     assert search.eplb_modes == ()
     assert search.cuda_graph_options == ()
