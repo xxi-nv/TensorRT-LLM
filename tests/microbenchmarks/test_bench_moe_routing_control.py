@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only tests for bench_moe.py routing-control planning helpers.
+"""CPU-only tests for the ``bench_moe`` routing-control planning helpers.
 
 The tests intentionally do not touch GPU / MPI / TRT-LLM kernels. They only
 exercise the pure-Python plan construction, materialisation, and observation
-helpers that live in ``bench_moe.py``.
+helpers that live in the ``bench_moe`` package (``tests/microbenchmarks/bench_moe/``).
 
 Run with::
 
@@ -34,8 +34,8 @@ from pathlib import Path
 import pytest
 import torch
 
-# Mirror the path setup in bench_moe.py so this test can import the benchmark
-# module without requiring an installed TRT-LLM wheel.
+# Mirror the path setup in bench_moe/__init__.py so this test can import the
+# benchmark module without requiring an installed TRT-LLM wheel.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))

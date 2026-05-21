@@ -5,7 +5,7 @@
 
 ## Goal
 
-The goal is to evolve `tests/microbenchmarks/bench_moe.py` from a standalone
+The goal is to evolve `tests/microbenchmarks/bench_moe/__main__.py` from a standalone
 MoE microbenchmark into a data generator for a user-facing MoE performance
 dashboard.
 
@@ -657,7 +657,7 @@ Specific issues:
 Quick fixed run:
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
   --model deepseek_v3 \
   --num_tokens 1 2 4 8 16 32 64 128 \
   --backend TRTLLM \
@@ -669,7 +669,7 @@ python tests/microbenchmarks/bench_moe.py \
 Backend search:
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
   --model deepseek_v3 \
   --num_tokens 1 2 4 8 16 32 64 128 \
   --search backend
@@ -678,7 +678,7 @@ python tests/microbenchmarks/bench_moe.py \
 Full dashboard data generation:
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
   --model deepseek_v3 \
   --num_tokens 1 2 4 8 16 32 64 128 256 512 1024 \
   --search full \
@@ -689,7 +689,7 @@ python tests/microbenchmarks/bench_moe.py \
 Dashboard pipeline run from a config file:
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
   --config_file configs/moe_dashboard_deepseek_v3.json
 ```
 
@@ -721,7 +721,7 @@ Example config file:
 Advanced custom shape:
 
 ```bash
-python tests/microbenchmarks/bench_moe.py \
+python tests/microbenchmarks/bench_moe/__main__.py \
   --num_experts 384 \
   --top_k 6 \
   --hidden_size 7168 \

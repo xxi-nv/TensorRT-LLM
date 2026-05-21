@@ -5,7 +5,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>bench_moe.py 用户使用指导</title>
+  <title>bench_moe 用户使用指导</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -152,13 +152,31 @@
 <main>
   <section class="hero">
     <span class="tag">TensorRT-LLM MoE Microbenchmark</span>
-    <h1>bench_moe.py 用户使用指导</h1>
+    <h1>bench_moe 用户使用指导</h1>
     <p>
-      <code>tests/microbenchmarks/bench_moe.py</code> 用 synthetic inputs 直接计时
+      <code>tests/microbenchmarks/bench_moe/__main__.py</code> 用 synthetic inputs 直接计时
       <code>ConfigurableMoE.forward</code>，最常见的用途是：给定模型 shape、token 数和 routing 形状后，
       比较不同 <strong>backend</strong>、<strong>communication method</strong>、并行布局、
       routing 形状和 CUDA Graph 设置的 MoE latency。
     </p>
+    <p>
+      <strong>高级用法：</strong>除了上面的"常规组合"外，bench 还允许 <em>自定义 dispatch 通信量</em>
+      和 <em>expert hotspot</em>，用来重放 trace 形状或构造极端 workload：
+    </p>
+    <ul>
+      <li>
+        参数化模板（覆盖大多数对称形状）：用 <code>--comm_pattern</code> 控制 source→target dispatch
+        分布（<code>receiver_hotspot</code> / <code>pair_hotspot</code> / <code>local_only</code> /
+        <code>ring</code> 等），用 <code>--expert_pattern</code> 控制每个 target rank 内的 local-expert
+        热点（<code>balanced</code> / <code>hotspot,hotness=...</code> 等）。
+      </li>
+      <li>
+        任意 trace 形状（参数化模板覆盖不到时）：用 <code>--routing_pattern_file</code>
+        提供一个 JSON，同时固定 <code>slot_dispatch_matrix</code> 和
+        <code>expert_histogram</code> 两个矩阵，跳过所有模板。详见
+        <a href="#common-cases">案例 H</a>。
+      </li>
+    </ul>
     <p class="muted">
       推荐阅读顺序：先看 <a href="#mental-model">三步用法</a> 和
       <a href="#common-cases">常用案例</a>，再看 <a href="#search-spaces">搜索空间</a>，
@@ -193,7 +211,9 @@
         最常用的是 <code>--search backend</code> 搜所有 backend，或 <code>--search comm</code>
         固定 backend 搜通信方式。<code>--backend</code>、<code>--comm_method</code>、
         <code>--parallel_mode</code> 都支持多值，例如 <code>--backend CUTLASS DEEPGEMM</code>
-        只搜这两个；传 &gt;1 个值会自动开启对应搜索轴。<code>--max_configs</code> 控制规模。
+        只搜这两个；传 &gt;1 个值会自动开启对应搜索轴。默认会跑完所有合法候选，需要
+        限制规模或 wall-clock 时再看
+        <a href="#sweep-limits">限制搜索规模和总耗时</a>。
       </p>
     </div>
     <div class="card">
@@ -208,7 +228,7 @@
 
   <div class="note">
     <strong>一句话模板：</strong>
-    <code>python tests/microbenchmarks/bench_moe.py --world_size N --model MODEL --parallel_mode DEP --balanced_total_num_tokens ... --search ... --output_file out.json</code>
+    <code>python tests/microbenchmarks/bench_moe/__main__.py --world_size N --model MODEL --parallel_mode DEP --balanced_total_num_tokens ... --search ... --output_file out.json</code>
   </div>
 
   <h2 id="common-cases">2. 常用案例</h2>
@@ -218,7 +238,7 @@
   </p>
 
   <h3>案例 A：单卡 sanity，确认环境能跑</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 1 \
   --model mixtral_8x7b \
   --backend CUTLASS \
@@ -228,7 +248,7 @@
   <p><strong>用途：</strong>确认 import、CUDA、backend 构建和 basic timing 能跑通。</p>
 
   <h3>案例 B：4 卡 DEP，搜索所有 backend</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --parallel_mode DEP \
   --model deepseek_v3 \
@@ -243,7 +263,7 @@
   </p>
 
   <h3>案例 C：固定 backend，搜索通信方式</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -254,13 +274,12 @@
   <p><strong>用途：</strong>回答“TRTLLM backend 下 AUTO、NVLink、DeepEP、AllGather 哪个通信路径最好”。</p>
 
   <h3>案例 D：同时搜索 backend 和 comm</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
   --search backend comm \
   --balanced_total_num_tokens 64 128 256 \
-  --max_configs 40 \
   --output_file out/deepseek_v3_backend_comm_full.json</code></pre>
   <p>
     <strong>用途：</strong>让搜索空间覆盖 backend 和 comm，其它轴用 base config。
@@ -269,10 +288,12 @@
     （多值会自动开启对应搜索轴，可省略 <code>--search</code>；也可显式写以表意更清晰）。
     多个搜索轴用空格分隔；逗号写法 <code>--search backend,comm</code> 也能解析，但推荐空格写法以对齐
     <code>--balanced_total_num_tokens 64 128 256</code> 这类多值选项。
+    笛卡尔积变得过大或 wall-clock 顶不住时，再叠加
+    <a href="#sweep-limits">限制搜索规模和总耗时</a> 一节中的两个 knob。
   </p>
 
   <h3>案例 E：receiver-hotspot，研究接收端通信压力</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --parallel_mode DEP \
   --model deepseek_v3 \
@@ -285,7 +306,7 @@
   </p>
 
   <h3>案例 F：source-rank token skew</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -300,7 +321,7 @@
   </p>
 
   <h3>案例 G：local-only baseline，估计最低通信量下界</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -316,6 +337,26 @@
   </p>
 
   <h3>案例 H：routing pattern file 表达 CLI 表达不了的高级 routing 形状</h3>
+
+  <p>
+    <strong>想要测什么：</strong>线上模型的 MoE routing 往往不是规则的——某些 source rank 偏好特定 target，
+    某些 target rank 上又恰好有几个 expert 被严重打热。当你从 trace、profiler dump 或离线分析中拿到了一个
+    具体的 routing 形状（"rank 0 给自己 5 个 slot、给 rank 3 两个 slot；rank 2 的本地 expert 2 拿走了
+    全部 7 个 slot"等），目标是把这个 <em>原样</em> 喂给 bench，对比不同 backend / comm 在这个
+    workload 下的 latency 和 kernel breakdown。
+  </p>
+
+  <p>
+    <strong>为什么 CLI 表达不了：</strong><code>--comm_pattern</code> 和 <code>--expert_pattern</code>
+    是一组参数化模板（<code>receiver_hotspot</code>、<code>pair_hotspot</code>、<code>hotspot</code>
+    等），都假设 <em>对称</em> ——每个 source row 形状一致、每个 target row 的 expert 热点形状一致；
+    所有不规则性只能通过单个标量（如 <code>hotness</code>、<code>rank</code>）调。一旦实际矩阵每行都不同、
+    或每个 target rank 的 expert 热点位置/比例都不同，CLI 模板就覆盖不到。
+    <code>--routing_pattern_file</code> 是为这种"非模板"形状准备的逃生通道：
+    一个 JSON 文件 <em>同时</em> 固定 <code>slot_dispatch_matrix</code> 和 <code>expert_histogram</code>，
+    跳过所有 pattern 模板。
+  </p>
+
   <pre><code># advanced_routing_pattern.json
 {
   "ep_size": 4,
@@ -333,7 +374,67 @@
     [2, 2, 1, 4]
   ]
 }</code></pre>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+
+  <p>
+    <strong><code>slot_dispatch_matrix</code> 的含义：</strong>
+    形状是 <code>[ep_size][ep_size]</code>，索引方向是 <em>source rank → target rank</em>。
+    单元 <code>slot_dispatch_matrix[src][dst]</code> 表示从 source rank <code>src</code>
+    发往 target rank <code>dst</code> 的 <em>slot</em> 数（每一个 <code>(token, selected_expert)</code>
+    组合计为一个 slot；同一个 token 选了 <code>top_k</code> 个 expert 就贡献 <code>top_k</code> 个 slot）。
+  </p>
+  <ul>
+    <li>
+      <strong>Row sum 不变量：</strong><code>sum(row src) == per_rank_num_tokens[src] * top_k</code>。
+      上面例子里每行都 = 8 = 4 tokens × top_k 2，对应 <code>--balanced_total_num_tokens 16</code> 在 4 个 rank
+      上每 rank 分到 4 个 token。Bench 在解析文件时会校验这一点，对不上立刻报错。
+    </li>
+    <li>
+      <strong>Column sum 的物理意义：</strong>是 target rank <code>dst</code> 在 dispatch 后总共要接收的
+      slot 数，直接决定 dispatch all-to-all 的接收侧 payload 以及该 rank 上 MoE compute 的总工作量。
+    </li>
+    <li>
+      <strong>逐行解读例子：</strong>row 0 = <code>[5, 0, 1, 2]</code>，表示 rank 0 把 8 个 slot 中的
+      5 个发给自己、0 个发给 rank 1、1 个发给 rank 2、2 个发给 rank 3 ——这是个"自亲和"形状。
+      row 2 = <code>[0, 2, 4, 2]</code>，rank 2 不给 rank 0 发任何东西，更偏向自身和邻居。
+      4 行各不相同，CLI 的任何对称模板都凑不出这个分布。
+    </li>
+  </ul>
+
+  <p>
+    <strong><code>expert_histogram</code> 的含义：</strong>
+    形状是 <code>[ep_size][experts_per_rank]</code>，索引方向是 <em>target rank → 该 rank 上的 local expert</em>。
+    单元 <code>expert_histogram[dst][le]</code> 表示 target rank <code>dst</code> 上的 local expert
+    <code>le</code> 在本次 forward 中拿到的 slot 总数（已经把全局所有 source rank 发过来的 slot 加在一起）。
+    这是 MoE compute 阶段的 per-expert workload，直接决定 grouped-GEMM 的 tile 切分、padding waste 和 tail 行为。
+  </p>
+  <ul>
+    <li>
+      <strong>全局总和（硬约束）：</strong>
+      <code>sum(expert_histogram) == sum(per_rank_num_tokens) * top_k</code>
+      = 总 token 数 × top_k = 总 slot 数。例子里 = 16 × 2 = 32 ✓。这一条 bench 在
+      <code>_build_routing_plan</code> 阶段强校验，对不上直接报错。
+    </li>
+    <li>
+      <strong>Per-row sum（强烈建议对齐 dispatch column sum）：</strong>对每个 target rank
+      <code>dst</code>，理想情况下 <code>sum(expert_histogram[dst])</code> 应当等于
+      <code>slot_dispatch_matrix</code> 第 <code>dst</code> 列的 column sum——rank <code>dst</code> 收到多少
+      slot，就要摊到自己的 local expert 上。这一条 bench <em>不</em> 在 plan 阶段强校验（只看全局和），
+      但 materialiser 在把 dispatch cell 分摊到 local expert 时只把 <code>expert_histogram[dst]</code>
+      当作权重（按比例切分），所以行和如果不匹配 column sum，<code>routing_control.actual</code>
+      里会观察到 <code>max_abs_slot_error &gt; 0</code>。例子里 col 0 = 5+1+0+2 = 8，rank 0 的
+      expert_histogram row 0 = <code>[5, 1, 1, 1]</code> sum = 8 ✓；col 2 = 1+1+4+1 = 7，row 2 =
+      <code>[0, 0, 7, 0]</code> sum = 7 ✓——构造时手动对齐，能保证 observed 和 requested 完全一致。
+    </li>
+    <li>
+      <strong>逐行解读例子：</strong>row 2 = <code>[0, 0, 7, 0]</code> 是个极端 expert-hotspot：rank 2
+      接收的 7 个 slot 全部落到本地 expert 2，另外 3 个 local expert 完全空闲，对应 grouped GEMM 里一个超大
+      group + 三个 zero group。row 3 = <code>[2, 2, 1, 4]</code> 则是相对均匀但偏向某一个 expert 的形状。
+      CLI 的 <code>hotspot</code> 只能描述"每个 rank 用同一种 hotness/active_experts"，做不到 row 2 和
+      row 3 各自不同的形状。
+    </li>
+  </ul>
+
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --parallel_mode DEP \
   --num_experts 16 \
@@ -348,11 +449,25 @@
   --routing_pattern_file advanced_routing_pattern.json \
   --routing_dump_matrix \
   --output_file out/advanced_routing_pattern.json</code></pre>
+
   <p>
-    <strong>用途：</strong>当每个 source rank 的目标 rank 分布都不同、且每个 target rank 内部 expert 热点也不同
-    时，CLI 的 <code>receiver_hotspot</code>、<code>pair_hotspot</code>、<code>hotspot</code> 只能表达少数规则化模式。
-    这类从 trace 或外部工具得到的任意矩阵需要用 <code>--routing_pattern_file</code> 同时固定
-    <code>slot_dispatch_matrix</code> 和 <code>expert_histogram</code>。
+    <strong>结果怎么验：</strong>
+    打开 <code>out/advanced_routing_pattern.json</code> 的 result row，比对
+    <code>routing_control.actual</code> 里的 <code>observed_slot_dispatch_matrix</code> 和
+    <code>observed_expert_histogram</code> 与你传入的两个矩阵是否一致；
+    <code>--routing_mode forced</code> 会让 bench 直接 supply top-k，所以二者应当 bit-exact。
+    如果走 <code>--routing_mode native</code>，则可能出现
+    <code>routing_realization.status = projected/rejected</code>，需要看
+    <code>max_abs_slot_error</code> 判断实际形状离请求多远。
+  </p>
+
+  <p>
+    <strong>常见坑：</strong>
+    <code>--routing_pattern_file</code> 已经同时固定了两个矩阵，不能再叠加非默认的
+    <code>--comm_pattern</code> 或 <code>--expert_pattern</code>，否则会报冲突；
+    JSON 里的 <code>ep_size</code>/<code>experts_per_rank</code> 必须与 runtime（由
+    <code>--world_size</code>、<code>--num_experts</code> 等推算出来）严格一致；
+    每行 row sum 必须满足上面两条不变量，否则解析阶段就会 fail 出来。
   </p>
 
   <h3>案例 I：从 JSON config 自定义搜索空间运行 dashboard sweep</h3>
@@ -373,10 +488,9 @@
     "comm_method": ["AUTO", "NVLINK_ONE_SIDED", "DEEPEP"]
   },
   "analysis": ["kernels"],
-  "max_configs": 32,
   "output_file": "out/deepseek_v3_dashboard.json"
 }</code></pre>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --config_file configs/deepseek_v3_dashboard.json</code></pre>
   <p>
     <strong>用途：</strong>面向 customer / custom benchmark 时，把“只关心的 backend、parallel layout、comm method”
@@ -460,20 +574,19 @@
     <li><code>--comm_method</code>：未给 → 上述六种全部；给 list 则只搜 list。</li>
   </ul>
 
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
   --search backend comm \
   --balanced_total_num_tokens 128 256 \
-  --max_configs 32 \
   --output_file out/backend_comm_search.json</code></pre>
 
   <p>
     上面命令省略了 <code>--backend</code> 和 <code>--comm_method</code>，两个轴都展开为全集。
     若只想比较子集，例如 CUTLASS/DEEPGEMM 配 NVLINK_ONE_SIDED/DEEPEP：
   </p>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -511,7 +624,6 @@
     "parallel_mode": ["DEP"],
     "comm_method": ["AUTO", "NVLINK_ONE_SIDED"]
   },
-  "max_configs": 8,
   "output_file": "out/customer_dep_comm_compare.json"
 }</code></pre>
   <p>
@@ -538,7 +650,8 @@
       </tr>
       <tr>
         <td>backend 和 comm 组合里谁最好？</td>
-        <td><code>--search backend comm --max_configs N</code></td>
+        <td><code>--search backend comm</code>（笛卡尔积过大时再看
+            <a href="#sweep-limits">限制搜索规模和总耗时</a>）</td>
       </tr>
       <tr>
         <td>只想比较 backend 子集 (e.g. CUTLASS vs DEEPGEMM)？</td>
@@ -730,14 +843,14 @@
     "comm_method": "NVLinkOneSided",
     "cuda_graph": true,
     "use_low_precision_moe_combine": false,
-    "score_us": 850.2,
+    "score_ms": 0.8502,
     "status": "success"
   },
   "ranking": [...]
 }</code></pre>
   <p>
     <code>best</code> 是同一个 <code>num_tokens</code> 和 <code>parallel_mode</code> 组内
-    <code>score_us</code> 最低的成功 case。skip/failed 候选仍在 <code>ranking</code> 中，方便看它为什么不可用。
+    <code>score_ms</code> 最低的成功 case。skip/failed 候选仍在 <code>ranking</code> 中，方便看它为什么不可用。
   </p>
 
   <h3>再看 result row</h3>
@@ -754,7 +867,7 @@
       <tr><td><code>actual_config</code></td><td>实际运行到的 backend、comm、scheduler、EP/TP、chunk 数。</td></tr>
       <tr><td><code>status</code></td><td><code>success</code>、<code>skipped</code> 或 <code>failed</code>。</td></tr>
       <tr><td><code>skip_reason</code></td><td>候选被剪枝、跳过或失败时的原因。</td></tr>
-      <tr><td><code>latency_us.score</code></td><td>默认 score：每次迭代取最慢 rank，再对迭代求平均。</td></tr>
+      <tr><td><code>latency_ms.score</code></td><td>默认 score：每次迭代取最慢 rank，再对迭代求平均（单位 ms）。</td></tr>
       <tr><td><code>kernel_breakdown</code></td><td>kernel 分类统计；<code>--analysis none</code> 时不会采集。</td></tr>
       <tr><td><code>routing_control</code></td><td>请求 routing 形状和实际观测形状的对比。</td></tr>
     </tbody>
@@ -807,7 +920,7 @@
         <td>长度必须等于 <code>world_size</code>；它和 <code>--balanced_total_num_tokens</code> 互斥，总和就是该 workload 的全局 token 数。</td>
       </tr>
       <tr>
-        <td><code>phase_times_us</code> 为空</td>
+        <td><code>phase_times_ms</code> 为空</td>
         <td>当前 scheduler-side phase marker 尚未实现；只能看 latency 和 kernel breakdown。</td>
       </tr>
       <tr>
@@ -845,13 +958,13 @@
       </tr>
       <tr>
         <td>外部 MPI</td>
-        <td><code>mpirun -n N python tests/microbenchmarks/bench_moe.py ...</code></td>
+        <td><code>mpirun -n N python tests/microbenchmarks/bench_moe/__main__.py ...</code></td>
         <td>脚本检测到外部 MPI world size 后，直接在这些 rank 上运行。</td>
       </tr>
     </tbody>
   </table>
 
-  <pre><code>mpirun -n 4 python tests/microbenchmarks/bench_moe.py \
+  <pre><code>mpirun -n 4 python tests/microbenchmarks/bench_moe/__main__.py \
   --model deepseek_v3 \
   --parallel_mode DEP \
   --search backend \
@@ -897,7 +1010,7 @@
   </table>
 
   <h3>自定义 shape</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 1 \
   --num_experts 384 \
   --top_k 6 \
@@ -1153,7 +1266,7 @@
     </tbody>
   </table>
 
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode CUSTOM \
@@ -1213,7 +1326,7 @@
   <div class="note">
     <strong>当前 phase 状态：</strong>
     scheduler-side phase marker 尚未实现，因此 CLI 不再暴露 <code>phases</code> analysis。
-    当前输出中 <code>phase_timing_available=false</code>，<code>phase_times_us</code> 为空结构。
+    当前输出中 <code>phase_timing_available=false</code>，<code>phase_times_ms</code> 为空结构。
   </div>
 
   <p>
@@ -1319,7 +1432,7 @@
     [960, 0, "... length = experts_per_rank"]
   ]
 }</code></pre>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -1334,7 +1447,7 @@
     <code>expert_histogram</code> 的每个 target-rank row sum 应该与 dispatch matrix 的对应 column sum 一致。</p>
 
   <h3>DeepSeek-V3 native projection 偏差分析</h3>
-  <pre><code>python tests/microbenchmarks/bench_moe.py \
+  <pre><code>python tests/microbenchmarks/bench_moe/__main__.py \
   --world_size 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
@@ -1348,6 +1461,61 @@
   <p><strong>用途：</strong>测量 DeepSeek-V3 的 <code>n_group</code>/<code>topk_group</code> 约束下，
     benchmark projection 与 requested matrix 的偏差。<code>routing_control.actual.routing_realization</code>
     里有 <code>max_abs_slot_error</code> 和 <code>max_relative_slot_error</code>。</p>
+
+  <h3 id="sweep-limits">限制搜索规模和总耗时</h3>
+  <p>
+    默认情况下 bench 会跑完所有 capability gate 通过的候选；本节的两个 knob 都
+    <em>默认不启用</em>，只在显式传入时才生效。当 sweep 笛卡尔积过大、或在 CI / 时间盒里
+    需要把 wall-clock 钉住时再打开。
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>默认</th>
+        <th>语义</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>--max_configs N</code></td>
+        <td>未启用（跑完全部合法候选）</td>
+        <td>
+          剪枝（backend capability、parallel mapping、forced comm 合法性）<em>之后</em>，
+          保留前 <code>N</code> 个 <em>有效</em> 候选；其余候选会以 <code>status="skipped"</code> 和
+          <code>skip_reason="truncated by --max_configs=N"</code> 写进结果，方便复盘哪些被截断。
+          注意：被剪枝的不计入 <code>N</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><code>--time_budget_minutes M</code></td>
+        <td>未启用（无 wall-clock 上限）</td>
+        <td>
+          deadline 在 sweep 主循环开始时 capture（<code>time.monotonic() + M*60</code>）。
+          每个候选启动之前检查一次，超过 deadline 就不再启动新候选，剩余候选全部标
+          <code>status="skipped"</code>、<code>skip_reason="time_budget_exceeded"</code>。
+          当前正在跑的候选 <em>不会</em> 被打断，所以实际总耗时通常会略微超过 <code>M</code>。
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    两个 knob 可以同时使用，<code>--max_configs</code> 限"候选数量上限"、
+    <code>--time_budget_minutes</code> 限"wall-clock 上限"，先到先生效。
+    单个候选自己 hang 住（例如 NCCL 死锁）请用 <code>--per_candidate_timeout_s</code>，
+    它由 watchdog 线程 + <code>SIGKILL</code> 实现，与本节的两个 knob 互补；详见
+    <code>BENCH_MOE_DESIGN.md</code>。
+  </p>
+  <pre><code># 例：搜索 backend×comm 笛卡尔积，但最多只跑 32 个有效候选且不超过 30 分钟
+python tests/microbenchmarks/bench_moe/__main__.py \
+  --world_size 4 \
+  --model deepseek_v3 \
+  --parallel_mode DEP \
+  --search backend comm \
+  --balanced_total_num_tokens 128 256 \
+  --max_configs 32 \
+  --time_budget_minutes 30 \
+  --output_file out/bounded_sweep.json</code></pre>
 
 </main>
 </body>

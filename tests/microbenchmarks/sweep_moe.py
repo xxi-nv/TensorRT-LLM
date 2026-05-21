@@ -63,7 +63,7 @@ _RETRYABLE_EXIT_CODES = {
     -int(signal.SIGKILL),
 }
 
-_DEFAULT_BENCH_PATH = Path(__file__).resolve().parent / "bench_moe.py"
+_DEFAULT_BENCH_PATH = Path(__file__).resolve().parent / "bench_moe" / "__main__.py"
 
 # Args we always set per-leaf; user-supplied copies of these are stripped from
 # the pass-through bench_args to avoid silent argparse override surprises.
@@ -126,7 +126,10 @@ def _parse_driver_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--bench_script",
         default=str(_DEFAULT_BENCH_PATH),
-        help="Path to bench_moe.py. Defaults to the copy next to this driver.",
+        help=(
+            "Path to the bench_moe entry script. Defaults to "
+            "bench_moe/__main__.py next to this driver."
+        ),
     )
     parser.add_argument(
         "--python_executable",
