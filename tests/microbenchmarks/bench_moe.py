@@ -120,7 +120,7 @@ import traceback
 import zipfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
 from xml.sax.saxutils import escape as _xml_escape
 
 # ---------------------------------------------------------------------------
@@ -3071,44 +3071,32 @@ def _finalize_routing_control_block(
     )
 
 
-def _run_one_candidate(
+def _resolve_layout_and_plan(
     *,
+    result: RunResult,
     model: ModelSpec,
     workload: WorkloadSpec,
     config: ConfigSpec,
     world_size: int,
-    rank: int,
-    device: torch.device,
-    act_dtype: torch.dtype,
-    routing_logits_dtype: torch.dtype,
-    warmup: int,
-    iters: int,
-    fast_autotune: bool,
-    analysis: Tuple[str, ...],
-    cupti_ctx: Optional[Any],
-) -> RunResult:
-    """Build, autotune, and time one ``ConfigSpec`` candidate.
+    rc_spec: RoutingControlSpec,
+    rc_active: bool,
+) -> Union[RunResult, Tuple[int, List[int], Optional[RoutingPlan]]]:
+    """Step 1 of ``_run_one_candidate``: resolve layout, routing plan, per-rank tokens.
 
-    Always returns a ``RunResult``; failures are encoded in the ``status`` /
-    ``skip_reason`` fields so the caller can write a row even for a failed
-    case. Every early-return path goes through ``_short_circuit`` so the
-    per-rank status allgather completes on every rank.
+    Resolves the EP-axis ``moe_ep_size`` from the candidate config (the
+    Mapping object built later will agree), validates that routing-control
+    cases satisfy ``moe_ep_size == world_size`` (so the dispatch_matrix axis
+    aligns with the per-rank token distribution), and either builds the
+    canonical ``RoutingPlan`` from ``rc_spec`` or falls back to a uniform
+    per-rank token split.
 
-    Pipeline:
-        Step 1  Resolve EP/TP layout and routing plan (if routing-control)
-        Step 2  Build mapping, configure AutoTuner, force comm method
-        Step 3  Build the MoE module and validate the actual backend
-        Step 4  Synthesise inputs and (if routing-control) pick routing inputs
-        Step 5  Run autotune and time the forward (eager or CUDA graph)
-        Step 6  Aggregate latency / kernels / bottleneck and routing observation
+    Returns either:
+    - ``RunResult`` (already short-circuited) on any layout/plan error, or
+    - ``(moe_ep_size, per_rank, routing_plan)`` on success.
+
+    The ``per_rank`` list is padded with zeros when ``EP < world`` so MoE-
+    replicated source ranks share the same EP-axis bucket.
     """
-    result = RunResult(model=model, workload=workload, config=config)
-    rc_spec = workload.routing_control
-    rc_active = rc_spec.is_active
-
-    # ---- Step 1: layout + routing plan ----------------------------------
-    # Resolve EP-axis ``moe_ep_size`` from the candidate now so routing-plan
-    # building can use it; the Mapping object built later will agree.
     try:
         moe_ep_size, _moe_tp_size, _enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
@@ -3151,6 +3139,58 @@ def _run_one_candidate(
             per_rank = per_rank + [0] * (world_size - len(per_rank))
     else:
         per_rank = _per_rank_tokens(workload, world_size)
+
+    return int(moe_ep_size), per_rank, routing_plan
+
+
+def _run_one_candidate(
+    *,
+    model: ModelSpec,
+    workload: WorkloadSpec,
+    config: ConfigSpec,
+    world_size: int,
+    rank: int,
+    device: torch.device,
+    act_dtype: torch.dtype,
+    routing_logits_dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+    fast_autotune: bool,
+    analysis: Tuple[str, ...],
+    cupti_ctx: Optional[Any],
+) -> RunResult:
+    """Build, autotune, and time one ``ConfigSpec`` candidate.
+
+    Always returns a ``RunResult``; failures are encoded in the ``status`` /
+    ``skip_reason`` fields so the caller can write a row even for a failed
+    case. Every early-return path goes through ``_short_circuit`` so the
+    per-rank status allgather completes on every rank.
+
+    Pipeline:
+        Step 1  Resolve EP/TP layout and routing plan (if routing-control)
+        Step 2  Build mapping, configure AutoTuner, force comm method
+        Step 3  Build the MoE module and validate the actual backend
+        Step 4  Synthesise inputs and (if routing-control) pick routing inputs
+        Step 5  Run autotune and time the forward (eager or CUDA graph)
+        Step 6  Aggregate latency / kernels / bottleneck and routing observation
+    """
+    result = RunResult(model=model, workload=workload, config=config)
+    rc_spec = workload.routing_control
+    rc_active = rc_spec.is_active
+
+    # ---- Step 1: layout + routing plan ----------------------------------
+    layout = _resolve_layout_and_plan(
+        result=result,
+        model=model,
+        workload=workload,
+        config=config,
+        world_size=world_size,
+        rc_spec=rc_spec,
+        rc_active=rc_active,
+    )
+    if isinstance(layout, RunResult):
+        return layout
+    moe_ep_size, per_rank, routing_plan = layout
 
     result.per_rank_num_tokens = list(per_rank)
     local_num_tokens = per_rank[rank] if rank < len(per_rank) else 0
@@ -5112,6 +5152,204 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+def _load_and_broadcast_resume_state(
+    rank: int, resume_path: Optional[str]
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load ``--resume_from`` payload on rank 0 and broadcast to all ranks.
+
+    Returns ``(resumed_by_key, resumed_rows)``. Returns empty containers when
+    ``resume_path`` is unset or the bcast fails (with a logged warning so the
+    operator can decide whether divergence matters).
+    """
+    resumed_by_key: Dict[str, Dict[str, Any]] = {}
+    resumed_rows: List[Dict[str, Any]] = []
+    if not resume_path:
+        return resumed_by_key, resumed_rows
+    if rank == 0:
+        resumed_by_key, resumed_rows = _load_resume_payload(resume_path)
+        if resumed_rows:
+            print(
+                f"[bench_moe] --resume_from={resume_path}: loaded "
+                f"{len(resumed_rows)} terminal row(s); they will be skipped.",
+                flush=True,
+            )
+    try:
+        resumed_by_key = MPI.COMM_WORLD.bcast(resumed_by_key, root=0)
+        resumed_rows = MPI.COMM_WORLD.bcast(resumed_rows, root=0)
+    except Exception as exc:
+        _maybe_print_rank0(
+            f"[bench_moe] resume bcast failed ({type(exc).__name__}: {exc}); "
+            "ranks may diverge on which candidates to skip."
+        )
+    return resumed_by_key, resumed_rows
+
+
+def _build_flat_plan_for_sweep(
+    ctx: Any,
+    world_size: int,
+    max_configs: Optional[int],
+) -> List[Tuple[WorkloadSpec, ConfigSpec, str]]:
+    """Flatten the per-workload search expansion into a single linear plan.
+
+    Items are ``(workload, config, kind)`` where ``kind`` is ``"run"`` for
+    candidates to execute or ``"prune:<reason>"`` for compile-time rejects
+    (e.g. ``backend.can_implement`` returned False). The flattened form lets
+    the poison handler emit upstream-skipped placeholders for every
+    not-yet-attempted candidate.
+    """
+    flat_plan: List[Tuple[WorkloadSpec, ConfigSpec, str]] = []
+    for workload in ctx.workloads:
+        candidates, skipped = expand_and_prune(
+            base_config=ctx.base_config,
+            search=ctx.search,
+            model=ctx.model,
+            world_size=world_size,
+            act_dtype=ctx.act_dtype,
+            max_configs=max_configs,
+        )
+        for cand, reason in skipped.items():
+            flat_plan.append((workload, cand, f"prune:{reason}"))
+        for cand in candidates:
+            flat_plan.append((workload, cand, "run"))
+    return flat_plan
+
+
+def _handle_cuda_poison_and_exit(
+    *,
+    any_poison: str,
+    args: argparse.Namespace,
+    ctx: Any,
+    rank: int,
+    world_size: int,
+    accumulated_rows: List[Dict[str, Any]],
+    flat_plan: List[Tuple[WorkloadSpec, ConfigSpec, str]],
+    resumed_by_key: Dict[str, Dict[str, Any]],
+    next_idx: int,
+) -> None:
+    """Handle a poisoned CUDA context by checkpointing and exiting cleanly.
+
+    Promotes the offending row to ``failed``, fills upstream placeholders for
+    every not-yet-attempted candidate, writes a checkpoint, then exits with
+    ``_BENCH_MOE_POISON_EXIT_CODE``.
+
+    Once a CUDA context is poisoned (sticky error from a prior candidate)
+    every later kernel launch on the same context will fail. The outer
+    driver wraps this worker and is responsible for restarting with
+    ``--resume_from`` after we exit.
+
+    NOTE: This function calls ``os._exit`` and never returns. Atexit hooks
+    are skipped on purpose so NCCL / CUDA do not re-enter on a poisoned
+    context and deadlock.
+    """
+    # Promote the just-finished row to "failed" so a future --resume_from
+    # never picks it again. Preserve original instrumentation; record
+    # the poison reason for the dashboard.
+    if accumulated_rows:
+        last = accumulated_rows[-1]
+        instr = last.setdefault("instrumentation", {})
+        instr["post_run_cuda_poison_reason"] = any_poison
+        if (last.get("status") or "").lower() == "success":
+            last["status"] = "failed"
+            last["skip_reason"] = f"{_POISON_HERE_PREFIX}: {any_poison}"
+
+    # Emit upstream-skipped placeholders for every not-yet-attempted
+    # candidate so dashboards see the full search space and a fresh
+    # --resume_from run knows to re-attempt them.
+    placeholder_reason = (
+        f"{_POISON_UPSTREAM_PREFIX}: prior candidate poisoned the CUDA context ({any_poison})"
+    )
+    for w2, c2, k2 in flat_plan[next_idx:]:
+        key2 = _candidate_resume_key(workload=w2, config=c2)
+        if key2 in resumed_by_key:
+            continue
+        if k2.startswith("prune:"):
+            # Pruned candidates do not touch CUDA; record their true
+            # reason rather than the upstream placeholder.
+            pruned = _make_skipped_run_result(
+                model=ctx.model,
+                workload=w2,
+                config=c2,
+                world_size=world_size,
+                analysis=ctx.analysis,
+                reason=k2[len("prune:") :],
+            )
+            accumulated_rows.append(_runresult_to_row(pruned))
+            continue
+        accumulated_rows.append(
+            _make_upstream_skipped_row(
+                model=ctx.model,
+                workload=w2,
+                config=c2,
+                world_size=world_size,
+                analysis=ctx.analysis,
+                reason=placeholder_reason,
+            )
+        )
+
+    _emit_checkpoint_report(args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size)
+    if rank == 0:
+        sys.stderr.write(
+            f"[bench_moe] CUDA context poisoned ({any_poison}); "
+            f"checkpointed {len(accumulated_rows)} row(s) to "
+            f"{args.output_file!r}; exiting with code "
+            f"{_BENCH_MOE_POISON_EXIT_CODE} so the outer driver can "
+            "restart with --resume_from.\n"
+        )
+        sys.stderr.flush()
+    # ``os._exit`` (not ``sys.exit``) so Python atexit hooks do not
+    # re-enter NCCL / CUDA on a poisoned context and deadlock.
+    os._exit(_BENCH_MOE_POISON_EXIT_CODE)
+
+
+def _write_final_report(
+    *,
+    args: argparse.Namespace,
+    ctx: Any,
+    rows: List[Dict[str, Any]],
+    world_size: int,
+) -> None:
+    """Produce the final report payload and write it to disk + workbook.
+
+    Two paths:
+    - ``args.output_file`` set: atomic write (tmp + rename), plus an analysis
+      workbook next to it.
+    - No ``output_file``: echo a rankings-only summary on stdout for headless
+      invocations, optionally writing a workbook if explicitly requested.
+
+    Caller must ensure this only runs on rank 0 -- all other ranks should
+    skip the final report step entirely.
+    """
+    out_payload = _build_report_payload(
+        ctx=ctx,
+        rows=rows,
+        world_size=world_size,
+        cuda_graph_default=bool(args.cuda_graph),
+    )
+    if args.output_file:
+        out_dir = os.path.dirname(args.output_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        tmp = args.output_file + ".final.tmp"
+        with open(tmp, "w") as f:
+            json.dump(out_payload, f, indent=2)
+        os.replace(tmp, args.output_file)
+        print(f"Report written to {args.output_file}", flush=True)
+        workbook_file = getattr(
+            args, "analysis_workbook_file", None
+        ) or _default_analysis_workbook_path(args.output_file)
+        if workbook_file:
+            _write_analysis_workbook(out_payload, workbook_file)
+            print(f"Analysis workbook written to {workbook_file}", flush=True)
+    else:
+        # Echo a one-shot summary block at the end so headless invocations
+        # still produce machine-readable output on stdout.
+        print(json.dumps({"rankings": out_payload["rankings"]}, indent=2), flush=True)
+        workbook_file = getattr(args, "analysis_workbook_file", None)
+        if workbook_file:
+            _write_analysis_workbook(out_payload, workbook_file)
+            print(f"Analysis workbook written to {workbook_file}", flush=True)
+
+
 def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: str) -> None:
     args = _maybe_load_config_file(args)
     ctx = _resolve_benchmark_context(args)
@@ -5137,47 +5375,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     if rank == 0:
         print(json.dumps(_build_worker_header(ctx, launcher, world_size), indent=2), flush=True)
 
-    # ---- Resume (E): preload completed rows from a previous JSON ----------
-    # Rank 0 reads; broadcast to keep every rank in lockstep on shared FS.
-    resumed_by_key: Dict[str, Dict[str, Any]] = {}
-    resumed_rows: List[Dict[str, Any]] = []
-    resume_path = getattr(args, "resume_from", None)
-    if resume_path:
-        if rank == 0:
-            resumed_by_key, resumed_rows = _load_resume_payload(resume_path)
-            if resumed_rows:
-                print(
-                    f"[bench_moe] --resume_from={resume_path}: loaded "
-                    f"{len(resumed_rows)} terminal row(s); they will be skipped.",
-                    flush=True,
-                )
-        try:
-            resumed_by_key = MPI.COMM_WORLD.bcast(resumed_by_key, root=0)
-            resumed_rows = MPI.COMM_WORLD.bcast(resumed_rows, root=0)
-        except Exception as exc:
-            _maybe_print_rank0(
-                f"[bench_moe] resume bcast failed ({type(exc).__name__}: {exc}); "
-                "ranks may diverge on which candidates to skip."
-            )
-
-    # ---- Flatten the sweep so the poison handler can emit placeholders ----
-    # ``flat_plan`` items are ``(workload, config, kind)`` where kind is
-    # "run" for candidates to execute and "prune:<reason>" for compile-time
-    # rejects (e.g. backend.can_implement returned False).
-    flat_plan: List[Tuple[WorkloadSpec, ConfigSpec, str]] = []
-    for workload in ctx.workloads:
-        candidates, skipped = expand_and_prune(
-            base_config=ctx.base_config,
-            search=ctx.search,
-            model=ctx.model,
-            world_size=world_size,
-            act_dtype=ctx.act_dtype,
-            max_configs=args.max_configs,
-        )
-        for cand, reason in skipped.items():
-            flat_plan.append((workload, cand, f"prune:{reason}"))
-        for cand in candidates:
-            flat_plan.append((workload, cand, "run"))
+    resumed_by_key, resumed_rows = _load_and_broadcast_resume_state(
+        rank=rank, resume_path=getattr(args, "resume_from", None)
+    )
+    flat_plan = _build_flat_plan_for_sweep(ctx, world_size, args.max_configs)
 
     # Accumulated rows include resumed rows (preserved as-is) plus rows
     # produced this run. ``_build_report_payload`` consumes this directly.
@@ -5258,67 +5459,18 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
         local_poison = _cuda_poison_self_check()
         any_poison = _allreduce_poison_reason(local_poison)
         if any_poison is not None:
-            # Promote the just-finished row to "failed" so a future --resume_from
-            # never picks it again. Preserve original instrumentation; record
-            # the poison reason for the dashboard.
-            if accumulated_rows:
-                last = accumulated_rows[-1]
-                instr = last.setdefault("instrumentation", {})
-                instr["post_run_cuda_poison_reason"] = any_poison
-                if (last.get("status") or "").lower() == "success":
-                    last["status"] = "failed"
-                    last["skip_reason"] = f"{_POISON_HERE_PREFIX}: {any_poison}"
-
-            # Emit upstream-skipped placeholders for every not-yet-attempted
-            # candidate so dashboards see the full search space and a fresh
-            # --resume_from run knows to re-attempt them.
-            placeholder_reason = (
-                f"{_POISON_UPSTREAM_PREFIX}: prior candidate poisoned the CUDA "
-                f"context ({any_poison})"
+            _handle_cuda_poison_and_exit(
+                any_poison=any_poison,
+                args=args,
+                ctx=ctx,
+                rank=rank,
+                world_size=world_size,
+                accumulated_rows=accumulated_rows,
+                flat_plan=flat_plan,
+                resumed_by_key=resumed_by_key,
+                next_idx=idx + 1,
             )
-            for w2, c2, k2 in flat_plan[idx + 1 :]:
-                key2 = _candidate_resume_key(workload=w2, config=c2)
-                if key2 in resumed_by_key:
-                    continue
-                if k2.startswith("prune:"):
-                    # Pruned candidates do not touch CUDA; record their true
-                    # reason rather than the upstream placeholder.
-                    pruned = _make_skipped_run_result(
-                        model=ctx.model,
-                        workload=w2,
-                        config=c2,
-                        world_size=world_size,
-                        analysis=ctx.analysis,
-                        reason=k2[len("prune:") :],
-                    )
-                    accumulated_rows.append(_runresult_to_row(pruned))
-                    continue
-                accumulated_rows.append(
-                    _make_upstream_skipped_row(
-                        model=ctx.model,
-                        workload=w2,
-                        config=c2,
-                        world_size=world_size,
-                        analysis=ctx.analysis,
-                        reason=placeholder_reason,
-                    )
-                )
-
-            _emit_checkpoint_report(
-                args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size
-            )
-            if rank == 0:
-                sys.stderr.write(
-                    f"[bench_moe] CUDA context poisoned ({any_poison}); "
-                    f"checkpointed {len(accumulated_rows)} row(s) to "
-                    f"{args.output_file!r}; exiting with code "
-                    f"{_BENCH_MOE_POISON_EXIT_CODE} so the outer driver can "
-                    "restart with --resume_from.\n"
-                )
-                sys.stderr.flush()
-            # ``os._exit`` (not ``sys.exit``) so Python atexit hooks do not
-            # re-enter NCCL / CUDA on a poisoned context and deadlock.
-            os._exit(_BENCH_MOE_POISON_EXIT_CODE)
+            # _handle_cuda_poison_and_exit calls os._exit; control never returns.
 
         # Incremental checkpoint so a future watchdog SIGKILL never loses
         # already-completed rows.
@@ -5330,41 +5482,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             candidates_since_checkpoint = 0
 
     if rank == 0:
-        out_payload = _build_report_payload(
-            ctx=ctx,
-            rows=accumulated_rows,
-            world_size=world_size,
-            cuda_graph_default=bool(args.cuda_graph),
-        )
-        if args.output_file:
-            out_dir = os.path.dirname(args.output_file)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            tmp = args.output_file + ".final.tmp"
-            with open(tmp, "w") as f:
-                json.dump(out_payload, f, indent=2)
-            os.replace(tmp, args.output_file)
-            print(f"Report written to {args.output_file}", flush=True)
-            workbook_file = getattr(
-                args, "analysis_workbook_file", None
-            ) or _default_analysis_workbook_path(args.output_file)
-            if workbook_file:
-                _write_analysis_workbook(out_payload, workbook_file)
-                print(f"Analysis workbook written to {workbook_file}", flush=True)
-        else:
-            # Echo a one-shot summary block at the end so headless invocations
-            # still produce machine-readable output on stdout.
-            print(
-                json.dumps(
-                    {"rankings": out_payload["rankings"]},
-                    indent=2,
-                ),
-                flush=True,
-            )
-            workbook_file = getattr(args, "analysis_workbook_file", None)
-            if workbook_file:
-                _write_analysis_workbook(out_payload, workbook_file)
-                print(f"Analysis workbook written to {workbook_file}", flush=True)
+        _write_final_report(args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size)
 
 
 # ---------------------------------------------------------------------------
