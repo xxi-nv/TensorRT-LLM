@@ -108,10 +108,12 @@ import json
 import os
 import pickle
 import platform
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import zipfile
@@ -3379,32 +3381,352 @@ def _make_skipped_run_result(
     return r
 
 
-def _build_rankings(results: List[RunResult]) -> List[Dict[str, Any]]:
-    """Group results by ``(num_tokens, parallel_mode)`` and rank by score."""
-    grouped: Dict[Tuple[int, str], List[RunResult]] = {}
-    for r in results:
-        key = (int(r.workload.num_tokens), r.config.parallel_mode)
-        grouped.setdefault(key, []).append(r)
+# ---------------------------------------------------------------------------
+# Resume (E), poison detection (B), per-candidate watchdog (C), checkpoint
+# ---------------------------------------------------------------------------
+#
+# Process-level isolation primitives. These tackle the three failure modes
+# that the in-process try/except in ``_run_one_candidate`` cannot recover from:
+#
+#   * Sticky CUDA error (illegal instruction / illegal address / misaligned
+#     access). Any subsequent kernel launch on the same context returns the
+#     same error; NCCL collectives may deadlock. Detected by B and turned into
+#     a clean ``os._exit(75)`` so an outer driver can restart with resume.
+#   * Pure NCCL deadlock (no rank ever raises). Caught by C via a daemon
+#     thread + ``os.kill(SIGKILL)``; the killed candidate is missing from the
+#     checkpoint JSON and will be retried on the next ``--resume_from`` pass.
+#   * Long sweeps where re-running already-completed candidates wastes hours.
+#     E loads the previous JSON, skips terminal rows, runs only the missing
+#     candidates.
+#
+# Exit codes used by this module (consumed by ``sweep_moe.py``):
+#   75: ``EX_TEMPFAIL`` -- voluntary exit because CUDA context is poisoned
+#       (B). Outer driver should restart with the same ``--resume_from``.
+#   -signal.SIGKILL: watchdog (C) tripped; same restart semantics as 75.
+# ---------------------------------------------------------------------------
+
+_POISON_HERE_PREFIX = "cuda_context_poisoned_after_success"
+_POISON_UPSTREAM_PREFIX = "cuda_context_poisoned_upstream"
+_WATCHDOG_UPSTREAM_PREFIX = "watchdog_timeout_upstream"
+_BENCH_MOE_POISON_EXIT_CODE = 75
+
+
+def _is_completed_for_resume(row: Dict[str, Any]) -> bool:
+    """Decide whether a previously-recorded row blocks a fresh attempt on resume.
+
+    Rules:
+      * ``status in {"success", "failed"}`` -> terminal, always skip on resume.
+      * ``status == "skipped"`` -> terminal *unless* the skip reason ends with
+        ``_upstream``. Upstream-skipped rows are placeholders left behind by a
+        crash and should be re-attempted.
+    """
+    status = (row.get("status") or "").lower()
+    reason = (row.get("skip_reason") or "").lower()
+    if status in {"success", "failed"}:
+        return True
+    if status == "skipped":
+        if reason.endswith("_upstream") or reason.startswith(_POISON_UPSTREAM_PREFIX):
+            return False
+        return True
+    return False
+
+
+def _candidate_resume_key(
+    *,
+    num_tokens: int,
+    backend: str,
+    parallel_mode: str,
+    comm_method: str,
+    cuda_graph: bool,
+    use_low_precision_moe_combine: bool,
+    moe_ep_size: Optional[int],
+    moe_tp_size: Optional[int],
+    enable_attention_dp: Optional[bool],
+) -> str:
+    """Stable string key identifying one ``(workload, config)`` candidate.
+
+    Used by ``--resume_from`` to match rows from a previous JSON against
+    candidates expanded fresh from the current CLI. The key includes every
+    field that ``ConfigSpec`` exposes plus ``num_tokens``. Routing-control
+    axes are *not* included today because the bench does not sweep routing
+    yet; if that changes, this key must expand.
+    """
+    return "|".join(
+        [
+            f"nt={int(num_tokens)}",
+            f"backend={str(backend).upper()}",
+            f"pmode={str(parallel_mode).upper()}",
+            f"comm={str(comm_method).upper()}",
+            f"cg={int(bool(cuda_graph))}",
+            f"lpmc={int(bool(use_low_precision_moe_combine))}",
+            f"ep={moe_ep_size if moe_ep_size is not None else '-'}",
+            f"tp={moe_tp_size if moe_tp_size is not None else '-'}",
+            f"adp={'-' if enable_attention_dp is None else int(bool(enable_attention_dp))}",
+        ]
+    )
+
+
+def _candidate_resume_key_from_specs(workload: WorkloadSpec, config: ConfigSpec) -> str:
+    return _candidate_resume_key(
+        num_tokens=int(workload.num_tokens),
+        backend=str(config.backend),
+        parallel_mode=str(config.parallel_mode),
+        comm_method=str(config.comm_method),
+        cuda_graph=bool(config.cuda_graph),
+        use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
+        moe_ep_size=config.moe_ep_size,
+        moe_tp_size=config.moe_tp_size,
+        enable_attention_dp=config.enable_attention_dp,
+    )
+
+
+def _candidate_resume_key_from_row(row: Dict[str, Any]) -> str:
+    workload = row.get("workload") or {}
+    cfg = row.get("requested_config") or {}
+    return _candidate_resume_key(
+        num_tokens=int(workload.get("num_tokens") or 0),
+        backend=str(cfg.get("backend") or ""),
+        parallel_mode=str(cfg.get("parallel_mode") or ""),
+        comm_method=str(cfg.get("comm_method") or "AUTO"),
+        cuda_graph=bool(cfg.get("cuda_graph", True)),
+        use_low_precision_moe_combine=bool(cfg.get("use_low_precision_moe_combine", False)),
+        moe_ep_size=cfg.get("moe_ep_size"),
+        moe_tp_size=cfg.get("moe_tp_size"),
+        enable_attention_dp=cfg.get("enable_attention_dp"),
+    )
+
+
+def _load_resume_payload(
+    path: Optional[str],
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load an existing JSON for resume.
+
+    Returns ``(completed_by_key, rows_to_carry_forward)``. Only rows for which
+    :func:`_is_completed_for_resume` returns True are indexed and carried;
+    placeholder upstream-skipped rows are dropped so they get re-attempted.
+    """
+    if not path or not os.path.exists(path):
+        return {}, []
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except Exception as exc:
+        _maybe_print_rank0(
+            f"[bench_moe] --resume_from={path}: failed to read existing JSON "
+            f"({type(exc).__name__}: {exc}); starting from scratch."
+        )
+        return {}, []
+    rows = payload.get("results") or []
+    completed: Dict[str, Dict[str, Any]] = {}
+    keep: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if _is_completed_for_resume(row):
+            key = _candidate_resume_key_from_row(row)
+            completed[key] = row
+            keep.append(row)
+    return completed, keep
+
+
+def _cuda_poison_self_check() -> Optional[str]:
+    """Return a non-empty reason if the current CUDA context is in a sticky error state.
+
+    Triggers a host-blocking ``torch.cuda.synchronize()`` to drain pending
+    kernels and surface any sticky CUDA error (illegal address / illegal
+    instruction / misaligned access). Returns ``None`` if healthy.
+
+    NOTE: this does NOT catch a hang inside ``synchronize`` itself (e.g. an
+    NCCL collective deadlock where no rank ever raises). The per-candidate
+    watchdog (:class:`_CandidateWatchdog`) is the only reliable defense
+    against that pure-deadlock case.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # pragma: no cover - belt and braces
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _allreduce_poison_reason(local_reason: Optional[str]) -> Optional[str]:
+    """Gather poison reasons across all MPI ranks; return concatenated message if any is bad.
+
+    Uses CPU-side ``mpi_allgather`` (object pickling) which does not depend on
+    CUDA being healthy. If even a single rank reports a sticky CUDA error,
+    every rank receives the same summary so the lockstep ``os._exit(75)`` in
+    the caller fires on all ranks simultaneously -- avoiding the hang where
+    one rank dies and the rest wait forever on the next NCCL collective.
+    """
+    try:
+        gathered: List[Optional[str]] = mpi_allgather(local_reason)
+    except Exception as exc:
+        # MPI itself is broken; fall back to local-only signal so we still exit.
+        return local_reason or f"mpi_allgather failed: {type(exc).__name__}: {exc}"
+    bad: List[Tuple[int, str]] = [(idx, reason) for idx, reason in enumerate(gathered) if reason]
+    if not bad:
+        return None
+    return "; ".join(f"rank{r}={reason}" for r, reason in bad)
+
+
+class _CandidateWatchdog:
+    """Hard wall-clock guard around one candidate; SIGKILLs the process on timeout.
+
+    Defense against NCCL collective deadlocks where no rank ever raises and
+    ``torch.cuda.synchronize()`` blocks forever (so the sticky-error check
+    cannot help). Uses a Python daemon thread + ``os.kill(SIGKILL)`` because
+    SIGTERM is typically swallowed by the CUDA driver / NCCL stack while a
+    kernel is in flight.
+
+    The outer driver (``sweep_moe.py``) treats SIGKILL exit as "retry with
+    resume": the killed candidate is missing from the checkpoint JSON, so the
+    next ``--resume_from`` re-attempts it. After ``--per_leaf_max_retries``
+    consecutive kills the outer driver gives up on the leaf.
+
+    A ``budget_s`` of 0 or negative disables the watchdog entirely.
+    """
+
+    def __init__(self, budget_s: float, label: str):
+        self._budget_s = float(budget_s)
+        self._label = label
+        self._cancelled = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_CandidateWatchdog":
+        if self._budget_s <= 0:
+            return self
+        self._cancelled.clear()
+        self._thread = threading.Thread(
+            target=self._guard,
+            name="bench_moe-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._cancelled.set()
+        # Do not join: the daemon thread exits on its own once _cancelled is
+        # set, and joining here could deadlock if the watchdog already fired
+        # between ``set()`` above and a still-draining caller.
+        return False
+
+    def _guard(self) -> None:
+        if self._cancelled.wait(self._budget_s):
+            return
+        try:
+            sys.stderr.write(
+                f"[bench_moe watchdog] candidate '{self._label}' exceeded "
+                f"{self._budget_s:.1f}s budget on pid={os.getpid()} "
+                f"rank={mpi_rank()}; sending SIGKILL to break suspected "
+                f"NCCL deadlock or CUDA hang.\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _emit_checkpoint_report(
+    *,
+    args: argparse.Namespace,
+    ctx: "_BenchmarkContext",
+    rows: List[Dict[str, Any]],
+    world_size: int,
+) -> None:
+    """Persist a JSON snapshot of all completed rows after a candidate finishes.
+
+    Only rank 0 writes; other ranks no-op. Uses tmp + ``os.replace`` so a
+    crash mid-dump cannot leave a half-written JSON. Called from the main
+    candidate loop so a sticky-error / watchdog crash cannot lose prior work.
+    """
+    if mpi_rank() != 0:
+        return
+    out_path = getattr(args, "output_file", None)
+    if not out_path:
+        return
+    payload = _build_report_payload(
+        ctx=ctx,
+        rows=rows,
+        world_size=world_size,
+        cuda_graph_default=bool(args.cuda_graph),
+    )
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp = out_path + ".checkpoint.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, out_path)
+
+
+def _make_upstream_skipped_row(
+    *,
+    model: ModelSpec,
+    workload: WorkloadSpec,
+    config: ConfigSpec,
+    world_size: int,
+    analysis: Tuple[str, ...],
+    reason: str,
+) -> Dict[str, Any]:
+    """Build a row marking a candidate as not-attempted due to an upstream crash.
+
+    Uses a reason ending in ``_upstream`` (or starting with one of the
+    upstream prefixes) so :func:`_is_completed_for_resume` treats it as
+    not-done; a subsequent ``--resume_from`` run will retry it.
+    """
+    placeholder = _make_skipped_run_result(
+        model=model,
+        workload=workload,
+        config=config,
+        world_size=world_size,
+        analysis=analysis,
+        reason=reason,
+    )
+    return _runresult_to_row(placeholder)
+
+
+def _build_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group serialized result rows by ``(num_tokens, parallel_mode)`` and rank by score.
+
+    Accepts rows produced by :func:`_runresult_to_row` (live runs) and rows
+    loaded from an existing JSON via ``--resume_from`` (E). Working on the row
+    schema (not ``RunResult``) keeps the ranker oblivious to whether each entry
+    came from this process or a previous one.
+    """
+    grouped: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        workload = row.get("workload") or {}
+        requested_cfg = row.get("requested_config") or {}
+        num_tokens = int(workload.get("num_tokens") or 0)
+        parallel_mode = str(requested_cfg.get("parallel_mode") or "")
+        grouped.setdefault((num_tokens, parallel_mode), []).append(row)
 
     rankings: List[Dict[str, Any]] = []
     for (num_tokens, parallel_mode), items in sorted(grouped.items()):
         ranking_entries: List[Dict[str, Any]] = []
-        for r in items:
-            score = r.latency_us.get("score") if r.latency_us else None
-            autotune_status = (
-                r.instrumentation.get("autotune_status") if r.instrumentation else None
-            )
+        for row in items:
+            actual_cfg = row.get("actual_config") or {}
+            requested_cfg = row.get("requested_config") or {}
+            instrumentation = row.get("instrumentation") or {}
+            latency = row.get("latency_us") or {}
+            score = latency.get("score") if isinstance(latency, dict) else None
             ranking_entries.append(
                 {
-                    "backend": r.actual_backend or r.config.backend,
-                    "requested_backend": r.config.backend,
-                    "comm_method": r.actual_comm_method,
-                    "cuda_graph": r.config.cuda_graph,
-                    "use_low_precision_moe_combine": r.config.use_low_precision_moe_combine,
+                    "backend": actual_cfg.get("backend") or requested_cfg.get("backend"),
+                    "requested_backend": requested_cfg.get("backend"),
+                    "comm_method": actual_cfg.get("comm_method"),
+                    "cuda_graph": requested_cfg.get("cuda_graph"),
+                    "use_low_precision_moe_combine": requested_cfg.get(
+                        "use_low_precision_moe_combine"
+                    ),
                     "score_us": float(score) if isinstance(score, (int, float)) else None,
-                    "status": r.status,
-                    "skip_reason": r.skip_reason,
-                    "autotune_status": autotune_status,
+                    "status": row.get("status"),
+                    "skip_reason": row.get("skip_reason"),
+                    "autotune_status": instrumentation.get("autotune_status"),
                 }
             )
         ranking_entries.sort(
@@ -3888,18 +4210,24 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
 def _build_report_payload(
     *,
     ctx: _BenchmarkContext,
-    results: List[RunResult],
+    rows: List[Dict[str, Any]],
     world_size: int,
     cuda_graph_default: bool,
 ) -> Dict[str, Any]:
+    """Build the dashboard JSON payload from already-serialized result rows.
+
+    Accepts the row schema (see :func:`_runresult_to_row`) so that resumed
+    rows loaded from an existing JSON via ``--resume_from`` can be passed
+    through without round-tripping through ``RunResult``.
+    """
     return {
         "benchmark": "bench_moe",
         "environment": _build_environment_block(world_size, cuda_graph_default),
         "model": ctx.model.to_dict(),
         "search": ctx.search.to_dict(),
         "base_config": ctx.base_config.to_dict(),
-        "results": [_runresult_to_row(r) for r in results],
-        "rankings": _build_rankings(results),
+        "results": list(rows),
+        "rankings": _build_rankings(rows),
     }
 
 
@@ -4170,6 +4498,18 @@ def parse_args() -> argparse.Namespace:
         help="Use a short autotune pass for smoke tests; may reduce measurement quality.",
     )
     timing_group.add_argument(
+        "--per_candidate_timeout_s",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard wall-clock budget per candidate (seconds). If a candidate exceeds "
+            "this, a watchdog thread sends SIGKILL to break suspected NCCL deadlocks "
+            "or CUDA hangs that ``torch.cuda.synchronize()`` cannot detect. The killed "
+            "candidate is missing from the checkpoint JSON, so an outer driver that "
+            "restarts with --resume_from will re-attempt it. 0 disables the watchdog."
+        ),
+    )
+    timing_group.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
@@ -4222,6 +4562,31 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Write an Excel workbook with all candidate rows, per-workload sheets, "
             "best configs, and status summaries. Defaults to <output_file>.analysis.xlsx."
+        ),
+    )
+    output_group.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help=(
+            "Read an existing JSON report and skip every (workload, config) candidate "
+            "whose row is terminal (success/failed, or skipped for a non-upstream reason). "
+            "Placeholder rows left behind by a prior crash (skip_reason ending in "
+            "'_upstream') are dropped and re-attempted. Combine with --output_file to "
+            "write fresh results back into the same file (atomic, checkpointed after "
+            "every candidate)."
+        ),
+    )
+    output_group.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=1,
+        help=(
+            "Write the --output_file JSON checkpoint after every N freshly completed "
+            "candidates. 0 disables incremental checkpointing (only the final JSON is "
+            "written). Default 1 trades a small amount of JSON I/O for crash-safety: "
+            "no completed candidate is ever lost to a watchdog SIGKILL or sticky-error "
+            "exit."
         ),
     )
     args = parser.parse_args()
@@ -4760,13 +5125,34 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     if rank == 0:
         print(json.dumps(_build_worker_header(ctx, launcher, world_size), indent=2), flush=True)
 
-    results: List[RunResult] = []
-    skipped_global: List[Tuple[WorkloadSpec, ConfigSpec, str]] = []
+    # ---- Resume (E): preload completed rows from a previous JSON ----------
+    # Rank 0 reads; broadcast to keep every rank in lockstep on shared FS.
+    resumed_by_key: Dict[str, Dict[str, Any]] = {}
+    resumed_rows: List[Dict[str, Any]] = []
+    resume_path = getattr(args, "resume_from", None)
+    if resume_path:
+        if rank == 0:
+            resumed_by_key, resumed_rows = _load_resume_payload(resume_path)
+            if resumed_rows:
+                print(
+                    f"[bench_moe] --resume_from={resume_path}: loaded "
+                    f"{len(resumed_rows)} terminal row(s); they will be skipped.",
+                    flush=True,
+                )
+        try:
+            resumed_by_key = MPI.COMM_WORLD.bcast(resumed_by_key, root=0)
+            resumed_rows = MPI.COMM_WORLD.bcast(resumed_rows, root=0)
+        except Exception as exc:
+            _maybe_print_rank0(
+                f"[bench_moe] resume bcast failed ({type(exc).__name__}: {exc}); "
+                "ranks may diverge on which candidates to skip."
+            )
 
-    deadline = None
-    if args.time_budget_minutes is not None and args.time_budget_minutes > 0:
-        deadline = time.monotonic() + args.time_budget_minutes * 60.0
-
+    # ---- Flatten the sweep so the poison handler can emit placeholders ----
+    # ``flat_plan`` items are ``(workload, config, kind)`` where kind is
+    # "run" for candidates to execute and "prune:<reason>" for compile-time
+    # rejects (e.g. backend.can_implement returned False).
+    flat_plan: List[Tuple[WorkloadSpec, ConfigSpec, str]] = []
     for workload in ctx.workloads:
         candidates, skipped = expand_and_prune(
             base_config=ctx.base_config,
@@ -4776,10 +5162,31 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             act_dtype=ctx.act_dtype,
             max_configs=args.max_configs,
         )
-
-        # Record every pruned candidate as a skipped result row so dashboards
-        # see the full search space.
         for cand, reason in skipped.items():
+            flat_plan.append((workload, cand, f"prune:{reason}"))
+        for cand in candidates:
+            flat_plan.append((workload, cand, "run"))
+
+    # Accumulated rows include resumed rows (preserved as-is) plus rows
+    # produced this run. ``_build_report_payload`` consumes this directly.
+    accumulated_rows: List[Dict[str, Any]] = list(resumed_rows)
+
+    checkpoint_every = max(0, int(getattr(args, "checkpoint_every", 1) or 0))
+    candidates_since_checkpoint = 0
+    watchdog_budget_s = float(getattr(args, "per_candidate_timeout_s", 0.0) or 0.0)
+
+    deadline: Optional[float] = None
+    if args.time_budget_minutes is not None and args.time_budget_minutes > 0:
+        deadline = time.monotonic() + args.time_budget_minutes * 60.0
+
+    for idx, (workload, cand, kind) in enumerate(flat_plan):
+        key = _candidate_resume_key_from_specs(workload, cand)
+        if key in resumed_by_key:
+            # E: short-circuit. The resumed row is already in accumulated_rows.
+            continue
+
+        if kind.startswith("prune:"):
+            reason = kind[len("prune:") :]
             r = _make_skipped_run_result(
                 model=ctx.model,
                 workload=workload,
@@ -4788,32 +5195,33 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 analysis=ctx.analysis,
                 reason=reason,
             )
-            results.append(r)
-            skipped_global.append((workload, cand, reason))
+            accumulated_rows.append(_runresult_to_row(r))
+            continue
 
-        for cand in candidates:
-            if deadline is not None and time.monotonic() > deadline:
-                _maybe_print_rank0(
-                    "[bench_moe] --time_budget_minutes exceeded; remaining candidates "
-                    "will be reported as skipped."
-                )
-                r = _make_skipped_run_result(
-                    model=ctx.model,
-                    workload=workload,
-                    config=cand,
-                    world_size=world_size,
-                    analysis=ctx.analysis,
-                    reason="time_budget_exceeded",
-                )
-                results.append(r)
-                continue
-
-            case_label = (
-                f"backend={cand.backend} parallel_mode={cand.parallel_mode} "
-                f"comm={cand.comm_method} num_tokens={workload.num_tokens}"
+        if deadline is not None and time.monotonic() > deadline:
+            _maybe_print_rank0(
+                "[bench_moe] --time_budget_minutes exceeded; remaining candidates "
+                "will be reported as skipped."
             )
-            _maybe_print_rank0(f"[bench_moe] running {case_label}")
+            r = _make_skipped_run_result(
+                model=ctx.model,
+                workload=workload,
+                config=cand,
+                world_size=world_size,
+                analysis=ctx.analysis,
+                reason="time_budget_exceeded",
+            )
+            accumulated_rows.append(_runresult_to_row(r))
+            continue
 
+        case_label = (
+            f"backend={cand.backend} parallel_mode={cand.parallel_mode} "
+            f"comm={cand.comm_method} num_tokens={workload.num_tokens}"
+        )
+        _maybe_print_rank0(f"[bench_moe] running {case_label}")
+
+        # C: hard wall-clock guard around the actual candidate execution.
+        with _CandidateWatchdog(watchdog_budget_s, case_label):
             r = _run_one_candidate(
                 model=ctx.model,
                 workload=workload,
@@ -4829,14 +5237,90 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 analysis=ctx.analysis,
                 cupti_ctx=_early_cupti_ctx,
             )
-            results.append(r)
+        row = _runresult_to_row(r)
+        accumulated_rows.append(row)
+        if rank == 0:
+            print(json.dumps(row, indent=2), flush=True)
+
+        # B: sticky CUDA error detection + lockstep exit across all ranks.
+        local_poison = _cuda_poison_self_check()
+        any_poison = _allreduce_poison_reason(local_poison)
+        if any_poison is not None:
+            # Promote the just-finished row to "failed" so a future --resume_from
+            # never picks it again. Preserve original instrumentation; record
+            # the poison reason for the dashboard.
+            if accumulated_rows:
+                last = accumulated_rows[-1]
+                instr = last.setdefault("instrumentation", {})
+                instr["post_run_cuda_poison_reason"] = any_poison
+                if (last.get("status") or "").lower() == "success":
+                    last["status"] = "failed"
+                    last["skip_reason"] = f"{_POISON_HERE_PREFIX}: {any_poison}"
+
+            # Emit upstream-skipped placeholders for every not-yet-attempted
+            # candidate so dashboards see the full search space and a fresh
+            # --resume_from run knows to re-attempt them.
+            placeholder_reason = (
+                f"{_POISON_UPSTREAM_PREFIX}: prior candidate poisoned the CUDA "
+                f"context ({any_poison})"
+            )
+            for w2, c2, k2 in flat_plan[idx + 1 :]:
+                key2 = _candidate_resume_key_from_specs(w2, c2)
+                if key2 in resumed_by_key:
+                    continue
+                if k2.startswith("prune:"):
+                    # Pruned candidates do not touch CUDA; record their true
+                    # reason rather than the upstream placeholder.
+                    pruned = _make_skipped_run_result(
+                        model=ctx.model,
+                        workload=w2,
+                        config=c2,
+                        world_size=world_size,
+                        analysis=ctx.analysis,
+                        reason=k2[len("prune:") :],
+                    )
+                    accumulated_rows.append(_runresult_to_row(pruned))
+                    continue
+                accumulated_rows.append(
+                    _make_upstream_skipped_row(
+                        model=ctx.model,
+                        workload=w2,
+                        config=c2,
+                        world_size=world_size,
+                        analysis=ctx.analysis,
+                        reason=placeholder_reason,
+                    )
+                )
+
+            _emit_checkpoint_report(
+                args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size
+            )
             if rank == 0:
-                print(json.dumps(_runresult_to_row(r), indent=2), flush=True)
+                sys.stderr.write(
+                    f"[bench_moe] CUDA context poisoned ({any_poison}); "
+                    f"checkpointed {len(accumulated_rows)} row(s) to "
+                    f"{args.output_file!r}; exiting with code "
+                    f"{_BENCH_MOE_POISON_EXIT_CODE} so the outer driver can "
+                    "restart with --resume_from.\n"
+                )
+                sys.stderr.flush()
+            # ``os._exit`` (not ``sys.exit``) so Python atexit hooks do not
+            # re-enter NCCL / CUDA on a poisoned context and deadlock.
+            os._exit(_BENCH_MOE_POISON_EXIT_CODE)
+
+        # Incremental checkpoint so a future watchdog SIGKILL never loses
+        # already-completed rows.
+        candidates_since_checkpoint += 1
+        if checkpoint_every > 0 and candidates_since_checkpoint >= checkpoint_every:
+            _emit_checkpoint_report(
+                args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size
+            )
+            candidates_since_checkpoint = 0
 
     if rank == 0:
         out_payload = _build_report_payload(
             ctx=ctx,
-            results=results,
+            rows=accumulated_rows,
             world_size=world_size,
             cuda_graph_default=bool(args.cuda_graph),
         )
@@ -4844,8 +5328,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
             out_dir = os.path.dirname(args.output_file)
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            with open(args.output_file, "w") as f:
+            tmp = args.output_file + ".final.tmp"
+            with open(tmp, "w") as f:
                 json.dump(out_payload, f, indent=2)
+            os.replace(tmp, args.output_file)
             print(f"Report written to {args.output_file}", flush=True)
             workbook_file = getattr(
                 args, "analysis_workbook_file", None
