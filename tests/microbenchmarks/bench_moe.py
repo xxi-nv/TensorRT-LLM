@@ -103,6 +103,7 @@ import contextlib
 import ctypes
 import functools
 import getpass
+import importlib
 import itertools
 import json
 import os
@@ -117,9 +118,9 @@ import threading
 import time
 import traceback
 import zipfile
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
 # ---------------------------------------------------------------------------
@@ -191,38 +192,30 @@ from tensorrt_llm.mapping import Mapping  # noqa: E402
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig  # noqa: E402
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check  # noqa: E402
 
+
 # ---------------------------------------------------------------------------
-# Optional dependencies. Each is gated by a top-level try/except; callers must
-# check the resulting sentinel before use. This avoids hard dependencies on
-# CUPTI / cxxfilt in minimal containers, and keeps the spawn launcher tolerant
-# of mpi4py images that ship without ``mpi4py.futures``.
+# Optional dependencies. Each is gated by a try/except so callers can check a
+# sentinel before use. This avoids hard dependencies on CUPTI / cxxfilt in
+# minimal containers, and keeps the spawn launcher tolerant of mpi4py images
+# that ship without ``mpi4py.futures``.
 # ---------------------------------------------------------------------------
-try:
-    from cupti import cupti as _cupti  # type: ignore[import-not-found]
-except Exception:
-    _cupti = None  # type: ignore[assignment]
+def _try_import(module_path: str, attr: Optional[str] = None, default: Any = None) -> Any:
+    """Import ``module_path``; if ``attr`` is given, return ``getattr(m, attr)``.
 
-try:
-    import cxxfilt as _cxxfilt  # type: ignore[import-not-found]
-except Exception:
-    _cxxfilt = None  # type: ignore[assignment]
+    Returns ``default`` on any import or attribute-lookup failure.
+    """
+    try:
+        m = importlib.import_module(module_path)
+    except Exception:
+        return default
+    return m if attr is None else getattr(m, attr, default)
 
-try:
-    from torch.cuda import (
-        _get_driver_version as _torch_driver_version,  # type: ignore[attr-defined]
-    )
-except Exception:
-    _torch_driver_version = None  # type: ignore[assignment]
 
-try:
-    import cloudpickle as _cloudpickle  # type: ignore[import-not-found]
-except Exception:
-    _cloudpickle = None  # type: ignore[assignment]
-
-try:
-    from mpi4py.futures import MPIPoolExecutor as _MPIPoolExecutor  # type: ignore[import-not-found]
-except Exception:
-    _MPIPoolExecutor = None  # type: ignore[assignment]
+_cupti = _try_import("cupti.cupti")
+_cxxfilt = _try_import("cxxfilt")
+_torch_driver_version = _try_import("torch.cuda", "_get_driver_version")
+_cloudpickle = _try_import("cloudpickle")
+_MPIPoolExecutor = _try_import("mpi4py.futures", "MPIPoolExecutor")
 
 # ---------------------------------------------------------------------------
 # Routing method registry
@@ -258,20 +251,41 @@ _COMM_METHODS: Tuple[str, ...] = (
 )
 
 # Forced communication methods that ``CommunicationFactory`` understands via
-# ``TRTLLM_FORCE_COMM_METHOD``. ``AUTO`` and ``ALLGATHER`` map to no force /
-# implicit fallback paths and are not pushed through the env var.
-_FORCED_COMM_ENV_VALUES: Dict[str, str] = {
-    "NVLINK_ONE_SIDED": "NVLINK_ONE_SIDED",
-    "NVLINK_TWO_SIDED": "NVLINK_TWO_SIDED",
-    "DEEPEP": "DEEPEP",
-    "DEEPEPLOWLATENCY": "DEEPEPLOWLATENCY",
-    "ALLGATHER": "ALLGATHER",
-}
+# ``TRTLLM_FORCE_COMM_METHOD``. ``AUTO`` is the implicit-fallback sentinel and
+# is not pushed through the env var. Order is preserved so iteration is
+# deterministic when this tuple is consumed as a search axis.
+_FORCED_COMM_ENV_VALUES: Tuple[str, ...] = (
+    "NVLINK_ONE_SIDED",
+    "NVLINK_TWO_SIDED",
+    "DEEPEP",
+    "DEEPEPLOWLATENCY",
+    "ALLGATHER",
+)
 
 
 # ---------------------------------------------------------------------------
 # Structured specs
 # ---------------------------------------------------------------------------
+
+
+def _to_jsonable_dict(obj: Any) -> Dict[str, Any]:
+    """``dataclasses.asdict`` with nested tuples converted to lists.
+
+    Several specs use ``Tuple[...]`` fields for hashability/immutability.
+    ``asdict`` preserves tuples; downstream consumers serialize the result
+    to JSON, which treats tuples and lists identically, but list form is
+    the historical wire format and avoids surprising callers that may
+    later mutate.
+    """
+
+    def _walk(value: Any) -> Any:
+        if isinstance(value, (tuple, list)):
+            return [_walk(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        return value
+
+    return _walk(asdict(obj))
 
 
 @dataclass(frozen=True)
@@ -323,21 +337,9 @@ class ModelSpec:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "num_experts": int(self.num_experts),
-            "top_k": int(self.top_k),
-            "hidden_size": int(self.hidden_size),
-            "intermediate_size": int(self.intermediate_size),
-            "n_group": self.n_group,
-            "topk_group": self.topk_group,
-            "quant_algo": self.quant_algo,
-            "routing_method": self.routing_method,
-            "routing_method_class": self.routing_method_cls.__name__,
-            "swiglu_alpha": float(self.swiglu_alpha),
-            "swiglu_beta": float(self.swiglu_beta),
-            "swiglu_limit": float(self.swiglu_limit),
-        }
+        d = _to_jsonable_dict(self)
+        d["routing_method_class"] = self.routing_method_cls.__name__
+        return d
 
 
 @dataclass(frozen=True)
@@ -365,20 +367,7 @@ class RoutingControlSpec:
     seed: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "routing_mode": self.routing_mode,
-            "projection_policy": self.projection_policy,
-            "comm_pattern": self.comm_pattern,
-            "expert_pattern": self.expert_pattern,
-            "routing_pattern_file": self.routing_pattern_file,
-            "per_rank_num_tokens": (
-                list(int(v) for v in self.per_rank_num_tokens)
-                if self.per_rank_num_tokens is not None
-                else None
-            ),
-            "routing_dump_matrix": bool(self.routing_dump_matrix),
-            "seed": int(self.seed),
-        }
+        return _to_jsonable_dict(self)
 
     @property
     def is_active(self) -> bool:
@@ -427,16 +416,7 @@ class ConfigSpec:
     use_low_precision_moe_combine: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "backend": self.backend,
-            "parallel_mode": self.parallel_mode,
-            "moe_ep_size": self.moe_ep_size,
-            "moe_tp_size": self.moe_tp_size,
-            "enable_attention_dp": self.enable_attention_dp,
-            "comm_method": self.comm_method,
-            "cuda_graph": bool(self.cuda_graph),
-            "use_low_precision_moe_combine": bool(self.use_low_precision_moe_combine),
-        }
+        return _to_jsonable_dict(self)
 
 
 @dataclass(frozen=True)
@@ -451,14 +431,7 @@ class SearchSpec:
     combine_precision_options: Tuple[bool, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "mode": self.mode,
-            "backends": list(self.backends),
-            "parallel_modes": list(self.parallel_modes),
-            "comm_methods": list(self.comm_methods),
-            "cuda_graph_options": [bool(v) for v in self.cuda_graph_options],
-            "combine_precision_options": [bool(v) for v in self.combine_precision_options],
-        }
+        return _to_jsonable_dict(self)
 
 
 @dataclass
@@ -486,8 +459,8 @@ class RunResult:
     per_rank_num_tokens: List[int] = field(default_factory=list)
     status_per_rank: Dict[str, str] = field(default_factory=dict)
     instrumentation: Dict[str, Any] = field(default_factory=dict)
-    latency_us: Dict[str, Any] = field(default_factory=dict)
-    phase_times_us: Dict[str, Any] = field(default_factory=dict)
+    latency_ms: Dict[str, Any] = field(default_factory=dict)
+    phase_times_ms: Dict[str, Any] = field(default_factory=dict)
     kernel_breakdown: Dict[str, Any] = field(default_factory=dict)
     overlap: Dict[str, Any] = field(default_factory=dict)
     bottleneck: Optional[str] = None
@@ -732,11 +705,8 @@ def _validate_per_rank_token_list(
 
 def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
     """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
-    per_rank = workload.routing_control.per_rank_num_tokens
-    if per_rank is None:
-        return _distribute_tokens(int(workload.num_tokens), world_size)
-    return _validate_per_rank_token_list(
-        per_rank, world_size=world_size, expected_total=int(workload.num_tokens)
+    return _build_per_rank_num_tokens(
+        workload.routing_control, int(workload.num_tokens), world_size
     )
 
 
@@ -897,6 +867,19 @@ def _build_model_config(
 # MoE construction (build phase)
 # ---------------------------------------------------------------------------
 
+# Map concrete MoE module class names to short backend identifiers used in
+# results and the dashboard. Anything not in this table falls back to the
+# upper-case class name.
+_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
+    "CutlassFusedMoE": "CUTLASS",
+    "TRTLLMGenFusedMoE": "TRTLLM",
+    "CuteDslFusedMoE": "CUTEDSL",
+    "DeepGemmFusedMoE": "DEEPGEMM",
+    "DenseGEMMFusedMoE": "DENSEGEMM",
+    "MegaMoEDeepGemm": "MEGAMOE_DEEPGEMM",
+    "VanillaMoE": "VANILLA",
+}
+
 
 def _backend_name_from_module(moe) -> str:
     """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
@@ -905,16 +888,7 @@ def _backend_name_from_module(moe) -> str:
         backend_cls = type(backend_attr).__name__
     else:
         backend_cls = type(moe).__name__
-    aliases = {
-        "CutlassFusedMoE": "CUTLASS",
-        "TRTLLMGenFusedMoE": "TRTLLM",
-        "CuteDslFusedMoE": "CUTEDSL",
-        "DeepGemmFusedMoE": "DEEPGEMM",
-        "DenseGEMMFusedMoE": "DENSEGEMM",
-        "MegaMoEDeepGemm": "MEGAMOE_DEEPGEMM",
-        "VanillaMoE": "VANILLA",
-    }
-    return aliases.get(backend_cls, backend_cls.upper())
+    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:
@@ -1092,12 +1066,7 @@ class RoutingPlan:
     seed: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "per_rank_num_tokens": [int(v) for v in self.per_rank_num_tokens],
-            "dispatch_matrix": [[int(v) for v in row] for row in self.dispatch_matrix],
-            "expert_histogram": [[int(v) for v in row] for row in self.expert_histogram],
-            "seed": int(self.seed),
-        }
+        return _to_jsonable_dict(self)
 
 
 @dataclass(frozen=True)
@@ -1164,12 +1133,25 @@ def _pop_hotness_kwarg(raw: Dict[str, str], kwargs: Dict[str, Any], *, label: st
     kwargs["hotness"] = value
 
 
-def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
+def _parse_typed_pattern(
+    spec: str, *, label: str, valid_names: Tuple[str, ...]
+) -> Tuple[str, Dict[str, str]]:
+    """Common prefix of ``_parse_comm_pattern`` / ``_parse_expert_pattern``.
+
+    Parses the ``name[:k=v,...]`` form, rejects the legacy ``file:<path>``
+    prefix (now handled via ``--routing_pattern_file``), and validates that
+    ``name`` is one of the supported pattern names for ``label``.
+    """
     name, raw = _parse_pattern_spec(spec)
     if name == "file":
-        raise ValueError("comm_pattern no longer accepts file:<path>; use --routing_pattern_file")
-    if name not in _COMM_PATTERN_NAMES:
-        raise ValueError(f"unknown comm_pattern {name!r}; supported: {_COMM_PATTERN_NAMES}")
+        raise ValueError(f"{label} no longer accepts file:<path>; use --routing_pattern_file")
+    if name not in valid_names:
+        raise ValueError(f"unknown {label} {name!r}; supported: {valid_names}")
+    return name, raw
+
+
+def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
+    name, raw = _parse_typed_pattern(spec, label="comm_pattern", valid_names=_COMM_PATTERN_NAMES)
     kwargs: Dict[str, Any] = {}
     _pop_hotness_kwarg(raw, kwargs, label="comm_pattern")
     for int_key in ("rank", "src", "dst"):
@@ -1186,11 +1168,9 @@ def _parse_comm_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
 
 
 def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
-    name, raw = _parse_pattern_spec(spec)
-    if name == "file":
-        raise ValueError("expert_pattern no longer accepts file:<path>; use --routing_pattern_file")
-    if name not in _EXPERT_PATTERN_NAMES:
-        raise ValueError(f"unknown expert_pattern {name!r}; supported: {_EXPERT_PATTERN_NAMES}")
+    name, raw = _parse_typed_pattern(
+        spec, label="expert_pattern", valid_names=_EXPERT_PATTERN_NAMES
+    )
     kwargs: Dict[str, Any] = {}
     _pop_hotness_kwarg(raw, kwargs, label="expert_pattern")
     if "active_experts" in raw:
@@ -2001,7 +1981,7 @@ def _run_autotune(
 def _kernel_times_to_summary_list(
     kernel_times: Dict[str, List[float]],
 ) -> List[Dict[str, Any]]:
-    """Convert ``{kernel_name: [times_us]}`` into the dashboard summary shape.
+    """Convert ``{kernel_name: [times_ms]}`` into the dashboard summary shape.
 
     Sorted by per-kernel mean duration descending; entries keep the raw
     ``_times`` list so downstream mpi_allgather can recompute per-rank stats.
@@ -2038,7 +2018,7 @@ def _time_moe_forward_eager(
     """Time eager ``ConfigurableMoE.forward``.
 
     Latency is ALWAYS measured with pure ``torch.cuda.Event`` records so the
-    reported ``score_us`` is comparable across ``cuda_graph`` and eager paths
+    reported ``score_ms`` is comparable across ``cuda_graph`` and eager paths
     (the CUDA-Graph path also uses external CUDA events for its per-iter
     window). When ``collect_kernels=True`` a separate, shorter profiler pass is
     run only to gather the kernel breakdown; profiler-derived numbers are not
@@ -2065,14 +2045,14 @@ def _time_moe_forward_eager(
         _do_forward()
         ends[i].record()
     _sync()
-    forward_times_us = [starts[i].elapsed_time(ends[i]) * 1e3 for i in range(iters)]
+    forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
 
     detailed_stats: Dict[str, Any] = {
         "moe_forward_kernels": [],
         "other_kernels": [],
     }
     if not collect_kernels:
-        return forward_times_us, detailed_stats
+        return forward_times_ms, detailed_stats
 
     # Separate profiler-only pass for kernel breakdown. Use a small fixed iter
     # count (capped by ``iters``) so the profiler overhead does not dominate
@@ -2099,13 +2079,13 @@ def _time_moe_forward_eager(
     except Exception as exc:
         # Breakdown is best-effort; do not fail the case if Kineto misbehaves.
         _maybe_print_rank0(f"[bench_moe] kernel breakdown skipped: {type(exc).__name__}: {exc}")
-    return forward_times_us, detailed_stats
+    return forward_times_ms, detailed_stats
 
 
 def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str, Any]]:
     """Parse Kineto events with ``moe_forward`` ranges.
 
-    Returns ``(moe_forward_times_us, detailed_stats)`` where ``detailed_stats``
+    Returns ``(moe_forward_times_ms, detailed_stats)`` where ``detailed_stats``
     contains ``moe_forward_kernels`` (within the range) and ``other_kernels``.
     """
 
@@ -2140,18 +2120,19 @@ def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str
             continue
         scope = _scope(evt)
         bucket = moe_kernel_times if scope == "moe_forward" else other_kernel_times
-        bucket.setdefault(evt.name, []).append(evt.device_time)
+        # PyTorch profiler reports device_time in microseconds; convert to ms.
+        bucket.setdefault(evt.name, []).append(evt.device_time / 1e3)
 
-    forward_times_us: List[float] = []
+    forward_times_ms: List[float] = []
     for evt in events_list:
         if _is_gpu_event(evt) and evt.name == "moe_forward":
-            forward_times_us.append(evt.device_time)
+            forward_times_ms.append(evt.device_time / 1e3)
 
     detailed_stats = {
         "moe_forward_kernels": _kernel_times_to_summary_list(moe_kernel_times),
         "other_kernels": _kernel_times_to_summary_list(other_kernel_times),
     }
-    return forward_times_us, detailed_stats
+    return forward_times_ms, detailed_stats
 
 
 # ---------------------------------------------------------------------------
@@ -2159,13 +2140,27 @@ def _parse_profiler_events_moe(events_list: list) -> Tuple[List[float], Dict[str
 # ---------------------------------------------------------------------------
 
 
-def _try_init_cupti():
+class _CuptiContext(NamedTuple):
+    """Initialised CUPTI handles + capture buffers.
+
+    Returned by ``_try_init_cupti``. ``ok`` is False when CUPTI was missing
+    or activity registration failed; in that case the other fields are
+    empty/None and callers fall back to PyTorch-event-only timing.
+    """
+
+    module: Any
+    kernels: List[Tuple[str, int, int]]
+    events: List[int]
+    ok: bool
+
+
+def _try_init_cupti() -> _CuptiContext:
     """Initialize CUPTI activity tracking before any CUDA context is created.
 
-    Returns a 4-tuple ``(cupti_module, kernels_list, events_list, ok)``. When
-    the ``cupti`` Python package is missing or registration fails the function
-    degrades gracefully to ``(None, [], [], False)`` and the caller falls back
-    to PyTorch-event-only timing without kernel breakdown.
+    Returns a ``_CuptiContext``. When the ``cupti`` Python package is missing
+    or registration fails the function degrades gracefully to
+    ``_CuptiContext(None, [], [], False)`` and the caller falls back to
+    PyTorch-event-only timing without kernel breakdown.
 
     The two activity kinds we register are:
       - ``CONCURRENT_KERNEL``: every kernel actually executed on the GPU,
@@ -2175,7 +2170,7 @@ def _try_init_cupti():
         we use them to delimit which kernels fall inside each timed iteration.
     """
     if _cupti is None:
-        return None, [], [], False
+        return _CuptiContext(None, [], [], False)
     try:
         _cupti_kernels: List[Tuple[str, int, int]] = []
         _cupti_events: List[int] = []
@@ -2197,9 +2192,9 @@ def _try_init_cupti():
             _buf_requested,
             functools.partial(_buf_completed, _cupti_kernels, _cupti_events),
         )
-        return _cupti, _cupti_kernels, _cupti_events, True
+        return _CuptiContext(_cupti, _cupti_kernels, _cupti_events, True)
     except Exception:
-        return None, [], [], False
+        return _CuptiContext(None, [], [], False)
 
 
 def _demangle_names(names: List[str]) -> Dict[str, str]:
@@ -2242,7 +2237,8 @@ def _build_cuda_graph_kernel_stats_cupti(
 
     for name, k_start, k_end in cupti_kernels:
         demangled = dm.get(name, name)
-        device_time_us = (k_end - k_start) / 1e3
+        # CUPTI timestamps are nanoseconds; convert to milliseconds.
+        device_time_ms = (k_end - k_start) / 1e6
 
         iter_idx = -1
         for i in range(iters):
@@ -2254,18 +2250,18 @@ def _build_cuda_graph_kernel_stats_cupti(
             span = iter_span[iter_idx]
             span[0] = k_start if span[0] is None else min(span[0], k_start)
             span[1] = k_end if span[1] is None else max(span[1], k_end)
-            moe_kernel_times.setdefault(demangled, []).append(device_time_us)
+            moe_kernel_times.setdefault(demangled, []).append(device_time_ms)
         else:
-            other_kernel_times.setdefault(demangled, []).append(device_time_us)
+            other_kernel_times.setdefault(demangled, []).append(device_time_ms)
 
-    moe_times_us = [
-        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in iter_span
+    moe_times_ms = [
+        (span[1] - span[0]) / 1e6 if span[0] is not None else None for span in iter_span
     ]
 
     return {
         "moe_forward_kernels": _kernel_times_to_summary_list(moe_kernel_times),
         "other_kernels": _kernel_times_to_summary_list(other_kernel_times),
-        "moe_times_us": moe_times_us,
+        "moe_times_ms": moe_times_ms,
     }
 
 
@@ -2290,7 +2286,10 @@ def _time_moe_forward_cuda_graph(
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
 
     if cupti_ctx is not None:
-        _cupti, _cupti_kernels, _cupti_events, _cupti_available = cupti_ctx
+        _cupti = cupti_ctx.module
+        _cupti_kernels = cupti_ctx.kernels
+        _cupti_events = cupti_ctx.events
+        _cupti_available = cupti_ctx.ok
     else:
         _cupti = None
         _cupti_kernels = []
@@ -2353,16 +2352,16 @@ def _time_moe_forward_cuda_graph(
     if _cupti_available:
         _cupti.activity_flush_all(0)
 
-    forward_times_us = [starts[i].elapsed_time(ends[i]) * 1e3 for i in range(iters)]
+    forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
 
     if _cupti_available:
         _cupti_kernels.sort(key=lambda k: k[1])
         _cupti_events.sort()
         cupti_stats = _build_cuda_graph_kernel_stats_cupti(_cupti_kernels, _cupti_events, iters)
         if cupti_stats is not None:
-            cupti_times = cupti_stats.pop("moe_times_us")
-            forward_times_us = [
-                ct if ct is not None else et for ct, et in zip(cupti_times, forward_times_us)
+            cupti_times = cupti_stats.pop("moe_times_ms")
+            forward_times_ms = [
+                ct if ct is not None else et for ct, et in zip(cupti_times, forward_times_ms)
             ]
             detailed_stats = cupti_stats
         else:
@@ -2370,7 +2369,7 @@ def _time_moe_forward_cuda_graph(
     else:
         detailed_stats = {"moe_forward_kernels": [], "other_kernels": []}
 
-    return forward_times_us, detailed_stats
+    return forward_times_ms, detailed_stats
 
 
 # ---------------------------------------------------------------------------
@@ -2378,13 +2377,13 @@ def _time_moe_forward_cuda_graph(
 # ---------------------------------------------------------------------------
 
 
-def _gather_per_iteration_times(times_us: List[float]) -> List[List[float]]:
+def _gather_per_iteration_times(times_ms: List[float]) -> List[List[float]]:
     """All-gather raw per-iteration latencies; returns ``[ [rank0_iters], ... ]``."""
-    return mpi_allgather(times_us)
+    return mpi_allgather(times_ms)
 
 
 def _slowest_rank_mean_score(per_rank_iters: List[List[float]]) -> float:
-    """Compute ``mean_i(max_r(latency_us[rank=r][iteration=i]))``.
+    """Compute ``mean_i(max_r(latency_ms[rank=r][iteration=i]))``.
 
     Falls back gracefully when ranks reported different iteration counts; the
     common length is used and trailing entries are ignored.
@@ -2459,10 +2458,19 @@ def _gather_kernel_breakdown(
 # ---------------------------------------------------------------------------
 
 
+# Heuristic thresholds for ``_classify_bottleneck``. Tuned for "label looks
+# right at a glance on the dashboard"; not intended as hard cutoffs.
+_BOTTLENECK_COMM_FRACTION = 0.5
+_BOTTLENECK_COMPUTE_FRACTION = 0.5
+_BOTTLENECK_ROUTING_FRACTION = 0.4
+_BOTTLENECK_LAUNCH_MIN_KERNELS = 50
+_BOTTLENECK_LAUNCH_MAX_KERNEL_MS = 0.005  # 5 us per launch on rank0
+
+
 def _classify_bottleneck(
-    phase_times_us_agg: Dict[str, Dict[str, float]],
+    phase_times_ms_agg: Dict[str, Dict[str, float]],
     kernel_breakdown: Dict[str, Any],
-    forward_score_us: float,
+    forward_score_ms: float,
 ) -> Optional[str]:
     """Return a coarse bottleneck label.
 
@@ -2471,24 +2479,24 @@ def _classify_bottleneck(
     we can identify dispatch/combine/GEMM heuristically by name we use that;
     otherwise we return ``None`` so the dashboard can show ``unknown``.
     """
-    if phase_times_us_agg:
-        comm_us = sum(
+    if phase_times_ms_agg:
+        comm_ms = sum(
             v.get("score", 0.0)
-            for k, v in phase_times_us_agg.items()
+            for k, v in phase_times_ms_agg.items()
             if k in ("dispatch", "combine", "all_reduce_or_reduce_results")
         )
-        gemm_us = phase_times_us_agg.get("backend_run_moe", {}).get(
+        gemm_ms = phase_times_ms_agg.get("backend_run_moe", {}).get(
             "score", 0.0
-        ) or phase_times_us_agg.get("fused_comm_backend_run_moe", {}).get("score", 0.0)
-        routing_us = phase_times_us_agg.get("routing", {}).get("score", 0.0)
-        total = comm_us + gemm_us + routing_us
+        ) or phase_times_ms_agg.get("fused_comm_backend_run_moe", {}).get("score", 0.0)
+        routing_ms = phase_times_ms_agg.get("routing", {}).get("score", 0.0)
+        total = comm_ms + gemm_ms + routing_ms
         if total <= 0:
             return None
-        if comm_us / total > 0.5:
+        if comm_ms / total > _BOTTLENECK_COMM_FRACTION:
             return "communication_bound"
-        if gemm_us / total > 0.5:
+        if gemm_ms / total > _BOTTLENECK_COMPUTE_FRACTION:
             return "compute_bound"
-        if routing_us / total > 0.4:
+        if routing_ms / total > _BOTTLENECK_ROUTING_FRACTION:
             return "routing_bound"
         return "unknown"
 
@@ -2497,17 +2505,20 @@ def _classify_bottleneck(
     if not moe_kernels:
         return None
     total_count = sum(k.get("count", 0) for k in moe_kernels)
-    # Average kernel duration in us per launch on rank0.
     rank0_total = 0.0
     rank0_count = 0
     for k in moe_kernels:
         rank0_stats = k.get("per_rank", {}).get("rank0", {})
-        mean_us = float(rank0_stats.get("mean", 0.0))
+        mean_ms = float(rank0_stats.get("mean", 0.0))
         count = int(k.get("count", 0))
-        rank0_total += mean_us * count
+        rank0_total += mean_ms * count
         rank0_count += count
-    avg_us = (rank0_total / rank0_count) if rank0_count else 0.0
-    if total_count > 50 and avg_us > 0.0 and avg_us < 5.0 and forward_score_us > 0:
+    avg_ms = (rank0_total / rank0_count) if rank0_count else 0.0
+    if (
+        total_count > _BOTTLENECK_LAUNCH_MIN_KERNELS
+        and 0.0 < avg_ms < _BOTTLENECK_LAUNCH_MAX_KERNEL_MS
+        and forward_score_ms > 0
+    ):
         return "launch_overhead_bound"
     return None
 
@@ -2634,7 +2645,7 @@ def _force_comm_env(comm_method: str, prev: Optional[str]) -> None:
     """
     upper = comm_method.upper()
     if upper in _FORCED_COMM_ENV_VALUES:
-        os.environ["TRTLLM_FORCE_COMM_METHOD"] = _FORCED_COMM_ENV_VALUES[upper]
+        os.environ["TRTLLM_FORCE_COMM_METHOD"] = upper
     else:
         if prev is None:
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
@@ -2802,7 +2813,7 @@ def _initial_instrumentation(
     return {
         "level": ",".join(sorted(analysis)) if analysis else "summary",
         "cuda_graph": bool(config.cuda_graph),
-        "cupti_available": bool(cupti_ctx is not None and cupti_ctx[3]),
+        "cupti_available": bool(cupti_ctx is not None and cupti_ctx.ok),
         "phase_timing_available": False,
         "kernel_breakdown_available": "kernels" in analysis,
         "autotune_status": "not_run",
@@ -3240,7 +3251,7 @@ def _run_one_candidate(
 
             try:
                 if config.cuda_graph:
-                    fwd_times_us, detailed_stats = _time_moe_forward_cuda_graph(
+                    fwd_times_ms, detailed_stats = _time_moe_forward_cuda_graph(
                         moe,
                         x,
                         router_logits,
@@ -3250,7 +3261,7 @@ def _run_one_candidate(
                         cupti_ctx=cupti_ctx,
                     )
                 else:
-                    fwd_times_us, detailed_stats = _time_moe_forward_eager(
+                    fwd_times_ms, detailed_stats = _time_moe_forward_eager(
                         moe,
                         x,
                         router_logits,
@@ -3269,8 +3280,8 @@ def _run_one_candidate(
         # dispatch, so refresh ``actual_comm_method`` after the first forward.
         result.actual_comm_method = _comm_method_name(moe)
 
-        per_rank_iters = _gather_per_iteration_times(fwd_times_us)
-        result.latency_us = _build_latency_block(per_rank_iters)
+        per_rank_iters = _gather_per_iteration_times(fwd_times_ms)
+        result.latency_ms = _build_latency_block(per_rank_iters)
 
         if "kernels" in analysis:
             result.kernel_breakdown = _gather_kernel_breakdown(detailed_stats)
@@ -3279,10 +3290,10 @@ def _run_one_candidate(
 
         # Phase markers live in moe_scheduler.py (Phase 5 of the design); not
         # implemented yet, so emit an empty agg/per_rank with a stable shape.
-        result.phase_times_us = {"agg": {}, "per_rank": {}}
-        result.overlap = {"overlap_us": None, "overlap_ratio": None}
+        result.phase_times_ms = {"agg": {}, "per_rank": {}}
+        result.overlap = {"overlap_ms": None, "overlap_ratio": None}
         result.bottleneck = _classify_bottleneck(
-            result.phase_times_us["agg"], result.kernel_breakdown, result.latency_us["score"]
+            result.phase_times_ms["agg"], result.kernel_breakdown, result.latency_ms["score"]
         )
 
         if rc_active and routing_plan is not None and routing_inputs is not None:
@@ -3338,14 +3349,14 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
         "skip_reason": result.skip_reason,
         "status_per_rank": result.status_per_rank,
         "instrumentation": result.instrumentation,
-        "latency_us": result.latency_us
+        "latency_ms": result.latency_ms
         or {
             "score": None,
             "score_type": "slowest_rank_mean",
             "per_rank": {},
         },
-        "phase_times_us": result.phase_times_us or {"agg": {}, "per_rank": {}},
-        "overlap": result.overlap or {"overlap_us": None, "overlap_ratio": None},
+        "phase_times_ms": result.phase_times_ms or {"agg": {}, "per_rank": {}},
+        "overlap": result.overlap or {"overlap_ms": None, "overlap_ratio": None},
         "bottleneck": result.bottleneck,
         "kernel_breakdown": result.kernel_breakdown
         or {
@@ -3431,26 +3442,32 @@ def _is_completed_for_resume(row: Dict[str, Any]) -> bool:
     return False
 
 
-def _candidate_resume_key(
-    *,
-    num_tokens: int,
-    backend: str,
-    parallel_mode: str,
-    comm_method: str,
-    cuda_graph: bool,
-    use_low_precision_moe_combine: bool,
-    moe_ep_size: Optional[int],
-    moe_tp_size: Optional[int],
-    enable_attention_dp: Optional[bool],
-) -> str:
+def _candidate_resume_key(*, workload: Any, config: Any) -> str:
     """Stable string key identifying one ``(workload, config)`` candidate.
 
     Used by ``--resume_from`` to match rows from a previous JSON against
-    candidates expanded fresh from the current CLI. The key includes every
-    field that ``ConfigSpec`` exposes plus ``num_tokens``. Routing-control
-    axes are *not* included today because the bench does not sweep routing
-    yet; if that changes, this key must expand.
+    candidates expanded fresh from the current CLI. Accepts either
+    ``WorkloadSpec``/``ConfigSpec`` objects or plain dicts (e.g., parsed
+    JSON rows). The key includes every field ``ConfigSpec`` exposes plus
+    ``num_tokens``. Routing-control axes are *not* included today because
+    the bench does not sweep routing yet; if that changes, this key must
+    expand.
     """
+
+    def _get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    num_tokens = _get(workload, "num_tokens", 0) or 0
+    backend = _get(config, "backend") or ""
+    parallel_mode = _get(config, "parallel_mode") or ""
+    comm_method = _get(config, "comm_method") or "AUTO"
+    cuda_graph = _get(config, "cuda_graph", True)
+    lpmc = _get(config, "use_low_precision_moe_combine", False)
+    moe_ep_size = _get(config, "moe_ep_size")
+    moe_tp_size = _get(config, "moe_tp_size")
+    enable_attention_dp = _get(config, "enable_attention_dp")
     return "|".join(
         [
             f"nt={int(num_tokens)}",
@@ -3458,41 +3475,11 @@ def _candidate_resume_key(
             f"pmode={str(parallel_mode).upper()}",
             f"comm={str(comm_method).upper()}",
             f"cg={int(bool(cuda_graph))}",
-            f"lpmc={int(bool(use_low_precision_moe_combine))}",
+            f"lpmc={int(bool(lpmc))}",
             f"ep={moe_ep_size if moe_ep_size is not None else '-'}",
             f"tp={moe_tp_size if moe_tp_size is not None else '-'}",
             f"adp={'-' if enable_attention_dp is None else int(bool(enable_attention_dp))}",
         ]
-    )
-
-
-def _candidate_resume_key_from_specs(workload: WorkloadSpec, config: ConfigSpec) -> str:
-    return _candidate_resume_key(
-        num_tokens=int(workload.num_tokens),
-        backend=str(config.backend),
-        parallel_mode=str(config.parallel_mode),
-        comm_method=str(config.comm_method),
-        cuda_graph=bool(config.cuda_graph),
-        use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
-        moe_ep_size=config.moe_ep_size,
-        moe_tp_size=config.moe_tp_size,
-        enable_attention_dp=config.enable_attention_dp,
-    )
-
-
-def _candidate_resume_key_from_row(row: Dict[str, Any]) -> str:
-    workload = row.get("workload") or {}
-    cfg = row.get("requested_config") or {}
-    return _candidate_resume_key(
-        num_tokens=int(workload.get("num_tokens") or 0),
-        backend=str(cfg.get("backend") or ""),
-        parallel_mode=str(cfg.get("parallel_mode") or ""),
-        comm_method=str(cfg.get("comm_method") or "AUTO"),
-        cuda_graph=bool(cfg.get("cuda_graph", True)),
-        use_low_precision_moe_combine=bool(cfg.get("use_low_precision_moe_combine", False)),
-        moe_ep_size=cfg.get("moe_ep_size"),
-        moe_tp_size=cfg.get("moe_tp_size"),
-        enable_attention_dp=cfg.get("enable_attention_dp"),
     )
 
 
@@ -3523,7 +3510,10 @@ def _load_resume_payload(
         if not isinstance(row, dict):
             continue
         if _is_completed_for_resume(row):
-            key = _candidate_resume_key_from_row(row)
+            key = _candidate_resume_key(
+                workload=row.get("workload") or {},
+                config=row.get("requested_config") or {},
+            )
             completed[key] = row
             keep.append(row)
     return completed, keep
@@ -3712,7 +3702,7 @@ def _build_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             actual_cfg = row.get("actual_config") or {}
             requested_cfg = row.get("requested_config") or {}
             instrumentation = row.get("instrumentation") or {}
-            latency = row.get("latency_us") or {}
+            latency = row.get("latency_ms") or {}
             score = latency.get("score") if isinstance(latency, dict) else None
             ranking_entries.append(
                 {
@@ -3723,7 +3713,7 @@ def _build_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "use_low_precision_moe_combine": requested_cfg.get(
                         "use_low_precision_moe_combine"
                     ),
-                    "score_us": float(score) if isinstance(score, (int, float)) else None,
+                    "score_ms": float(score) if isinstance(score, (int, float)) else None,
                     "status": row.get("status"),
                     "skip_reason": row.get("skip_reason"),
                     "autotune_status": instrumentation.get("autotune_status"),
@@ -3731,8 +3721,8 @@ def _build_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             )
         ranking_entries.sort(
             key=lambda e: (
-                e["score_us"] is None,
-                e["score_us"] if e["score_us"] is not None else 0.0,
+                e["score_ms"] is None,
+                e["score_ms"] if e["score_ms"] is not None else 0.0,
             )
         )
         # ``best`` excludes cases whose autotune pass failed: their score is
@@ -3742,7 +3732,7 @@ def _build_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             (
                 e
                 for e in ranking_entries
-                if e["score_us"] is not None
+                if e["score_ms"] is not None
                 and e["status"] == "success"
                 and not (
                     isinstance(e.get("autotune_status"), str)
@@ -3945,7 +3935,7 @@ def _write_xlsx_workbook(path: str, sheets: List[Tuple[str, List[List[Any]]]]) -
 
 
 def _latency_rank_value(row: Dict[str, Any], rank_name: str, metric: str) -> Optional[float]:
-    per_rank = ((row.get("latency_us") or {}).get("per_rank") or {}).get(rank_name) or {}
+    per_rank = ((row.get("latency_ms") or {}).get("per_rank") or {}).get(rank_name) or {}
     value = per_rank.get(metric)
     return float(value) if isinstance(value, (int, float)) else None
 
@@ -3955,7 +3945,7 @@ def _flatten_result_for_analysis(row: Dict[str, Any]) -> Dict[str, Any]:
     requested = row.get("requested_config") or {}
     actual = row.get("actual_config") or {}
     instrumentation = row.get("instrumentation") or {}
-    latency = row.get("latency_us") or {}
+    latency = row.get("latency_ms") or {}
     routing_actual = (row.get("routing_control") or {}).get("actual") or {}
     dispatch_summary = routing_actual.get("observed_dispatch_matrix_summary") or {}
     hist_summary = routing_actual.get("observed_expert_histogram_summary") or {}
@@ -3977,16 +3967,16 @@ def _flatten_result_for_analysis(row: Dict[str, Any]) -> Dict[str, Any]:
         "num_chunks": actual.get("num_chunks"),
         "status": row.get("status"),
         "skip_reason": row.get("skip_reason"),
-        "score_us": latency.get("score"),
+        "score_ms": latency.get("score"),
         "score_type": latency.get("score_type"),
-        "rank0_mean_us": _latency_rank_value(row, "rank0", "mean"),
-        "rank1_mean_us": _latency_rank_value(row, "rank1", "mean"),
-        "rank2_mean_us": _latency_rank_value(row, "rank2", "mean"),
-        "rank3_mean_us": _latency_rank_value(row, "rank3", "mean"),
-        "rank0_p90_us": _latency_rank_value(row, "rank0", "p90"),
-        "rank1_p90_us": _latency_rank_value(row, "rank1", "p90"),
-        "rank2_p90_us": _latency_rank_value(row, "rank2", "p90"),
-        "rank3_p90_us": _latency_rank_value(row, "rank3", "p90"),
+        "rank0_mean_ms": _latency_rank_value(row, "rank0", "mean"),
+        "rank1_mean_ms": _latency_rank_value(row, "rank1", "mean"),
+        "rank2_mean_ms": _latency_rank_value(row, "rank2", "mean"),
+        "rank3_mean_ms": _latency_rank_value(row, "rank3", "mean"),
+        "rank0_p90_ms": _latency_rank_value(row, "rank0", "p90"),
+        "rank1_p90_ms": _latency_rank_value(row, "rank1", "p90"),
+        "rank2_p90_ms": _latency_rank_value(row, "rank2", "p90"),
+        "rank3_p90_ms": _latency_rank_value(row, "rank3", "p90"),
         "autotune_status": instrumentation.get("autotune_status"),
         "latency_source": instrumentation.get("latency_source"),
         "analysis_level": instrumentation.get("level"),
@@ -4020,16 +4010,16 @@ _ANALYSIS_COLUMNS: Tuple[str, ...] = (
     "num_chunks",
     "status",
     "skip_reason",
-    "score_us",
+    "score_ms",
     "score_type",
-    "rank0_mean_us",
-    "rank1_mean_us",
-    "rank2_mean_us",
-    "rank3_mean_us",
-    "rank0_p90_us",
-    "rank1_p90_us",
-    "rank2_p90_us",
-    "rank3_p90_us",
+    "rank0_mean_ms",
+    "rank1_mean_ms",
+    "rank2_mean_ms",
+    "rank3_mean_ms",
+    "rank0_p90_ms",
+    "rank1_p90_ms",
+    "rank2_p90_ms",
+    "rank3_p90_ms",
     "autotune_status",
     "latency_source",
     "analysis_level",
@@ -4061,7 +4051,7 @@ def _best_by_workload_rows(rankings: List[Dict[str, Any]]) -> List[List[Any]]:
             "requested_backend",
             "comm_method",
             "cuda_graph",
-            "score_us",
+            "score_ms",
             "status",
             "skip_reason",
             "autotune_status",
@@ -4077,7 +4067,7 @@ def _best_by_workload_rows(rankings: List[Dict[str, Any]]) -> List[List[Any]]:
                 best.get("requested_backend"),
                 best.get("comm_method"),
                 best.get("cuda_graph"),
-                best.get("score_us"),
+                best.get("score_ms"),
                 best.get("status"),
                 best.get("skip_reason"),
                 best.get("autotune_status"),
@@ -4128,8 +4118,8 @@ def _workload_sheets(flat_rows: List[Dict[str, Any]]) -> List[Tuple[str, List[Li
         sorted_rows = sorted(
             rows,
             key=lambda row: (
-                row.get("score_us") is None,
-                row.get("score_us") if row.get("score_us") is not None else 0.0,
+                row.get("score_ms") is None,
+                row.get("score_ms") if row.get("score_ms") is not None else 0.0,
                 str(row.get("requested_backend")),
                 str(row.get("requested_comm_method")),
             ),
@@ -4952,7 +4942,7 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
             cli_dest="comm_method",
             cli_flag_name="--comm_method",
             config_key="comm_method",
-            full_set=tuple(_FORCED_COMM_ENV_VALUES.keys()) + ("AUTO",),
+            full_set=_FORCED_COMM_ENV_VALUES + ("AUTO",),
         )
     # ``cuda_graph`` and ``combine_precision`` axes are reserved for ``full``;
     # leave them empty by default so the base value is used.
@@ -5105,11 +5095,11 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     ctx = _resolve_benchmark_context(args)
 
     # CUPTI MUST be initialized before the CUDA context is created.
-    _early_cupti_ctx: Optional[Any] = None
+    _early_cupti_ctx: Optional[_CuptiContext] = None
     if args.cuda_graph and "kernels" in ctx.analysis:
-        _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
-        if _cupti_ok:
-            _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
+        _cupti_init = _try_init_cupti()
+        if _cupti_init.ok:
+            _early_cupti_ctx = _cupti_init
 
     tllm.logger.set_level("error")
 
@@ -5180,7 +5170,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
         deadline = time.monotonic() + args.time_budget_minutes * 60.0
 
     for idx, (workload, cand, kind) in enumerate(flat_plan):
-        key = _candidate_resume_key_from_specs(workload, cand)
+        key = _candidate_resume_key(workload=workload, config=cand)
         if key in resumed_by_key:
             # E: short-circuit. The resumed row is already in accumulated_rows.
             continue
@@ -5265,7 +5255,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 f"context ({any_poison})"
             )
             for w2, c2, k2 in flat_plan[idx + 1 :]:
-                key2 = _candidate_resume_key_from_specs(w2, c2)
+                key2 = _candidate_resume_key(workload=w2, config=c2)
                 if key2 in resumed_by_key:
                     continue
                 if k2.startswith("prune:"):
