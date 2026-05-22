@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import os
 import socket
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from _torch.modules.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._utils import local_mpi_rank, mpi_barrier, mpi_rank
+
+_InputCacheKey = Tuple[int, int, int, str, str, str, Optional[int]]
+_InputCache = Dict[_InputCacheKey, Tuple[torch.Tensor, torch.Tensor]]
 
 
 def _maybe_print_rank0(msg: str) -> None:
@@ -140,12 +143,42 @@ def _make_inputs(
     act_dtype: torch.dtype,
     routing_logits_dtype: torch.dtype,
     device: torch.device,
+    seed: Optional[int] = None,
+    cache: Optional[_InputCache] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Create deterministic synthetic hidden states + router logits."""
+    """Create synthetic hidden states + router logits, optionally from a local seed."""
+    cache_key = (
+        int(local_num_tokens),
+        int(hidden_size),
+        int(num_experts),
+        str(act_dtype),
+        str(routing_logits_dtype),
+        str(device),
+        int(seed) if seed is not None else None,
+    )
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
     if local_num_tokens == 0:
         x = torch.empty((0, hidden_size), dtype=act_dtype, device=device)
         logits = torch.empty((0, num_experts), dtype=routing_logits_dtype, device=device)
+        if cache is not None:
+            cache[cache_key] = (x, logits)
         return x, logits
-    x = torch.randn((local_num_tokens, hidden_size), dtype=act_dtype, device=device)
-    logits = torch.randn((local_num_tokens, num_experts), dtype=routing_logits_dtype, device=device)
+    generator = None
+    if seed is not None:
+        generator_device = device.type if isinstance(device, torch.device) else device
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(int(seed))
+    x = torch.randn(
+        (local_num_tokens, hidden_size), dtype=act_dtype, device=device, generator=generator
+    )
+    logits = torch.randn(
+        (local_num_tokens, num_experts),
+        dtype=routing_logits_dtype,
+        device=device,
+        generator=generator,
+    )
+    if cache is not None:
+        cache[cache_key] = (x, logits)
     return x, logits

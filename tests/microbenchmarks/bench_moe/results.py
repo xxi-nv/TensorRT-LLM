@@ -25,38 +25,142 @@ from .routing import _per_rank_tokens
 from .specs import ConfigSpec, ModelSpec, RunResult, WorkloadSpec
 from .utils import _compute_stats
 
+_ROBUST_SCORE_MIN_SAMPLES = 8
+_ROBUST_SCORE_MAD_Z_THRESHOLD = 3.5
+_ROBUST_SCORE_ZERO_SPREAD_REL_TOL = 0.05
+
 
 def _gather_per_iteration_times(times_ms: List[float]) -> List[List[float]]:
     """All-gather raw per-iteration latencies; returns ``[ [rank0_iters], ... ]``."""
     return mpi_allgather(times_ms)
 
 
-def _slowest_rank_mean_score(per_rank_iters: List[List[float]]) -> float:
-    """Compute ``mean_i(max_r(latency_ms[rank=r][iteration=i]))``.
+def _slowest_rank_iter_maxes(per_rank_iters: List[List[float]]) -> List[float]:
+    """Return ``max_r(latency_ms[rank=r][iteration=i])`` for each common iteration.
 
     Falls back gracefully when ranks reported different iteration counts; the
     common length is used and trailing entries are ignored.
     """
     if not per_rank_iters:
-        return 0.0
+        return []
     lengths = [len(r) for r in per_rank_iters if r]
     if not lengths:
-        return 0.0
+        return []
     n = min(lengths)
     if n == 0:
-        return 0.0
+        return []
     iter_max: List[float] = []
     for i in range(n):
         per_iter_vals = [r[i] for r in per_rank_iters if i < len(r)]
         iter_max.append(max(per_iter_vals))
-    return sum(iter_max) / len(iter_max)
+    return iter_max
+
+
+def _slowest_rank_mean_score(per_rank_iters: List[List[float]]) -> float:
+    """Compute raw ``mean_i(max_r(latency_ms[rank=r][iteration=i]))``."""
+    iter_max = _slowest_rank_iter_maxes(per_rank_iters)
+    return sum(iter_max) / len(iter_max) if iter_max else 0.0
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return float((s[mid - 1] + s[mid]) / 2.0)
+
+
+def _robust_slowest_rank_score(iter_max: List[float]) -> Tuple[float, str, Dict[str, Any]]:
+    """Score distributed latency while reporting, not hiding, extreme samples."""
+    if not iter_max:
+        return (
+            0.0,
+            "slowest_rank_trimmed_mean",
+            {
+                "method": "modified_z_score_mad",
+                "count": 0,
+                "samples_used": 0,
+                "samples_total": 0,
+                "items": [],
+            },
+        )
+
+    if len(iter_max) < _ROBUST_SCORE_MIN_SAMPLES:
+        return (
+            _median(iter_max),
+            "slowest_rank_median",
+            {
+                "method": "disabled_insufficient_samples",
+                "count": 0,
+                "samples_used": len(iter_max),
+                "samples_total": len(iter_max),
+                "items": [],
+            },
+        )
+
+    center = _median(iter_max)
+    deviations = [abs(v - center) for v in iter_max]
+    mad = _median(deviations)
+    outliers: List[Dict[str, Any]] = []
+    keep: List[float] = []
+
+    for idx, value in enumerate(iter_max):
+        diff = value - center
+        score: Optional[float]
+        if mad > 0.0:
+            score = 0.6745 * diff / mad
+            is_outlier = abs(score) > _ROBUST_SCORE_MAD_Z_THRESHOLD
+        else:
+            tolerance = max(abs(center) * _ROBUST_SCORE_ZERO_SPREAD_REL_TOL, 1.0e-12)
+            score = None
+            is_outlier = abs(diff) > tolerance
+
+        if is_outlier:
+            outliers.append(
+                {
+                    "index": int(idx),
+                    "value": float(value),
+                    "center": float(center),
+                    "modified_z_score": float(score) if score is not None else None,
+                    "absolute_deviation": float(abs(diff)),
+                    "direction": "high" if diff > 0 else "low",
+                }
+            )
+        else:
+            keep.append(value)
+
+    samples = keep if keep else iter_max
+    score = sum(samples) / len(samples)
+    return (
+        float(score),
+        "slowest_rank_trimmed_mean",
+        {
+            "method": "modified_z_score_mad",
+            "threshold": float(_ROBUST_SCORE_MAD_Z_THRESHOLD),
+            "center": float(center),
+            "mad": float(mad),
+            "count": len(outliers),
+            "samples_used": len(samples),
+            "samples_total": len(iter_max),
+            "items": outliers,
+        },
+    )
 
 
 def _build_latency_block(per_rank_iters: List[List[float]]) -> Dict[str, Any]:
-    score = _slowest_rank_mean_score(per_rank_iters)
+    iter_max = _slowest_rank_iter_maxes(per_rank_iters)
+    raw_score = sum(iter_max) / len(iter_max) if iter_max else 0.0
+    score, score_type, outliers = _robust_slowest_rank_score(iter_max)
     return {
         "score": float(score),
-        "score_type": "slowest_rank_mean",
+        "score_type": score_type,
+        "raw_score": float(raw_score),
+        "raw_score_type": "slowest_rank_mean",
+        "iter_max_stats": _compute_stats(iter_max),
+        "iter_max_outliers": outliers,
         "per_rank": {f"rank{i}": _compute_stats(times) for i, times in enumerate(per_rank_iters)},
     }
 
@@ -65,14 +169,24 @@ def _gather_kernel_breakdown(
     detailed_stats: Dict[str, Any],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """All-gather per-kernel timings and produce per-rank summary stats."""
+    kernel_breakdown, _raw_kernel_times = _gather_kernel_timing_blocks(detailed_stats)
+    return kernel_breakdown
+
+
+def _kernel_times_payload(detailed_stats: Dict[str, Any]) -> Dict[str, Dict[str, List[float]]]:
     categories = ("moe_forward_kernels", "other_kernels")
     local_payload: Dict[str, Dict[str, List[float]]] = {}
     for cat in categories:
         local_payload[cat] = {
             kernel["name"]: kernel.get("_times", []) for kernel in detailed_stats.get(cat, [])
         }
-    all_payload = mpi_allgather(local_payload)
+    return local_payload
 
+
+def _kernel_breakdown_from_payload(
+    all_payload: List[Dict[str, Dict[str, List[float]]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    categories = ("moe_forward_kernels", "other_kernels")
     merged: Dict[str, List[Dict[str, Any]]] = {}
     for cat in categories:
         seen = set()
@@ -100,6 +214,65 @@ def _gather_kernel_breakdown(
             )
         merged[cat] = kernels
     return merged
+
+
+def _raw_kernel_times_from_payload(
+    all_payload: List[Dict[str, Dict[str, List[float]]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    categories = ("moe_forward_kernels", "other_kernels")
+    merged: Dict[str, List[Dict[str, Any]]] = {}
+    for cat in categories:
+        seen = set()
+        kernel_names: List[str] = []
+        for rank_payload in all_payload:
+            for name in rank_payload.get(cat, {}):
+                if name not in seen:
+                    seen.add(name)
+                    kernel_names.append(name)
+
+        kernels: List[Dict[str, Any]] = []
+        for name in kernel_names:
+            per_rank: Dict[str, List[float]] = {}
+            for rank_idx, rank_payload in enumerate(all_payload):
+                times = rank_payload.get(cat, {}).get(name, [])
+                per_rank[f"rank{rank_idx}"] = list(times) if isinstance(times, list) else []
+            kernels.append(
+                {
+                    "name": name,
+                    "count": max((len(times) for times in per_rank.values()), default=0),
+                    "per_rank": per_rank,
+                }
+            )
+        merged[cat] = kernels
+    return merged
+
+
+def _gather_kernel_timing_blocks(
+    detailed_stats: Dict[str, Any],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, List[Dict[str, Any]]]]:
+    """All-gather kernel timings once and return summary plus raw timing blocks."""
+    all_payload = mpi_allgather(_kernel_times_payload(detailed_stats))
+    return _kernel_breakdown_from_payload(all_payload), _raw_kernel_times_from_payload(all_payload)
+
+
+def _build_raw_data_block(
+    per_rank_iters: List[List[float]],
+    raw_kernel_times: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Build the raw sample block written to JSON and the analysis workbook."""
+    return {
+        "forward_times_ms": {
+            "per_rank": {
+                f"rank{i}": list(times) if isinstance(times, list) else []
+                for i, times in enumerate(per_rank_iters)
+            }
+        },
+        "kernel_times_ms": raw_kernel_times
+        or {
+            "moe_forward_kernels": [],
+            "other_kernels": [],
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +367,11 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
         "latency_ms": result.latency_ms
         or {
             "score": None,
-            "score_type": "slowest_rank_mean",
+            "score_type": "slowest_rank_trimmed_mean",
+            "raw_score": None,
+            "raw_score_type": "slowest_rank_mean",
+            "iter_max_stats": {},
+            "iter_max_outliers": {},
             "per_rank": {},
         },
         "phase_times_ms": result.phase_times_ms or {"agg": {}, "per_rank": {}},
@@ -204,6 +381,14 @@ def _runresult_to_row(result: RunResult) -> Dict[str, Any]:
         or {
             "moe_forward_kernels": [],
             "other_kernels": [],
+        },
+        "raw_data": result.raw_data
+        or {
+            "forward_times_ms": {"per_rank": {}},
+            "kernel_times_ms": {
+                "moe_forward_kernels": [],
+                "other_kernels": [],
+            },
         },
         "routing_control": result.routing_control or None,
     }

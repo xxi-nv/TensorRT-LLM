@@ -46,6 +46,7 @@ if str(_TESTS_UNITTEST_DIR) not in sys.path:
 # Importing bench_moe triggers heavy ``tensorrt_llm`` imports. Skip when those
 # are not available (e.g. lean container without the in-tree TRT-LLM build).
 bench_moe = pytest.importorskip("bench_moe")  # noqa: E402
+from bench_moe.reporting import _build_analysis_workbook_sheets  # noqa: E402
 
 RoutingControlSpec = bench_moe.RoutingControlSpec
 RoutingPlan = bench_moe.RoutingPlan
@@ -59,6 +60,12 @@ RoutingPlan = bench_moe.RoutingPlan
 def test_parse_comm_pattern_balanced():
     name, kwargs = bench_moe._parse_comm_pattern("balanced_alltoall")
     assert name == "balanced_alltoall"
+    assert kwargs == {}
+
+
+def test_parse_comm_pattern_random():
+    name, kwargs = bench_moe._parse_comm_pattern("random")
+    assert name == "random"
     assert kwargs == {}
 
 
@@ -90,6 +97,12 @@ def test_parse_expert_pattern_active_experts():
     assert kwargs == {"active_experts": 2}
 
 
+def test_parse_expert_pattern_random():
+    name, kwargs = bench_moe._parse_expert_pattern("random")
+    assert name == "random"
+    assert kwargs == {}
+
+
 def test_parse_expert_pattern_requires_args():
     with pytest.raises(ValueError):
         bench_moe._parse_expert_pattern("hotspot")
@@ -110,6 +123,20 @@ def test_balanced_alltoall_row_sums_match_top_k():
     # Uniform within rounding.
     for row in matrix:
         assert max(row) - min(row) <= 1
+
+
+def test_random_dispatch_matrix_is_seeded_and_preserves_row_sums():
+    per_rank = [4, 4, 4, 4]
+    top_k = 4
+    ep_size = 4
+    matrix1 = bench_moe._build_dispatch_matrix("random", per_rank, top_k, ep_size, seed=7)
+    matrix2 = bench_moe._build_dispatch_matrix("random", per_rank, top_k, ep_size, seed=7)
+    matrix3 = bench_moe._build_dispatch_matrix("random", per_rank, top_k, ep_size, seed=8)
+
+    assert matrix1 == matrix2
+    assert matrix1 != matrix3
+    for src in range(ep_size):
+        assert sum(matrix1[src]) == per_rank[src] * top_k
 
 
 def test_receiver_hotspot_adds_traffic_to_target_column():
@@ -176,6 +203,22 @@ def test_expert_pattern_balanced_distributes_uniformly():
     hist = bench_moe._build_expert_histogram("balanced", dispatch, experts_per_rank, ep_size)
     for row in hist:
         assert max(row) - min(row) <= 1
+
+
+def test_random_expert_histogram_is_seeded_and_preserves_total_slots():
+    dispatch = [
+        [4, 4, 4, 4],
+        [4, 4, 4, 4],
+        [4, 4, 4, 4],
+        [4, 4, 4, 4],
+    ]
+    hist1 = bench_moe._build_expert_histogram("random", dispatch, 4, 4, seed=7)
+    hist2 = bench_moe._build_expert_histogram("random", dispatch, 4, 4, seed=7)
+    hist3 = bench_moe._build_expert_histogram("random", dispatch, 4, 4, seed=8)
+
+    assert hist1 == hist2
+    assert hist1 != hist3
+    assert sum(sum(row) for row in hist1) == sum(sum(row) for row in dispatch)
 
 
 def test_expert_pattern_hotspot_active_experts_limits_active_count():
@@ -431,12 +474,24 @@ def test_dispatch_matrix_file_ep_mismatch(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_is_active_default_false():
-    assert RoutingControlSpec().is_active is False
+def test_is_active_default_balanced_plan():
+    assert RoutingControlSpec().is_active is True
 
 
-def test_is_active_when_pattern_changed():
+def test_is_active_false_when_patterns_are_random():
+    assert RoutingControlSpec(comm_pattern="random", expert_pattern="random").is_active is False
+
+
+def test_is_active_when_comm_pattern_changed():
     assert RoutingControlSpec(comm_pattern="local_only").is_active is True
+
+
+def test_is_active_when_expert_pattern_changed():
+    assert RoutingControlSpec(expert_pattern="balanced").is_active is True
+
+
+def test_is_active_when_balanced_plan_requested():
+    assert RoutingControlSpec(comm_pattern="balanced_alltoall", expert_pattern="balanced").is_active
 
 
 def test_is_active_when_routing_pattern_file_set():
@@ -445,6 +500,95 @@ def test_is_active_when_routing_pattern_file_set():
 
 def test_is_active_when_per_rank_tokens_set():
     assert RoutingControlSpec(per_rank_num_tokens=(1, 2)).is_active is True
+
+
+def test_pick_enable_perfect_router_is_explicit_opt_in():
+    assert bench_moe._pick_enable_perfect_router(RoutingControlSpec(), False) is False
+    assert bench_moe._pick_enable_perfect_router(RoutingControlSpec(), True) is True
+    assert (
+        bench_moe._pick_enable_perfect_router(RoutingControlSpec(routing_mode="forced"), True)
+        is False
+    )
+
+
+def test_balanced_native_projection_logits_select_materialized_plan():
+    class DefaultMoeRoutingMethod:
+        pass
+
+    top_k = 4
+    num_experts = 16
+    moe_ep_size = 4
+    experts_per_rank = num_experts // moe_ep_size
+    spec = RoutingControlSpec(comm_pattern="balanced_alltoall", expert_pattern="balanced")
+    plan = bench_moe._build_routing_plan(
+        spec,
+        num_tokens=64,
+        world_size=moe_ep_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        moe_ep_size=moe_ep_size,
+    )
+
+    for src_rank in range(moe_ep_size):
+        expected_ids, _ = bench_moe._materialize_selected_experts_for_rank(
+            plan,
+            src_rank=src_rank,
+            top_k=top_k,
+            experts_per_rank=experts_per_rank,
+            moe_ep_size=moe_ep_size,
+            device=torch.device("cpu"),
+            scale_dtype=torch.float32,
+        )
+        logits, status, _ = bench_moe._project_router_logits_for_plan(
+            plan,
+            src_rank=src_rank,
+            routing_method=DefaultMoeRoutingMethod(),
+            num_experts=num_experts,
+            top_k=top_k,
+            experts_per_rank=experts_per_rank,
+            moe_ep_size=moe_ep_size,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        actual_ids = torch.topk(logits, k=top_k, dim=1).indices.to(torch.int32)
+
+        assert status == "exact"
+        assert torch.equal(actual_ids, expected_ids)
+
+
+def test_latency_block_uses_robust_score_and_reports_high_outlier():
+    block = bench_moe._build_latency_block(
+        [
+            [1.0] * 10,
+            [1.0] * 9 + [100.0],
+        ]
+    )
+
+    assert block["score_type"] == "slowest_rank_trimmed_mean"
+    assert block["score"] == 1.0
+    assert block["raw_score"] == pytest.approx(10.9)
+    assert block["iter_max_outliers"]["count"] == 1
+    assert block["iter_max_outliers"]["items"][0]["index"] == 9
+    assert block["iter_max_outliers"]["items"][0]["direction"] == "high"
+
+
+def test_latency_block_uses_robust_score_and_reports_low_outlier():
+    block = bench_moe._build_latency_block(
+        [
+            [1.0] * 10,
+            [1.0] * 5 + [0.01] + [1.0] * 4,
+        ]
+    )
+
+    assert block["score"] == 1.0
+    assert block["raw_score"] == 1.0
+    assert block["iter_max_outliers"]["count"] == 0
+
+    block = bench_moe._build_latency_block([[1.0] * 5 + [0.01] + [1.0] * 4])
+    assert block["score"] == 1.0
+    assert block["raw_score"] == pytest.approx(0.901)
+    assert block["iter_max_outliers"]["count"] == 1
+    assert block["iter_max_outliers"]["items"][0]["direction"] == "low"
 
 
 def test_resolve_workloads_uses_balanced_total_num_tokens():
@@ -654,3 +798,274 @@ def test_observe_summary_matches_exact_plan():
     max_abs, max_rel = bench_moe._observe_summary(requested, observed)
     assert max_abs == 0
     assert max_rel == 0.0
+
+
+def test_make_inputs_uses_seed_without_advancing_global_rng():
+    torch.manual_seed(123)
+    before = torch.rand(3)
+    x1, logits1 = bench_moe._make_inputs(
+        4,
+        8,
+        6,
+        torch.float32,
+        torch.float32,
+        torch.device("cpu"),
+        seed=999,
+    )
+    after = torch.rand(3)
+
+    torch.manual_seed(123)
+    expected_before = torch.rand(3)
+    expected_after = torch.rand(3)
+    x2, logits2 = bench_moe._make_inputs(
+        4,
+        8,
+        6,
+        torch.float32,
+        torch.float32,
+        torch.device("cpu"),
+        seed=999,
+    )
+
+    assert torch.equal(before, expected_before)
+    assert torch.equal(after, expected_after)
+    assert torch.equal(x1, x2)
+    assert torch.equal(logits1, logits2)
+
+
+def test_make_inputs_reuses_cached_tensors_for_same_seed_and_shape():
+    cache = {}
+    x1, logits1 = bench_moe._make_inputs(
+        4,
+        8,
+        6,
+        torch.float32,
+        torch.float32,
+        torch.device("cpu"),
+        seed=999,
+        cache=cache,
+    )
+    x2, logits2 = bench_moe._make_inputs(
+        4,
+        8,
+        6,
+        torch.float32,
+        torch.float32,
+        torch.device("cpu"),
+        seed=999,
+        cache=cache,
+    )
+    x3, logits3 = bench_moe._make_inputs(
+        4,
+        8,
+        6,
+        torch.float32,
+        torch.float32,
+        torch.device("cpu"),
+        seed=1000,
+        cache=cache,
+    )
+
+    assert x1 is x2
+    assert logits1 is logits2
+    assert x1 is not x3
+    assert logits1 is not logits3
+
+
+def test_analysis_workbook_includes_kernel_breakdown_sheet():
+    payload = {
+        "results": [
+            {
+                "workload": {"num_tokens": 1024},
+                "requested_config": {
+                    "backend": "TRTLLM",
+                    "comm_method": "DEEPEP",
+                    "parallel_mode": "DEP",
+                    "cuda_graph": True,
+                    "use_low_precision_moe_combine": False,
+                },
+                "actual_config": {
+                    "backend": "TRTLLM",
+                    "comm_method": "DeepEP",
+                    "scheduler_kind": "EXTERNAL_COMM",
+                },
+                "status": "success",
+                "latency_ms": {"score": 1.5},
+                "kernel_breakdown": {
+                    "moe_forward_kernels": [
+                        {
+                            "name": "void deep_ep::intranode::dispatch<4>()",
+                            "count": 20,
+                            "per_rank": {
+                                "rank0": {
+                                    "mean": 0.12,
+                                    "median": 0.11,
+                                    "p90": 0.13,
+                                    "min": 0.10,
+                                    "max": 0.14,
+                                    "stdev": 0.01,
+                                },
+                                "rank1": {
+                                    "mean": 0.22,
+                                    "median": 0.21,
+                                    "p90": 0.23,
+                                    "min": 0.20,
+                                    "max": 0.24,
+                                    "stdev": 0.02,
+                                },
+                            },
+                        }
+                    ],
+                    "other_kernels": [
+                        {
+                            "name": "void at::native::fill_kernel()",
+                            "count": 20,
+                            "per_rank": {
+                                "rank0": {
+                                    "mean": 0.01,
+                                    "median": 0.01,
+                                    "p90": 0.02,
+                                    "min": 0.01,
+                                    "max": 0.02,
+                                    "stdev": 0.0,
+                                }
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "rankings": [],
+    }
+
+    sheets = dict(_build_analysis_workbook_sheets(payload))
+
+    assert "kernel_breakdown" in sheets
+    header, first_row, second_row, third_row = sheets["kernel_breakdown"]
+    assert header == [
+        "result_index",
+        "num_tokens",
+        "requested_parallel_mode",
+        "requested_backend",
+        "requested_comm_method",
+        "requested_cuda_graph",
+        "requested_low_precision_combine",
+        "actual_backend",
+        "actual_comm_method",
+        "scheduler_kind",
+        "status",
+        "score_ms",
+        "category",
+        "kernel_name",
+        "kernel_count",
+        "rank",
+        "mean_ms",
+        "median_ms",
+        "p90_ms",
+        "min_ms",
+        "max_ms",
+        "stdev_ms",
+    ]
+    assert first_row[12:] == [
+        "moe_forward_kernels",
+        "void deep_ep::intranode::dispatch<4>()",
+        20,
+        "rank0",
+        0.12,
+        0.11,
+        0.13,
+        0.10,
+        0.14,
+        0.01,
+    ]
+    assert second_row[15] == "rank1"
+    assert third_row[12:16] == [
+        "other_kernels",
+        "void at::native::fill_kernel()",
+        20,
+        "rank0",
+    ]
+
+
+def test_analysis_workbook_includes_raw_data_sheet():
+    payload = {
+        "results": [
+            {
+                "workload": {"num_tokens": 1024},
+                "requested_config": {
+                    "backend": "TRTLLM",
+                    "comm_method": "DEEPEP",
+                    "parallel_mode": "DEP",
+                    "cuda_graph": True,
+                    "use_low_precision_moe_combine": False,
+                },
+                "actual_config": {
+                    "backend": "TRTLLM",
+                    "comm_method": "DeepEP",
+                    "scheduler_kind": "EXTERNAL_COMM",
+                },
+                "status": "success",
+                "latency_ms": {"score": 1.5},
+                "raw_data": {
+                    "forward_times_ms": {
+                        "per_rank": {
+                            "rank0": [1.0, 1.1],
+                            "rank1": [1.2],
+                        }
+                    },
+                    "kernel_times_ms": {
+                        "moe_forward_kernels": [
+                            {
+                                "name": "void deep_ep::intranode::dispatch<4>()",
+                                "count": 2,
+                                "per_rank": {
+                                    "rank0": [0.10, 0.11],
+                                    "rank1": [0.20],
+                                },
+                            }
+                        ],
+                        "other_kernels": [],
+                    },
+                },
+            }
+        ],
+        "rankings": [],
+    }
+
+    sheets = dict(_build_analysis_workbook_sheets(payload))
+
+    assert "raw_data" in sheets
+    header, forward0, forward1, forward2, kernel0, kernel1, kernel2 = sheets["raw_data"]
+    assert header == [
+        "result_index",
+        "num_tokens",
+        "requested_parallel_mode",
+        "requested_backend",
+        "requested_comm_method",
+        "requested_cuda_graph",
+        "requested_low_precision_combine",
+        "actual_backend",
+        "actual_comm_method",
+        "scheduler_kind",
+        "status",
+        "score_ms",
+        "record_type",
+        "category",
+        "kernel_name",
+        "rank",
+        "iteration",
+        "time_ms",
+    ]
+    assert forward0[12:] == ["forward", None, None, "rank0", 0, 1.0]
+    assert forward1[12:] == ["forward", None, None, "rank0", 1, 1.1]
+    assert forward2[12:] == ["forward", None, None, "rank1", 0, 1.2]
+    assert kernel0[12:] == [
+        "kernel",
+        "moe_forward_kernels",
+        "void deep_ep::intranode::dispatch<4>()",
+        "rank0",
+        0,
+        0.10,
+    ]
+    assert kernel1[15:] == ["rank0", 1, 0.11]
+    assert kernel2[15:] == ["rank1", 0, 0.20]

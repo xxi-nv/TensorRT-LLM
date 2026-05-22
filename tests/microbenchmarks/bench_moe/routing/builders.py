@@ -25,6 +25,7 @@ share the same validation surface.
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,6 +106,11 @@ def _largest_remainder_split(total: int, weights: List[float]) -> List[int]:
     return floors
 
 
+def _random_weights(n: int, *, seed: int, label: str, index: int) -> List[float]:
+    rng = random.Random(f"bench_moe:{int(seed)}:{label}:{int(index)}")
+    return [rng.random() for _ in range(n)]
+
+
 def _build_per_rank_num_tokens(
     spec: RoutingControlSpec,
     num_tokens: int,
@@ -134,6 +140,7 @@ def _build_dispatch_matrix(
     per_rank_num_tokens: List[int],
     top_k: int,
     ep_size: int,
+    seed: int = 0,
 ) -> List[List[int]]:
     """Build the canonical slot ``dispatch_matrix`` for ``comm_pattern``.
 
@@ -152,6 +159,8 @@ def _build_dispatch_matrix(
             raise ValueError(
                 "file:<path> dispatch matrices are loaded via _load_dispatch_matrix_file"
             )
+        elif name == "random":
+            weights = _random_weights(ep_size, seed=seed, label="comm", index=src)
         elif name == "balanced_alltoall":
             weights = [1.0] * ep_size
         elif name == "receiver_hotspot":
@@ -191,6 +200,7 @@ def _build_expert_histogram(
     dispatch_matrix: List[List[int]],
     experts_per_rank: int,
     ep_size: int,
+    seed: int = 0,
 ) -> List[List[int]]:
     """Build the canonical global ``expert_histogram[ep_size][experts_per_rank]``."""
     name, kwargs = _parse_expert_pattern(expert_pattern)
@@ -205,6 +215,8 @@ def _build_expert_histogram(
             raise ValueError(
                 "file:<path> expert histograms are loaded via _load_expert_histogram_file"
             )
+        elif name == "random":
+            weights = _random_weights(experts_per_rank, seed=seed, label="expert", index=dst)
         elif name == "balanced":
             weights = [1.0] * experts_per_rank
         elif name == "hotspot":
@@ -312,7 +324,8 @@ def _build_routing_plan(
     # axis, but materialisation is still per source rank. For the v1 dispatch
     # matrix abstraction we use ``moe_ep_size`` as both axes.
     if spec.routing_pattern_file:
-        if spec.comm_pattern != "balanced_alltoall" or spec.expert_pattern != "balanced":
+        default_patterns = {("balanced_alltoall", "balanced"), ("random", "random")}
+        if (spec.comm_pattern, spec.expert_pattern) not in default_patterns:
             raise ValueError(
                 "--routing_pattern_file cannot be combined with non-default "
                 "--comm_pattern or --expert_pattern"
@@ -321,9 +334,11 @@ def _build_routing_plan(
             spec.routing_pattern_file, moe_ep_size, experts_per_rank
         )
     else:
-        dispatch_matrix = _build_dispatch_matrix(spec.comm_pattern, per_rank, top_k, moe_ep_size)
+        dispatch_matrix = _build_dispatch_matrix(
+            spec.comm_pattern, per_rank, top_k, moe_ep_size, seed=spec.seed
+        )
         expert_histogram = _build_expert_histogram(
-            spec.expert_pattern, dispatch_matrix, experts_per_rank, moe_ep_size
+            spec.expert_pattern, dispatch_matrix, experts_per_rank, moe_ep_size, seed=spec.seed
         )
 
     # Per-row sums are an invariant; emit a clearer error than the materialiser would.
