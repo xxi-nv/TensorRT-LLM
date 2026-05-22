@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,6 @@ import functools
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from flashinfer.mamba import SSDCombined
 
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
@@ -46,6 +45,20 @@ _FLASHINFER_SSD_VALID_M_MODES = (64, 128)
 _FLASHINFER_SSD_VALID_HEAD_DIMS = (64, 128)
 
 
+@functools.cache
+def _get_ssd_combined_cls():
+    try:
+        from flashinfer.mamba import SSDCombined
+    except ImportError as exc:
+        logger.info_once(
+            f"FlashInfer SSDCombined is unavailable ({exc}); falling back to "
+            "Triton SSD prefill",
+            key="flashinfer_ssd_combined_unavailable",
+        )
+        return None
+    return SSDCombined
+
+
 def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
     return (chunk_size in _FLASHINFER_SSD_VALID_M_MODES
             and dstate in _FLASHINFER_SSD_VALID_M_MODES
@@ -60,11 +73,14 @@ def _get_flashinfer_ssd_kernel(chunk_size, nheads, headdim, dstate, ngroups,
     has_varlen is in the cache key because flashinfer compiles distinct
     kernels per mode.
     """
+    ssd_combined_cls = _get_ssd_combined_cls()
+    if ssd_combined_cls is None:
+        return None
     logger.info_once(
         f"Using FlashInfer fused SSD kernel for Mamba2 prefill "
         f"(has_varlen={has_varlen})",
         key=f"flashinfer_ssd_prefill_{has_varlen}")
-    return SSDCombined(
+    return ssd_combined_cls(
         chunk_size=chunk_size,
         nheads=nheads,
         headdim=headdim,
@@ -113,6 +129,8 @@ def _mamba_chunk_scan_flashinfer_fwd(
 
     ssd = _get_flashinfer_ssd_kernel(chunk_size, nheads, headdim, dstate,
                                      ngroups, has_varlen)
+    if ssd is None:
+        return None
     num_seqs = cu_seqlens.shape[0] - 1 if has_varlen else batch
 
     # Pad seqlen to chunk_size boundary — padded tokens use dt=-100
@@ -442,7 +460,7 @@ def mamba_chunk_scan_combined(
     flashinfer_eligible = (z is None and is_sm_100f())
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
-        return _mamba_chunk_scan_flashinfer_fwd(
+        flashinfer_result = _mamba_chunk_scan_flashinfer_fwd(
             x,
             dt,
             A,
@@ -462,6 +480,8 @@ def mamba_chunk_scan_combined(
             return_final_states=return_final_states,
             state_dtype=state_dtype,
         )
+        if flashinfer_result is not None:
+            return flashinfer_result
     if flashinfer_eligible:
         logger.info_once(
             f"FlashInfer SSD unavailable for chunk_size={chunk_size}, "
