@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import traceback
 from dataclasses import dataclass, field
@@ -38,8 +40,9 @@ from .build import (
 from .mapping import _build_mapping_from_config, _resolve_mapping_layout
 from .results import (
     _build_latency_block,
+    _build_raw_data_block,
     _classify_bottleneck,
-    _gather_kernel_breakdown,
+    _gather_kernel_timing_blocks,
     _gather_per_iteration_times,
 )
 from .routing import (
@@ -61,7 +64,7 @@ from .specs import (
     WorkloadSpec,
 )
 from .timing import _run_autotune, _time_moe_forward_cuda_graph, _time_moe_forward_eager
-from .utils import _make_inputs, _maybe_print_rank0
+from .utils import _InputCache, _make_inputs, _maybe_print_rank0
 
 
 def _force_comm_env(comm_method: str, prev: Optional[str]) -> None:
@@ -267,18 +270,21 @@ def _initial_instrumentation(
     }
 
 
-def _pick_enable_perfect_router(rc_spec: RoutingControlSpec, rc_active: bool) -> bool:
+def _pick_enable_perfect_router(
+    rc_spec: RoutingControlSpec,
+    enable_perfect_router_requested: bool,
+) -> bool:
     """Decide whether to enable ``ENABLE_PERFECT_ROUTER`` for one case.
 
-    Forced routing always disables the perfect router (we are bypassing the
-    routing kernels entirely). Native routing enables it only on the balanced
-    workload, where the synthetic logits naturally produce balanced top-k.
+    The perfect router is a lower-level MoE override that replaces the incoming
+    router logits inside ``MoE.forward``. Keep it explicit so normal
+    routing-control cases use the logits projected by bench_moe itself.
     """
-    if not rc_active:
-        return True
+    if not enable_perfect_router_requested:
+        return False
     if rc_spec.routing_mode == "forced":
         return False
-    return rc_spec.comm_pattern == "balanced_alltoall" and rc_spec.expert_pattern == "balanced"
+    return True
 
 
 def _build_empty_routing_control_block_for_rejection(
@@ -570,6 +576,28 @@ def _resolve_layout_and_plan(
     return int(moe_ep_size), per_rank, routing_plan
 
 
+def _make_candidate_input_seed(
+    *,
+    random_seed: int,
+    rank: int,
+    model: ModelSpec,
+    workload: WorkloadSpec,
+    per_rank: List[int],
+    local_num_tokens: int,
+) -> int:
+    """Build a stable per-workload input seed shared across runtime candidates."""
+    payload = {
+        "random_seed": int(random_seed),
+        "rank": int(rank),
+        "model": model.to_dict(),
+        "workload": workload.to_dict(per_rank_num_tokens=per_rank),
+        "local_num_tokens": int(local_num_tokens),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.blake2b(encoded, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little") & ((1 << 63) - 1)
+
+
 def _run_one_candidate(
     *,
     model: ModelSpec,
@@ -585,6 +613,9 @@ def _run_one_candidate(
     fast_autotune: bool,
     analysis: Tuple[str, ...],
     cupti_ctx: Optional[Any],
+    random_seed: int,
+    input_cache: Optional[_InputCache],
+    enable_perfect_router_requested: bool,
 ) -> RunResult:
     """Build, autotune, and time one ``ConfigSpec`` candidate.
 
@@ -641,7 +672,9 @@ def _run_one_candidate(
     prev_force_comm = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
     _force_comm_env(config.comm_method, prev_force_comm)
 
-    enable_perfect_router = _pick_enable_perfect_router(rc_spec, rc_active)
+    enable_perfect_router = _pick_enable_perfect_router(
+        rc_spec, bool(enable_perfect_router_requested)
+    )
 
     moe = None
     try:
@@ -676,6 +709,15 @@ def _run_one_candidate(
             return _short_circuit(result, "skipped", reason)
 
         # ---- Step 4: synthetic inputs + routing-control routing inputs --
+        input_seed = _make_candidate_input_seed(
+            random_seed=int(random_seed),
+            rank=rank,
+            model=model,
+            workload=workload,
+            per_rank=per_rank,
+            local_num_tokens=local_num_tokens,
+        )
+        result.instrumentation["input_seed"] = int(input_seed)
         x, router_logits = _make_inputs(
             local_num_tokens,
             model.hidden_size,
@@ -683,6 +725,8 @@ def _run_one_candidate(
             act_dtype,
             routing_logits_dtype,
             device,
+            seed=input_seed,
+            cache=input_cache,
         )
 
         routing_inputs: Optional[_RoutingInputs] = None
@@ -773,9 +817,11 @@ def _run_one_candidate(
         result.latency_ms = _build_latency_block(per_rank_iters)
 
         if "kernels" in analysis:
-            result.kernel_breakdown = _gather_kernel_breakdown(detailed_stats)
+            result.kernel_breakdown, raw_kernel_times = _gather_kernel_timing_blocks(detailed_stats)
         else:
             result.kernel_breakdown = {"moe_forward_kernels": [], "other_kernels": []}
+            raw_kernel_times = {"moe_forward_kernels": [], "other_kernels": []}
+        result.raw_data = _build_raw_data_block(per_rank_iters, raw_kernel_times)
 
         # Phase markers live in moe_scheduler.py (Phase 5 of the design); not
         # implemented yet, so emit an empty agg/per_rank with a stable shape.

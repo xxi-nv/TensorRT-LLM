@@ -48,6 +48,8 @@ def build_rankings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             instrumentation = row.get("instrumentation") or {}
             latency = row.get("latency_ms") or {}
             score = latency.get("score") if isinstance(latency, dict) else None
+            raw_score = latency.get("raw_score") if isinstance(latency, dict) else None
+            outliers = latency.get("iter_max_outliers") if isinstance(latency, dict) else {}
             ranking_entries.append(
                 {
                     "backend": actual_cfg.get("backend") or requested_cfg.get("backend"),
@@ -58,6 +60,10 @@ def build_rankings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "use_low_precision_moe_combine"
                     ),
                     "score_ms": float(score) if isinstance(score, (int, float)) else None,
+                    "raw_score_ms": float(raw_score)
+                    if isinstance(raw_score, (int, float))
+                    else None,
+                    "outlier_count": outliers.get("count") if isinstance(outliers, dict) else None,
                     "status": row.get("status"),
                     "skip_reason": row.get("skip_reason"),
                     "autotune_status": instrumentation.get("autotune_status"),
@@ -314,6 +320,8 @@ def _flatten_result_for_analysis(row: dict[str, Any]) -> dict[str, Any]:
     dispatch_summary = routing_actual.get("observed_dispatch_matrix_summary") or {}
     hist_summary = routing_actual.get("observed_expert_histogram_summary") or {}
     kernel_breakdown = row.get("kernel_breakdown") or {}
+    iter_max_stats = latency.get("iter_max_stats") or {}
+    iter_max_outliers = latency.get("iter_max_outliers") or {}
     return {
         "num_tokens": workload.get("num_tokens"),
         "per_rank_num_tokens": json.dumps(workload.get("per_rank_num_tokens")),
@@ -333,6 +341,12 @@ def _flatten_result_for_analysis(row: dict[str, Any]) -> dict[str, Any]:
         "skip_reason": row.get("skip_reason"),
         "score_ms": latency.get("score"),
         "score_type": latency.get("score_type"),
+        "raw_score_ms": latency.get("raw_score"),
+        "raw_score_type": latency.get("raw_score_type"),
+        "iter_max_median_ms": iter_max_stats.get("median"),
+        "iter_max_p90_ms": iter_max_stats.get("p90"),
+        "iter_max_max_ms": iter_max_stats.get("max"),
+        "iter_max_outlier_count": iter_max_outliers.get("count"),
         "rank0_mean_ms": _latency_rank_value(row, "rank0", "mean"),
         "rank1_mean_ms": _latency_rank_value(row, "rank1", "mean"),
         "rank2_mean_ms": _latency_rank_value(row, "rank2", "mean"),
@@ -376,6 +390,12 @@ _ANALYSIS_COLUMNS: tuple[str, ...] = (
     "skip_reason",
     "score_ms",
     "score_type",
+    "raw_score_ms",
+    "raw_score_type",
+    "iter_max_median_ms",
+    "iter_max_p90_ms",
+    "iter_max_max_ms",
+    "iter_max_outlier_count",
     "rank0_mean_ms",
     "rank1_mean_ms",
     "rank2_mean_ms",
@@ -473,6 +493,199 @@ def _status_summary_rows(flat_rows: list[dict[str, Any]]) -> list[list[Any]]:
     return out
 
 
+_KERNEL_BREAKDOWN_COLUMNS: tuple[str, ...] = (
+    "result_index",
+    "num_tokens",
+    "requested_parallel_mode",
+    "requested_backend",
+    "requested_comm_method",
+    "requested_cuda_graph",
+    "requested_low_precision_combine",
+    "actual_backend",
+    "actual_comm_method",
+    "scheduler_kind",
+    "status",
+    "score_ms",
+    "category",
+    "kernel_name",
+    "kernel_count",
+    "rank",
+    "mean_ms",
+    "median_ms",
+    "p90_ms",
+    "min_ms",
+    "max_ms",
+    "stdev_ms",
+)
+
+
+def _rank_sort_key(rank_name: str) -> tuple[int, str]:
+    prefix = "rank"
+    if rank_name.startswith(prefix) and rank_name[len(prefix) :].isdigit():
+        return (int(rank_name[len(prefix) :]), rank_name)
+    return (10**9, rank_name)
+
+
+def _kernel_stat(stats: dict[str, Any], metric: str) -> Optional[float]:
+    value = stats.get(metric)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _kernel_breakdown_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    out: list[list[Any]] = [list(_KERNEL_BREAKDOWN_COLUMNS)]
+    for result_index, row in enumerate(rows):
+        workload = row.get("workload") or {}
+        requested = row.get("requested_config") or {}
+        actual = row.get("actual_config") or {}
+        latency = row.get("latency_ms") or {}
+        common = [
+            result_index,
+            workload.get("num_tokens"),
+            requested.get("parallel_mode"),
+            requested.get("backend"),
+            requested.get("comm_method"),
+            requested.get("cuda_graph"),
+            requested.get("use_low_precision_moe_combine"),
+            actual.get("backend"),
+            actual.get("comm_method"),
+            actual.get("scheduler_kind"),
+            row.get("status"),
+            latency.get("score"),
+        ]
+        kernel_breakdown = row.get("kernel_breakdown") or {}
+        for category in ("moe_forward_kernels", "other_kernels"):
+            for kernel in kernel_breakdown.get(category) or []:
+                per_rank = kernel.get("per_rank") or {}
+                if not per_rank:
+                    out.append(
+                        common
+                        + [
+                            category,
+                            kernel.get("name"),
+                            kernel.get("count"),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ]
+                    )
+                    continue
+                for rank_name, stats in sorted(
+                    per_rank.items(), key=lambda item: _rank_sort_key(item[0])
+                ):
+                    stats = stats or {}
+                    out.append(
+                        common
+                        + [
+                            category,
+                            kernel.get("name"),
+                            kernel.get("count"),
+                            rank_name,
+                            _kernel_stat(stats, "mean"),
+                            _kernel_stat(stats, "median"),
+                            _kernel_stat(stats, "p90"),
+                            _kernel_stat(stats, "min"),
+                            _kernel_stat(stats, "max"),
+                            _kernel_stat(stats, "stdev"),
+                        ]
+                    )
+    return out
+
+
+_RAW_DATA_COLUMNS: tuple[str, ...] = (
+    "result_index",
+    "num_tokens",
+    "requested_parallel_mode",
+    "requested_backend",
+    "requested_comm_method",
+    "requested_cuda_graph",
+    "requested_low_precision_combine",
+    "actual_backend",
+    "actual_comm_method",
+    "scheduler_kind",
+    "status",
+    "score_ms",
+    "record_type",
+    "category",
+    "kernel_name",
+    "rank",
+    "iteration",
+    "time_ms",
+)
+
+
+def _result_common_row(result_index: int, row: dict[str, Any]) -> list[Any]:
+    workload = row.get("workload") or {}
+    requested = row.get("requested_config") or {}
+    actual = row.get("actual_config") or {}
+    latency = row.get("latency_ms") or {}
+    return [
+        result_index,
+        workload.get("num_tokens"),
+        requested.get("parallel_mode"),
+        requested.get("backend"),
+        requested.get("comm_method"),
+        requested.get("cuda_graph"),
+        requested.get("use_low_precision_moe_combine"),
+        actual.get("backend"),
+        actual.get("comm_method"),
+        actual.get("scheduler_kind"),
+        row.get("status"),
+        latency.get("score"),
+    ]
+
+
+def _raw_sample_value(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _raw_data_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    out: list[list[Any]] = [list(_RAW_DATA_COLUMNS)]
+    for result_index, row in enumerate(rows):
+        common = _result_common_row(result_index, row)
+        raw_data = row.get("raw_data") or {}
+        forward_per_rank = (raw_data.get("forward_times_ms") or {}).get("per_rank") or {}
+        for rank_name, times in sorted(
+            forward_per_rank.items(), key=lambda item: _rank_sort_key(item[0])
+        ):
+            for iteration, value in enumerate(times or []):
+                out.append(
+                    common
+                    + [
+                        "forward",
+                        None,
+                        None,
+                        rank_name,
+                        iteration,
+                        _raw_sample_value(value),
+                    ]
+                )
+
+        kernel_times = raw_data.get("kernel_times_ms") or {}
+        for category in ("moe_forward_kernels", "other_kernels"):
+            for kernel in kernel_times.get(category) or []:
+                per_rank = kernel.get("per_rank") or {}
+                for rank_name, times in sorted(
+                    per_rank.items(), key=lambda item: _rank_sort_key(item[0])
+                ):
+                    for iteration, value in enumerate(times or []):
+                        out.append(
+                            common
+                            + [
+                                "kernel",
+                                category,
+                                kernel.get("name"),
+                                rank_name,
+                                iteration,
+                                _raw_sample_value(value),
+                            ]
+                        )
+    return out
+
+
 def _workload_sheets(flat_rows: list[dict[str, Any]]) -> list[tuple[str, list[list[Any]]]]:
     grouped: dict[Any, list[dict[str, Any]]] = {}
     for row in flat_rows:
@@ -499,6 +712,8 @@ def _build_analysis_workbook_sheets(payload: dict[str, Any]) -> list[tuple[str, 
         ("all_results", _analysis_table_rows(flat_rows)),
         ("best_by_workload", _best_by_workload_rows(payload.get("rankings") or [])),
         ("status_summary", _status_summary_rows(flat_rows)),
+        ("kernel_breakdown", _kernel_breakdown_rows(rows)),
+        ("raw_data", _raw_data_rows(rows)),
         *_workload_sheets(flat_rows),
     ]
 

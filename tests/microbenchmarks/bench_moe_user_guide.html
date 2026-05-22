@@ -819,11 +819,11 @@
   <h2 id="output">5. 如何看输出结果</h2>
   <p>
     rank0 会在 stdout 打印 header 和 result rows。传 <code>--output_file</code> 时，最终完整 payload 会写入 JSON 文件。
-    当前输出 schema version 是 <code>5</code>。
+    默认还会生成 <code>&lt;output_file&gt;.analysis.xlsx</code>，也可以用
+    <code>--analysis_workbook_file</code> 指定 Excel 路径。
   </p>
 
   <pre><code>{
-  "schema_version": 5,
   "benchmark": "bench_moe",
   "environment": { "...": "..." },
   "model": { "...": "..." },
@@ -851,6 +851,8 @@
   <p>
     <code>best</code> 是同一个 <code>num_tokens</code> 和 <code>parallel_mode</code> 组内
     <code>score_ms</code> 最低的成功 case。skip/failed 候选仍在 <code>ranking</code> 中，方便看它为什么不可用。
+    <code>score_ms</code> 对应 <code>latency_ms.score</code>，默认是对每次迭代的 slowest-rank latency
+    做 robust scoring；原始 slowest-rank mean 会另存为 <code>latency_ms.raw_score</code>。
   </p>
 
   <h3>再看 result row</h3>
@@ -867,11 +869,70 @@
       <tr><td><code>actual_config</code></td><td>实际运行到的 backend、comm、scheduler、EP/TP、chunk 数。</td></tr>
       <tr><td><code>status</code></td><td><code>success</code>、<code>skipped</code> 或 <code>failed</code>。</td></tr>
       <tr><td><code>skip_reason</code></td><td>候选被剪枝、跳过或失败时的原因。</td></tr>
-      <tr><td><code>latency_ms.score</code></td><td>默认 score：每次迭代取最慢 rank，再对迭代求平均（单位 ms）。</td></tr>
-      <tr><td><code>kernel_breakdown</code></td><td>kernel 分类统计；<code>--analysis none</code> 时不会采集。</td></tr>
+      <tr><td><code>latency_ms.score</code></td><td>排序用 score。每次迭代先取最慢 rank；样本少于 8 个时取 median，否则用 MAD modified z-score 识别极端样本并对保留样本求 mean。</td></tr>
+      <tr><td><code>latency_ms.raw_score</code></td><td>未过滤的原始 slowest-rank mean，便于和旧结果或手算结果对齐。</td></tr>
+      <tr><td><code>latency_ms.iter_max_stats</code></td><td>每次迭代 slowest-rank latency 的统计量，包括 mean、median、p90、min、max、stdev。</td></tr>
+      <tr><td><code>latency_ms.iter_max_outliers</code></td><td>robust scoring 识别出的极端样本，记录 index、value、center、modified z-score 和方向。</td></tr>
+      <tr><td><code>kernel_breakdown</code></td><td>每个真实 CUDA kernel name 的分类统计；<code>--analysis none</code> 时为空。</td></tr>
+      <tr><td><code>raw_data</code></td><td>原始样本：每个 rank 的逐 iteration forward latency，以及每个 rank、每个 kernel 的逐次采样耗时。</td></tr>
       <tr><td><code>routing_control</code></td><td>请求 routing 形状和实际观测形状的对比。</td></tr>
     </tbody>
   </table>
+
+  <h3>Excel workbook 怎么看</h3>
+  <p>
+    Excel 报告是从同一份 JSON payload 生成的，方便筛选和排序；它不会替代 JSON。若要保留最完整的结构化信息，
+    仍应保存 <code>--output_file</code>。
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Sheet</th>
+        <th>内容</th>
+        <th>典型用途</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>all_results</code></td>
+        <td>每个 candidate 一行，包含 requested/actual config、score、raw score、iter_max 统计、outlier 数量、kernel 数量和 routing summary。</td>
+        <td>快速排序、过滤成功/失败、比较候选。</td>
+      </tr>
+      <tr>
+        <td><code>best_by_workload</code></td>
+        <td>每个 <code>(num_tokens, parallel_mode)</code> 分组里的最佳候选。</td>
+        <td>直接找 winner。</td>
+      </tr>
+      <tr>
+        <td><code>status_summary</code></td>
+        <td>按 token、backend、comm、status 聚合的数量和 skip reason。</td>
+        <td>检查 sweep 是否大量被剪枝或失败。</td>
+      </tr>
+      <tr>
+        <td><code>kernel_breakdown</code></td>
+        <td>一行一个 <code>(candidate, category, kernel_name, rank)</code>，包含 mean、median、p90、min、max、stdev。</td>
+        <td>看每个 rank 上真实 kernel name 的统计耗时；category 只区分 <code>moe_forward_kernels</code> 和 <code>other_kernels</code>。</td>
+      </tr>
+      <tr>
+        <td><code>raw_data</code></td>
+        <td>一行一个原始样本。<code>record_type=forward</code> 表示每个 rank 的每次 forward iteration；
+          <code>record_type=kernel</code> 表示每个 rank、每个 kernel 的每次采样耗时。</td>
+        <td>排查 outlier、画 per-iter 曲线、手动聚合 dispatch/GEMM/combine 类 kernel。</td>
+      </tr>
+      <tr>
+        <td><code>workload_&lt;num_tokens&gt;</code></td>
+        <td>把同一个 token 数的候选单独拆成一个 sheet。</td>
+        <td>按 workload 局部分析。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>原始数据边界：</strong>
+    <code>raw_data.forward_times_ms</code> 总会记录当前 run 的 forward timing 原始样本；
+    <code>raw_data.kernel_times_ms</code> 只有在 <code>--analysis kernels</code> 且 profiler/CUPTI 成功采集时才有内容。
+    旧版本 JSON 里没有 <code>raw_data</code>，重新生成 Excel 只能得到空的 <code>raw_data</code> 表头，无法反推已经丢掉的逐 iter 样本。
+  </div>
 
   <h2 id="pitfalls">6. 常见问题和限制</h2>
   <table>
@@ -930,6 +991,11 @@
       <tr>
         <td>CUDA Graph timing 没有 kernel breakdown</td>
         <td>CUPTI 需要在 CUDA context 创建前初始化；失败时会标记 <code>cupti_available=false</code> 或跳过 breakdown。</td>
+      </tr>
+      <tr>
+        <td>Excel 的 <code>raw_data</code> sheet 只有表头</td>
+        <td>通常是旧 JSON 没有保存 <code>raw_data</code>，或该 run 没有实际成功 candidate。
+          需要用新代码重新跑 benchmark 才能记录逐 iteration 原始样本。</td>
       </tr>
     </tbody>
   </table>
@@ -1316,8 +1382,9 @@
     <tbody>
       <tr><td><code>--no_cuda_graph</code></td><td>默认不开启该 flag</td><td>默认使用 CUDA Graph timing；传该 flag 改成 eager timing。</td></tr>
       <tr><td><code>--warmup</code></td><td>1</td><td>timed loop 前的 warmup 次数。</td></tr>
-      <tr><td><code>--iters</code></td><td>5</td><td>计时迭代次数。</td></tr>
+      <tr><td><code>--iters</code></td><td>12</td><td>计时迭代次数。少于 8 个样本时 score 使用 slowest-rank median；默认 12 会启用 MAD outlier 检测后的 trimmed mean。</td></tr>
       <tr><td><code>--fast_autotune</code></td><td>false</td><td>缩短 autotune repeat/warmup，适合快速调试。</td></tr>
+      <tr><td><code>--per_candidate_timeout_s</code></td><td>0.0</td><td>单个 candidate 的硬 wall-clock 超时。大于 0 时 watchdog 会在疑似 NCCL/CUDA hang 后发送 <code>SIGKILL</code>，外层可用 <code>--resume_from</code> 重试缺失 candidate。</td></tr>
       <tr><td><code>--analysis</code></td><td><code>kernels</code></td><td>可传 <code>kernels</code> 或 <code>none</code>。<code>none</code> 只输出 latency，不采集 kernel breakdown。</td></tr>
       <tr><td><code>--dtype</code></td><td><code>bfloat16</code></td><td>activation dtype，可选 <code>bfloat16</code> 或 <code>float16</code>。</td></tr>
     </tbody>
@@ -1333,6 +1400,40 @@
     Autotune 是 untimed pre-pass：脚本会在正式 timing 前运行一次 <code>autotune(...)</code>，
     用来填充 kernel cache。正式 latency 不包含这个 autotune pass。
   </p>
+
+  <h3>输出与恢复</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>参数</th>
+        <th>默认值</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>--output_file</code></td>
+        <td>未设置</td>
+        <td>写最终 JSON report；同时作为默认 Excel 路径的前缀。</td>
+      </tr>
+      <tr>
+        <td><code>--analysis_workbook_file</code></td>
+        <td><code>&lt;output_file&gt;.analysis.xlsx</code></td>
+        <td>写 Excel workbook。包含 <code>all_results</code>、<code>best_by_workload</code>、
+          <code>status_summary</code>、<code>kernel_breakdown</code>、<code>raw_data</code> 和各 workload sheet。</td>
+      </tr>
+      <tr>
+        <td><code>--resume_from</code></td>
+        <td>未设置</td>
+        <td>读取已有 JSON，跳过 terminal candidate；上游 crash 留下的 placeholder 会被丢弃并重跑。</td>
+      </tr>
+      <tr>
+        <td><code>--checkpoint_every</code></td>
+        <td>1</td>
+        <td>每完成 N 个新 candidate 写一次 JSON checkpoint；0 表示只写最终结果。</td>
+      </tr>
+    </tbody>
+  </table>
 
   <h3>routing_control 块</h3>
   <pre><code>"routing_control": {

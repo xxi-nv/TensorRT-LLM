@@ -49,7 +49,7 @@ from .results import _make_skipped_run_result, _make_upstream_skipped_row, _runr
 from .search import expand_and_prune
 from .specs import ConfigSpec, WorkloadSpec
 from .timing import _CuptiContext, _try_init_cupti
-from .utils import _maybe_print_rank0, _set_device_from_local_rank
+from .utils import _InputCache, _maybe_print_rank0, _set_device_from_local_rank
 
 _MICROBENCH_DIR = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _MICROBENCH_DIR.parent.parent
@@ -467,6 +467,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     # Accumulated rows include resumed rows (preserved as-is) plus rows
     # produced this run. ``_build_report_payload`` consumes this directly.
     accumulated_rows: List[Dict[str, Any]] = list(resumed_rows)
+    input_cache: _InputCache = {}
 
     checkpoint_every = max(0, int(getattr(args, "checkpoint_every", 1) or 0))
     candidates_since_checkpoint = 0
@@ -533,6 +534,9 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                 fast_autotune=bool(args.fast_autotune),
                 analysis=ctx.analysis,
                 cupti_ctx=_early_cupti_ctx,
+                random_seed=int(args.random_seed),
+                input_cache=input_cache,
+                enable_perfect_router_requested=bool(args.enable_perfect_router),
             )
         row = _runresult_to_row(r)
         accumulated_rows.append(row)

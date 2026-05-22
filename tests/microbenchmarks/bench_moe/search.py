@@ -30,6 +30,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from .mapping import _resolve_mapping_layout
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
+_FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
+
 
 def _check_backend_can_implement(
     backend_str: str,
@@ -57,6 +59,12 @@ def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:
     return out if out else (default,)
 
 
+def _comm_axis_for_backend(backend: Any, comm_methods: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    if str(backend).upper() in _FUSED_COMM_BACKENDS:
+        return ("NONE",)
+    return comm_methods
+
+
 def expand_search(
     base_config: ConfigSpec,
     search: SearchSpec,
@@ -77,18 +85,19 @@ def expand_search(
     )
 
     candidates: List[ConfigSpec] = []
-    for backend, pmode, comm, cgraph, combine in itertools.product(
-        backends, parallel_modes, comm_methods, cuda_graph_options, combine_options
+    for backend, pmode, cgraph, combine in itertools.product(
+        backends, parallel_modes, cuda_graph_options, combine_options
     ):
-        candidate = replace(
-            base_config,
-            backend=str(backend).upper(),
-            parallel_mode=str(pmode).upper(),
-            comm_method=str(comm).upper(),
-            cuda_graph=bool(cgraph),
-            use_low_precision_moe_combine=bool(combine),
-        )
-        candidates.append(candidate)
+        for comm in _comm_axis_for_backend(backend, comm_methods):
+            candidate = replace(
+                base_config,
+                backend=str(backend).upper(),
+                parallel_mode=str(pmode).upper(),
+                comm_method=str(comm).upper(),
+                cuda_graph=bool(cgraph),
+                use_low_precision_moe_combine=bool(combine),
+            )
+            candidates.append(candidate)
     return candidates
 
 
@@ -348,8 +357,14 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
             cli_dest="comm_method",
             cli_flag_name="--comm_method",
             config_key="comm_method",
-            full_set=_FORCED_COMM_ENV_VALUES + ("AUTO",),
+            full_set=_FORCED_COMM_ENV_VALUES,
         )
+        comm_methods = tuple(v for v in comm_methods if str(v).upper() != "AUTO")
+        if not comm_methods:
+            raise ValueError(
+                "--search comm does not include AUTO because AUTO aliases one of the concrete "
+                "communication strategies; pass a forced --comm_method value or disable comm search."
+            )
     # ``cuda_graph`` and ``combine_precision`` axes are reserved for ``full``;
     # leave them empty by default so the base value is used.
     if full_search:

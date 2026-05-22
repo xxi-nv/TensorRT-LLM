@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 
 _COMM_PATTERN_NAMES: Tuple[str, ...] = (
+    "random",
     "balanced_alltoall",
     "receiver_hotspot",
     "pair_hotspot",
@@ -27,7 +28,7 @@ _COMM_PATTERN_NAMES: Tuple[str, ...] = (
     "ring",
 )
 
-_EXPERT_PATTERN_NAMES: Tuple[str, ...] = ("balanced", "hotspot")
+_EXPERT_PATTERN_NAMES: Tuple[str, ...] = ("random", "balanced", "hotspot")
 
 
 def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:

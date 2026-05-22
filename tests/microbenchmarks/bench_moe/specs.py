@@ -152,9 +152,11 @@ class RoutingControlSpec:
     realization and forced supplied-topk; ``projection_policy`` controls what
     happens when native logits cannot exactly express the requested pattern.
 
-    All fields default to "balanced everything via native logits", which keeps
-    the benchmark behaviour identical to legacy invocations that did not
-    request routing control.
+    By default, balanced patterns build a deterministic RoutingPlan that is
+    projected to native logits or supplied directly, depending on
+    ``routing_mode``. Set both ``comm_pattern=random`` and
+    ``expert_pattern=random`` to leave routing uncontrolled and use random
+    router logits.
     """
 
     routing_mode: str = "native"  # "native" | "forced"
@@ -171,17 +173,16 @@ class RoutingControlSpec:
 
     @property
     def is_active(self) -> bool:
-        """True when this spec asks for non-default routing behaviour.
+        """True when this spec asks for planned routing instead of random logits.
 
         Used to decide whether to dispatch through routing-control planning or
         keep the normal benchmark path.
         """
         return (
             self.routing_mode != "native"
-            or self.comm_pattern != "balanced_alltoall"
-            or self.expert_pattern != "balanced"
             or self.routing_pattern_file is not None
             or self.per_rank_num_tokens is not None
+            or not (self.comm_pattern == "random" and self.expert_pattern == "random")
         )
 
 
@@ -262,6 +263,7 @@ class RunResult:
     latency_ms: Dict[str, Any] = field(default_factory=dict)
     phase_times_ms: Dict[str, Any] = field(default_factory=dict)
     kernel_breakdown: Dict[str, Any] = field(default_factory=dict)
+    raw_data: Dict[str, Any] = field(default_factory=dict)
     overlap: Dict[str, Any] = field(default_factory=dict)
     bottleneck: Optional[str] = None
     routing_control: Dict[str, Any] = field(default_factory=dict)

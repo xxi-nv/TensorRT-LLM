@@ -240,7 +240,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="balanced_alltoall",
         help=(
-            "Source-to-target slot dispatch pattern. Examples: balanced_alltoall, "
+            "Source-to-target slot dispatch pattern. balanced_alltoall builds a balanced "
+            "plan by default; random keeps logits uncontrolled when expert_pattern is also random. "
+            "Examples: balanced_alltoall, random, "
             "receiver_hotspot,hotness=0.75,rank=0, pair_hotspot,hotness=0.5,src=0,dst=1, "
             "local_only, ring."
         ),
@@ -250,7 +252,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="balanced",
         help=(
-            "Per-target-rank local expert histogram pattern. Examples: balanced, "
+            "Per-target-rank local expert histogram pattern. balanced builds a balanced "
+            "plan by default; random keeps logits uncontrolled when comm_pattern is also random. "
+            "Examples: balanced, random, "
             "hotspot,hotness=0.5, hotspot,active_experts=2."
         ),
     )
@@ -280,6 +284,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Seed for deterministic routing-plan materialisation; independent from --random_seed.",
+    )
+    routing_group.add_argument(
+        "--enable_perfect_router",
+        action="store_true",
+        help=(
+            "Use the lower-level ENABLE_PERFECT_ROUTER path to replace router logits with "
+            "load-balanced logits inside the MoE module. Disabled by default so routing-control "
+            "patterns use bench_moe's own projected logits."
+        ),
     )
 
     parallel_group = parser.add_argument_group("Parallel layout")
@@ -351,7 +364,7 @@ def parse_args() -> argparse.Namespace:
         help="Disable CUDA-Graph capture and use eager timing.",
     )
     timing_group.add_argument("--warmup", type=int, default=1, help="Warmup iterations per case.")
-    timing_group.add_argument("--iters", type=int, default=5, help="Timed iterations per case.")
+    timing_group.add_argument("--iters", type=int, default=12, help="Timed iterations per case.")
     timing_group.add_argument(
         "--fast_autotune",
         action="store_true",
