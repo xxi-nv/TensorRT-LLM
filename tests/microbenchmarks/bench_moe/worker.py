@@ -520,24 +520,25 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
         # C: hard wall-clock guard around the actual candidate execution.
         with CandidateWatchdog(watchdog_budget_s, case_label):
-            r = _run_one_candidate(
-                model=ctx.model,
-                workload=workload,
-                config=cand,
-                world_size=world_size,
-                rank=rank,
-                device=device,
-                act_dtype=ctx.act_dtype,
-                routing_logits_dtype=ctx.routing_logits_dtype,
-                warmup=int(args.warmup),
-                iters=int(args.iters),
-                fast_autotune=bool(args.fast_autotune),
-                analysis=ctx.analysis,
-                cupti_ctx=_early_cupti_ctx,
-                random_seed=int(args.random_seed),
-                input_cache=input_cache,
-                enable_perfect_router_requested=bool(args.enable_perfect_router),
-            )
+            with torch.device(device):
+                r = _run_one_candidate(
+                    model=ctx.model,
+                    workload=workload,
+                    config=cand,
+                    world_size=world_size,
+                    rank=rank,
+                    device=device,
+                    act_dtype=ctx.act_dtype,
+                    routing_logits_dtype=ctx.routing_logits_dtype,
+                    warmup=int(args.warmup),
+                    iters=int(args.iters),
+                    fast_autotune=bool(args.fast_autotune),
+                    analysis=ctx.analysis,
+                    cupti_ctx=_early_cupti_ctx,
+                    random_seed=int(args.random_seed),
+                    input_cache=input_cache,
+                    enable_perfect_router_requested=bool(args.enable_perfect_router),
+                )
         row = _runresult_to_row(r)
         accumulated_rows.append(row)
         if rank == 0:
