@@ -209,6 +209,12 @@ class ConfigurableMoE(MoE):
         # Validate configuration
         self.validate_config()
 
+        # Validate backend acceptance now that ``self.comm`` and
+        # ``self.moe_max_num_tokens`` are set, so backend hooks may
+        # inspect them directly. ``_create_and_sync_backend`` deliberately
+        # skips this step (see comment there).
+        self.validate_backend(self.backend)
+
         # ========== Optional DWDP integration ==========
         self.dwdp_manager = get_global_dwdp_manager()
         self.dwdp_handle_collector = None
@@ -322,7 +328,11 @@ class ConfigurableMoE(MoE):
                 activation_type=self.activation_type,
             )
 
-        self.validate_backend(backend)
+        # Backend acceptance is validated at the end of ``__init__`` instead
+        # of here so the validation hook can inspect ``self.comm`` and
+        # ``self.moe_max_num_tokens`` (assigned only after this method
+        # returns). Backends like ``MegaMoECuteDsl`` rely on that to
+        # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
@@ -583,9 +593,15 @@ class ConfigurableMoE(MoE):
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
         constraints (e.g. fused-comm backends rejecting dynamic
-        EPLB) override that hook. EPLB / num_slots / ep_size are already
-        populated on ``self`` by ``MoE.__init__`` -> ``_init_load_balancer``
-        before this is called, so backends may inspect them directly.
+        EPLB) override that hook.
+
+        Call site contract: invoked from ``__init__`` *after* every
+        wrapper-owned attribute is assigned (EPLB / num_slots /
+        ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
+        ``self.comm`` from ``_create_comm_strategy_auto``, and
+        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        hooks can therefore inspect them directly without ``getattr``
+        guards or sentinel defaults.
         """
         if backend is None:
             raise ValueError("Backend cannot be None")

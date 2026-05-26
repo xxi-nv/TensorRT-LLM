@@ -2974,6 +2974,686 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 module, module.w3_w1_weight_scale.data[expert_idx])
 
 
+class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
+    """NVFP4 weight lifecycle for the MegaMoE CuteDSL backend.
+
+    Inherits directly from :class:`NVFP4FusedMoEMethod` (NOT from
+    :class:`NVFP4CutlassFusedMoEMethod`). The MegaMoE CuteDSL kernel
+    consumes a raw NVFP4 byte layout sized to
+    ``(slots, expand_intermediate, hidden//2)`` exactly, and runs its
+    own 16-atom gate/up interleave + ``to_blocked`` swizzle in
+    :meth:`_build_mega_format_weights`. Cutlass's child overrides
+    ``get_weights_shapes`` to pad ``expand_intermediate`` up to
+    ``NVFP4_ROW_ALIGNMENT == 128``; that hidden padding would shift the
+    ``w3 | w1`` boundary inside ``w3_w1_weight`` and silently break the
+    M-axis slice in ``_build_mega_format_weights`` for any model where
+    ``expand_intermediate % 128 != 0``. Inheriting the grandparent
+    keeps the natural unpadded shape and removes the latent coupling.
+
+    The lifecycle in this class:
+
+    1. ``create_weights`` registers the standard NVFP4 parameters via
+       the grandparent (raw layout, no Cutlass M-axis pad), then adds
+       MegaMoE-format derived parameters
+       (``mega_fc1_weight`` / ``mega_fc1_weight_sf`` /
+       ``mega_fc2_weight`` / ``mega_fc2_weight_sf``).
+    2. The four ``load_expert_*`` abstract hooks stash raw checkpoint
+       shards in ``tmp_cutlass_*`` dicts keyed by ``(dst_base,
+       expert_idx)`` -- identical to the Cutlass loader pattern but
+       inlined here so MegaMoE owns the layout contract end-to-end and
+       can never accidentally pick up Cutlass-specific interleaves if
+       the Cutlass loader evolves.
+    3. ``process_weights_after_loading`` cats ``[w3 | w1]`` along M
+       WITHOUT applying ``block_scale_interleave`` (the kernel needs
+       raw bytes), runs grandparent's
+       ``process_weights_after_loading`` for alpha / input_scale
+       reconcile, builds the MegaMoE-format derived tensors, and
+       enforces the v1 alpha == 1.0 product gate (see
+       MEGAMOE_CUTEDSL_DESIGN.md "NVFP4 scale and alpha ABI").
+
+    EPLB support is ``SUPPORTED``: dynamic EPLB migrates the four
+    ``mega_fc*_weight*`` derived parameters via CPU shared-staging
+    buffers built in :meth:`_build_mega_shared_staging` and registered
+    through :meth:`register_all_parameter_slot_and_to_fix_weight_fns`,
+    in addition to the standard NVFP4 family (``w3_w1_weight`` /
+    ``w2_weight`` / ``w*_weight_scale`` / ``fc*_alpha``) handled by the
+    base / grandparent classes. Slot migration replaces all six raw +
+    four mega parameters atomically with byte-consistent values from
+    the source rank (the source built mega = transform(raw) once at
+    load time, so the migrated raw and mega bytes stay paired).
+    """
+
+    eplb_support_status = EplbSupportStatus.SUPPORTED
+
+    # On-device NVFP4 byte formats. Same constants the Cutlass child
+    # uses; they describe the NVFP4 weight / FP8 block-scale packing,
+    # not anything Cutlass-kernel-specific.
+    weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
+    block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+
+    # -----------------------------------------------------------------
+    # Shape helpers (kernel-side authoritative; see MEGAMOE_CUTEDSL_DESIGN.md)
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _ceil_div_int(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    @staticmethod
+    def _round_up_int(a: int, b: int) -> int:
+        return ((a + b - 1) // b) * b
+
+    @classmethod
+    def fc1_sf_flat_size(cls, intermediate: int, hidden: int) -> int:
+        """``round_up(expand_intermediate, SfPaddingBlock=128) *
+        round_up(ceil(hidden / 16), 4)`` -- matches kernel_fc12.py:880-890.
+        ``expand_intermediate = 2 * intermediate``.
+        """
+        expand_intermediate = intermediate * 2
+        return (cls._round_up_int(expand_intermediate, 128) *
+                cls._round_up_int(cls._ceil_div_int(hidden, 16), 4))
+
+    @classmethod
+    def fc2_sf_flat_size(cls, hidden: int, intermediate: int) -> int:
+        """``round_up(hidden, SfPaddingBlock=128) *
+        round_up(ceil(intermediate / 16), 4)`` -- matches runner_fc12.py:1305.
+        """
+        return (cls._round_up_int(hidden, 128) *
+                cls._round_up_int(cls._ceil_div_int(intermediate, 16), 4))
+
+    # -----------------------------------------------------------------
+    # create_weights: register MegaMoE-format parameters in addition to
+    # the grandparent's standard NVFP4 parameters.
+    # -----------------------------------------------------------------
+    def create_weights(self, module: torch.nn.Module):
+        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        self.block_scales_vec_size = torch.iinfo(
+            self.block_scales_dtype).bits // 8
+        # Grandparent's ``get_weights_shapes`` is the un-padded NVFP4
+        # variant, so ``w3_w1_weight.shape[1] == expand_intermediate``
+        # exactly. ``_build_mega_format_weights`` relies on this when it
+        # slices ``[:intermediate, :]`` and ``[intermediate:, :]`` to
+        # separate w3 from w1; a Cutlass-style 128-row M pad would put
+        # zero pad rows between w1 and the boundary and break the
+        # 16-atom gate/up interleave.
+        super().create_weights(module, self.weight_dtype, weight_vec_size,
+                               self.block_scales_dtype,
+                               self.block_scales_vec_size)
+
+        num_local_slots = module.expert_size_per_partition
+        hidden = module.hidden_size
+        intermediate = module.intermediate_size_per_partition
+        expand_intermediate = module.expand_intermediate_size_per_partition
+        # NVFP4 packs 2 elements per byte along K. ``mega_fc1_weight`` has
+        # a 16-atom gate/up interleave applied along expand_intermediate;
+        # ``mega_fc2_weight`` is byte-equivalent to ``w2_weight`` but is
+        # owned by this method so the backend reads through one stable
+        # MegaMoECuteDslWeightView surface.
+        mega_fc1_weight = nn.Parameter(
+            torch.empty(num_local_slots,
+                        expand_intermediate,
+                        hidden // 2,
+                        dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.register_parameter("mega_fc1_weight", mega_fc1_weight)
+
+        mega_fc2_weight = nn.Parameter(
+            torch.empty(num_local_slots,
+                        hidden,
+                        intermediate // 2,
+                        dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.register_parameter("mega_fc2_weight", mega_fc2_weight)
+
+        mega_fc1_weight_sf = nn.Parameter(
+            torch.empty(num_local_slots,
+                        self.fc1_sf_flat_size(intermediate, hidden),
+                        dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.register_parameter("mega_fc1_weight_sf", mega_fc1_weight_sf)
+
+        mega_fc2_weight_sf = nn.Parameter(
+            torch.empty(num_local_slots,
+                        self.fc2_sf_flat_size(hidden, intermediate),
+                        dtype=torch.uint8),
+            requires_grad=False,
+        )
+        module.register_parameter("mega_fc2_weight_sf", mega_fc2_weight_sf)
+
+    # -----------------------------------------------------------------
+    # Loader overrides (4x @abstractmethod hooks on the grandparent).
+    # Each one stashes the raw checkpoint shard in a tmp dict keyed by
+    # (dst_base, expert_idx) -- identical pattern to Cutlass's loaders
+    # but inlined here so MegaMoE owns the layout end-to-end and never
+    # picks up Cutlass-side interleave / alignment changes by accident.
+    # -----------------------------------------------------------------
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False,
+                                 expert_idx: int = -1):
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        if w1_weight is None and w3_weight is None:
+            return
+        device = dst_w3_w1_weight.device
+        w1_weight_shard = load_weight_shard(
+            w1_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w1_weight is not None else None
+        w3_weight_shard = load_weight_shard(
+            w3_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w3_weight is not None else None
+
+        if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
+            module.tmp_cutlass_w3_w1_weights = {}
+        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dict_key = (dst_base, expert_idx)
+        expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
+        expert_entry['dst'] = dst_w3_w1_weight
+        if w1_weight_shard is not None:
+            expert_entry['w1'] = w1_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype)
+        if w3_weight_shard is not None:
+            expert_entry['w3'] = w3_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype)
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        if not allow_partial_loading:
+            assert w2_weight is not None
+        if w2_weight is None:
+            return
+        device = dst_w2_weight.device
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+        cast_w2_weight_shard = w2_weight_shard.contiguous().view(
+            dst_w2_weight.dtype)
+        cast_w2_weight_shard = self._maybe_padding_shape(
+            cast_w2_weight_shard, dst_w2_weight)
+        dst_w2_weight.copy_(cast_w2_weight_shard, non_blocking=True)
+
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
+            expert_idx: int = -1):
+        device = dst_w3_w1_weight_scale.device
+        w1_weight_scale = load_weight_shard(
+            w1_weight_scale,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w1_weight_scale is not None else None
+        w3_weight_scale = load_weight_shard(
+            w3_weight_scale,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w3_weight_scale is not None else None
+
+        if not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
+            module.tmp_cutlass_w3_w1_weight_scales = {}
+        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        dst_base = dst_w3_w1_weight_scale.storage().data_ptr()
+        dict_key = (dst_base, expert_idx)
+        expert_entry = module.tmp_cutlass_w3_w1_weight_scales.setdefault(
+            dict_key, {})
+        expert_entry['dst'] = dst_w3_w1_weight_scale
+        if w3_weight_scale is not None:
+            expert_entry['w3'] = w3_weight_scale.contiguous().view(
+                dst_w3_w1_weight_scale.dtype)
+        if w1_weight_scale is not None:
+            expert_entry['w1'] = w1_weight_scale.contiguous().view(
+                dst_w3_w1_weight_scale.dtype)
+
+    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        device = dst_w2_weight_scale.device
+        w2_weight_scale = load_weight_shard(w2_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+        src_w2_scale_size = w2_weight_scale.shape[1]
+        adjusted_dst_w2_scale_size = (dst_w2_weight_scale.shape[1] *
+                                      self.block_scales_vec_size)
+        assert adjusted_dst_w2_scale_size >= src_w2_scale_size, (
+            "adjusted_dst_w2_scale_size must be >= src_w2_scale_size")
+        if adjusted_dst_w2_scale_size > src_w2_scale_size:
+            w2_weight_scale = torch.nn.functional.pad(
+                w2_weight_scale,
+                (0, adjusted_dst_w2_scale_size - src_w2_scale_size), "constant",
+                0).contiguous()
+        cast_w2_weight_scale = w2_weight_scale.view(dst_w2_weight_scale.dtype)
+        cast_w2_weight_scale = self._maybe_padding_shape(
+            cast_w2_weight_scale, dst_w2_weight_scale)
+        dst_w2_weight_scale.copy_(cast_w2_weight_scale)
+
+    @staticmethod
+    def _maybe_padding_shape(source_tensor: torch.Tensor,
+                             dst_tensor: torch.Tensor) -> torch.Tensor:
+        """Pad ``source_tensor`` (2D) to match ``dst_tensor.shape``.
+
+        Defensive symmetry with the Cutlass loader pattern. With the
+        grandparent's un-padded ``get_weights_shapes`` the dst/source
+        shapes should already match for every MegaMoE-supported shape;
+        keeping the helper means any future drift (e.g. a new alignment
+        constant on the grandparent) fails loudly only on real
+        mismatches instead of producing wrong byte slices.
+        """
+        assert len(source_tensor.shape) == 2 and len(
+            dst_tensor.shape) == 2, ("Only support 2D weights padding for now.")
+        dst_row, dst_col = dst_tensor.shape
+        src_row, src_col = source_tensor.shape
+        if src_row != dst_row or src_col != dst_col:
+            source_tensor = torch.nn.functional.pad(
+                source_tensor, (0, dst_col - src_col, 0, dst_row - src_row),
+                "constant", 0).contiguous()
+        return source_tensor
+
+    # -----------------------------------------------------------------
+    # process_weights_after_loading: cat raw shards (NO interleave),
+    # build EPLB shared-staging mega buffers BEFORE the parent deletes
+    # the shared scale staging, reconcile alphas/input scales via
+    # parent, build routed MegaMoE-format derived tensors, register
+    # mega-format CPU staging with the load balancer, run v1 alpha gate.
+    # -----------------------------------------------------------------
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # ---- Cat raw w3+w1 weights ----
+        # Iterates BOTH routed (module.w3_w1_weight.data) and shared
+        # (module.local_shared_w3_w1_tensors) entries: the loader keys
+        # the tmp dict by (dst_storage, expert_idx), so a single dict
+        # holds entries for both destinations when EPLB shared loading
+        # ran. After this loop:
+        #   * module.w3_w1_weight.data        contains cat'd [w3|w1] per routed slot
+        #   * module.local_shared_w3_w1_tensors  contains cat'd [w3|w1] per shared slot
+        # _maybe_padding_shape is a defensive no-op against future
+        # alignment drift on the grandparent get_weights_shapes.
+        if hasattr(module, 'tmp_cutlass_w3_w1_weights'):
+            for entry in module.tmp_cutlass_w3_w1_weights.values():
+                w3 = entry.get('w3')
+                w1 = entry.get('w1')
+                dst = entry['dst']
+                if w3 is not None and w1 is not None:
+                    cat_weight = torch.cat([w3, w1], dim=0)
+                    cat_weight = self._maybe_padding_shape(cat_weight, dst)
+                    dst.copy_(cat_weight, non_blocking=True)
+            delattr(module, 'tmp_cutlass_w3_w1_weights')
+
+        # ---- Cat raw w3+w1 scales (NO block_scale_interleave) ----
+        # Same routed + shared cat pattern as weights. MegaMoE's kernel
+        # does its own 16-atom gate/up interleave + to_blocked swizzle
+        # in _build_mega_format_weights below; the Cutlass parent would
+        # call block_scale_interleave here, which we deliberately skip.
+        if hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
+            for entry in module.tmp_cutlass_w3_w1_weight_scales.values():
+                w3_scale = entry.get('w3')
+                w1_scale = entry.get('w1')
+                dst = entry['dst']
+                if w3_scale is not None and w1_scale is not None:
+                    cat_scale = torch.cat([w3_scale, w1_scale], dim=0)
+                    cat_scale = self._maybe_padding_shape(cat_scale, dst)
+                    dst.copy_(cat_scale)
+            delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
+
+        # ---- Build EPLB shared-staging mega buffers ----
+        # MUST run BEFORE super().process_weights_after_loading, because
+        # super() deletes module.local_shared_w*_scale_tensors at the
+        # end of its shared-alpha block (see
+        # NVFP4FusedMoEMethod.process_weights_after_loading step 4).
+        # The routed mega buffers are built after super() so they
+        # reflect any in-place parent alpha/scale normalization.
+        if self.need_load_shared_weights(module):
+            self._build_mega_shared_staging(module)
+
+        # ---- Reconcile alpha + input_scale via parent ----
+        # super() here is NVFP4FusedMoEMethod: verifies w1/w3
+        # input_scale, computes global input scales, runs pre_quant_scale
+        # finalization, alpha reconcile, and EPLB shared-alpha
+        # registration (which also deletes local_shared_w*_scale_tensors).
+        super().process_weights_after_loading(module)
+
+        # ---- Build MegaMoE-format derived tensors (routed slots) ----
+        self._build_mega_format_weights(module)
+
+        # ---- Register MegaMoE-format shared staging with load balancer ----
+        if self.need_load_shared_weights(module):
+            self._register_mega_shared_staging(module)
+
+        # ---- v1 product gate ----
+        self._check_v1_alpha_gate(module)
+
+    # -----------------------------------------------------------------
+    # MegaMoE-format weight builders
+    # -----------------------------------------------------------------
+    def _build_mega_format_buffers(
+        self,
+        raw_w3_w1: torch.Tensor,
+        raw_w3_w1_sf: torch.Tensor,
+        raw_w2: torch.Tensor,
+        raw_w2_sf: torch.Tensor,
+        *,
+        num_slots: int,
+        intermediate: int,
+        hidden: int,
+        expand_intermediate: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure helper: run the MegaMoE-format transform pipeline.
+
+        Takes the four raw NVFP4 tensors (any device, any slot count)
+        and returns four fresh, contiguous tensors on the same device:
+
+        * ``mega_fc1`` shape ``(num_slots, expand_intermediate,
+          hidden // 2)`` uint8 -- 16-atom gate/up interleave applied
+          along expand_intermediate.
+        * ``mega_fc1_sf_raw`` shape ``(num_slots, fc1_sf_flat_size)``
+          uint8 -- 16-atom gate/up interleave + per-slot ``to_blocked``
+          swizzle. Already padded to the registered flat size.
+        * ``mega_fc2`` shape ``(num_slots, hidden, intermediate // 2)``
+          uint8 -- byte-equivalent clone of ``raw_w2``.
+        * ``mega_fc2_sf_raw`` shape ``(num_slots, fc2_sf_flat_size)``
+          uint8 -- per-slot ``to_blocked`` swizzle, padded.
+
+        Reads only the input tensors (no module access), per the
+        trtllm-moe-develop "CPU shared-staging buffer family" rule
+        "the reconcile/compute helper must take the destination tensor
+        as a parameter so the same body serves routed and staging index
+        spaces". The routed path passes
+        ``module.w3_w1_weight.data`` etc.; the EPLB shared-staging path
+        passes ``module.local_shared_w3_w1_tensors`` etc. (CPU).
+        """
+        # Lazy import: the helper lives in the ported CuteDSL kernel
+        # package which we don't want to import at module load time
+        # (it pulls cutlass dsl symbols).
+        from ...cute_dsl_kernels.mega_moe_nvfp4 import (
+            stack_byte_reinterpretable_tensors, to_blocked)
+
+        if intermediate % 16 != 0:
+            raise ValueError(
+                f"MegaMoE NVFP4 FC1 transform requires intermediate % 16 == 0"
+                f" (Fc1GateUpInterleave); got intermediate={intermediate}.")
+        h_bytes = hidden // 2
+        n_pairs = intermediate // 16
+        device = raw_w3_w1.device
+
+        # ===================== FC1 weight =====================
+        # raw_w3_w1 is (num_slots, expand_intermediate, hidden // 2) uint8
+        # with [w3 | w1] cat'd along M. Per design: gate = w1, up = w3.
+        # MegaMoE epilogue pairs gate/up at 16-atom granularity along
+        # the M axis:
+        #   [gate[0:16], up[0:16], gate[16:32], up[16:32], ...]
+        # The "16" is logical NVFP4 elements along M (NOT packed-K bytes).
+        # Bytes along the H_bytes axis are preserved.
+        #
+        # The parent NVFP4 layout stores w3_w1_weight as int64 with last dim
+        # ``hidden // 16`` (16 NVFP4 packed per int64). The kernel boundary
+        # works in uint8 (``hidden // 2``), so re-view here before slicing.
+        if raw_w3_w1.dtype != torch.uint8:
+            raw_w3_w1 = raw_w3_w1.view(torch.uint8).contiguous()
+        if raw_w2.dtype != torch.uint8:
+            raw_w2 = raw_w2.view(torch.uint8).contiguous()
+        up_part = raw_w3_w1[:, :intermediate, :].contiguous()
+        gate_part = raw_w3_w1[:, intermediate:, :].contiguous()
+        gate_p = gate_part.view(num_slots, n_pairs, 16, h_bytes)
+        up_p = up_part.view(num_slots, n_pairs, 16, h_bytes)
+        interleaved = torch.stack([gate_p, up_p], dim=2).contiguous()
+        mega_fc1 = interleaved.view(num_slots, expand_intermediate,
+                                    h_bytes).contiguous()
+
+        # ===================== FC2 weight =====================
+        # raw_w2 is (num_slots, hidden, intermediate // 2) uint8; the
+        # kernel boundary applies permute(0, 2, 1).view(float4_e2m1fn_x2)
+        # to expose (num_slots, intermediate, hidden) stride-1. We copy
+        # the bytes through so mega_fc2 is owned by this method.
+        mega_fc2 = raw_w2.detach().clone().contiguous()
+
+        # ===================== FC1 weight SF =====================
+        # raw_w3_w1_sf is (num_slots, expand_intermediate, hidden // 64)
+        # int32 (each int32 packs 4 FP8 SFs along K). Apply the same
+        # 16-atom gate/up interleave along M, then per-slot to_blocked
+        # swizzle on the FP8 view.
+        sf_cols = raw_w3_w1_sf.shape[-1]  # in int32 units
+        up_sf = raw_w3_w1_sf[:, :intermediate, :].contiguous()
+        gate_sf = raw_w3_w1_sf[:, intermediate:, :].contiguous()
+        gate_sf_p = gate_sf.view(num_slots, n_pairs, 16, sf_cols)
+        up_sf_p = up_sf.view(num_slots, n_pairs, 16, sf_cols)
+        interleaved_sf = torch.stack([gate_sf_p, up_sf_p], dim=2).contiguous()
+        interleaved_sf = interleaved_sf.view(num_slots, expand_intermediate,
+                                             sf_cols)
+        fc1_sf_per_slot: List[torch.Tensor] = []
+        for slot_idx in range(num_slots):
+            sf_fp8 = interleaved_sf[slot_idx].view(torch.float8_e4m3fn)
+            flat = to_blocked(sf_fp8)
+            fc1_sf_per_slot.append(flat.view(torch.uint8))
+        stacked_fc1_sf = stack_byte_reinterpretable_tensors(fc1_sf_per_slot,
+                                                            dim=0).contiguous()
+        # Pad to fc1_sf_flat_size (zero pad on the tail) so the output
+        # shape always matches the registered Parameter shape.
+        fc1_w = self.fc1_sf_flat_size(intermediate, hidden)
+        if stacked_fc1_sf.shape[-1] != fc1_w:
+            mega_fc1_sf = torch.zeros((num_slots, fc1_w),
+                                      dtype=stacked_fc1_sf.dtype,
+                                      device=device)
+            mega_fc1_sf[:, :stacked_fc1_sf.shape[-1]] = stacked_fc1_sf
+        else:
+            mega_fc1_sf = stacked_fc1_sf
+
+        # ===================== FC2 weight SF =====================
+        # raw_w2_sf is (num_slots, hidden, intermediate // 64) int32.
+        # No M-axis interleave (FC2 isn't gated); just per-slot to_blocked.
+        fc2_sf_per_slot: List[torch.Tensor] = []
+        for slot_idx in range(num_slots):
+            sf_fp8 = raw_w2_sf[slot_idx].view(torch.float8_e4m3fn)
+            flat = to_blocked(sf_fp8)
+            fc2_sf_per_slot.append(flat.view(torch.uint8))
+        stacked_fc2_sf = stack_byte_reinterpretable_tensors(fc2_sf_per_slot,
+                                                            dim=0).contiguous()
+        fc2_w = self.fc2_sf_flat_size(hidden, intermediate)
+        if stacked_fc2_sf.shape[-1] != fc2_w:
+            mega_fc2_sf = torch.zeros((num_slots, fc2_w),
+                                      dtype=stacked_fc2_sf.dtype,
+                                      device=device)
+            mega_fc2_sf[:, :stacked_fc2_sf.shape[-1]] = stacked_fc2_sf
+        else:
+            mega_fc2_sf = stacked_fc2_sf
+
+        return mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf
+
+    def _build_mega_format_weights(self, module: torch.nn.Module):
+        """Build the routed-slot MegaMoE-format Parameter buffers.
+
+        Reads ``module.{w3_w1_weight, w3_w1_weight_scale, w2_weight,
+        w2_weight_scale}`` (routed GPU) and writes
+        ``module.{mega_fc1_weight, mega_fc1_weight_sf, mega_fc2_weight,
+        mega_fc2_weight_sf}`` via :meth:`_build_mega_format_buffers`.
+        See MEGAMOE_CUTEDSL_DESIGN.md "Required transform pipeline".
+        """
+        mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf = (
+            self._build_mega_format_buffers(
+                raw_w3_w1=module.w3_w1_weight.data,
+                raw_w3_w1_sf=module.w3_w1_weight_scale.data,
+                raw_w2=module.w2_weight.data,
+                raw_w2_sf=module.w2_weight_scale.data,
+                num_slots=module.expert_size_per_partition,
+                intermediate=module.intermediate_size_per_partition,
+                hidden=module.hidden_size,
+                expand_intermediate=module.
+                expand_intermediate_size_per_partition,
+            ))
+        module.mega_fc1_weight.data.copy_(mega_fc1, non_blocking=True)
+        module.mega_fc1_weight_sf.data.copy_(mega_fc1_sf, non_blocking=True)
+        module.mega_fc2_weight.data.copy_(mega_fc2, non_blocking=True)
+        module.mega_fc2_weight_sf.data.copy_(mega_fc2_sf, non_blocking=True)
+
+    def _build_mega_shared_staging(self, module: torch.nn.Module):
+        """Allocate + populate CPU shared-staging tensors for the four
+        MegaMoE-format derived parameters.
+
+        Reads ``module.local_shared_{w3_w1, w3_w1_scale, w2, w2_scale}_tensors``
+        (CPU, sized ``num_shared = len(local_shared_load_expert_ids)``)
+        and writes ``module.local_shared_mega_{fc1_weight, fc1_weight_sf,
+        fc2_weight, fc2_weight_sf}_tensors``. Used only when
+        :meth:`need_load_shared_weights` is True; deleted after
+        registration in :meth:`_register_mega_shared_staging` so they
+        do not survive past load.
+
+        IMPORTANT: must be called BEFORE
+        ``super().process_weights_after_loading``, because that step
+        deletes ``module.local_shared_w*_scale_tensors`` as part of the
+        shared-alpha EPLB registration. The mega bytes only depend on
+        raw weight + raw scale (no alpha), so order independence is
+        safe.
+        """
+        mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf = (
+            self._build_mega_format_buffers(
+                raw_w3_w1=module.local_shared_w3_w1_tensors,
+                raw_w3_w1_sf=module.local_shared_w3_w1_scale_tensors,
+                raw_w2=module.local_shared_w2_tensors,
+                raw_w2_sf=module.local_shared_w2_scale_tensors,
+                num_slots=module.local_shared_w3_w1_tensors.shape[0],
+                intermediate=module.intermediate_size_per_partition,
+                hidden=module.hidden_size,
+                expand_intermediate=module.
+                expand_intermediate_size_per_partition,
+            ))
+        # ``.cpu()`` is a no-op when the source is already CPU; explicit
+        # so the shm registration below never trips on a CUDA tensor if
+        # a caller mistakenly passes routed GPU shared buffers.
+        module.local_shared_mega_fc1_weight_tensors = mega_fc1.cpu().contiguous(
+        )
+        module.local_shared_mega_fc1_weight_sf_tensors = mega_fc1_sf.cpu(
+        ).contiguous()
+        module.local_shared_mega_fc2_weight_tensors = mega_fc2.cpu().contiguous(
+        )
+        module.local_shared_mega_fc2_weight_sf_tensors = mega_fc2_sf.cpu(
+        ).contiguous()
+
+    def _register_mega_shared_staging(self, module: torch.nn.Module):
+        """Hand the four mega-format CPU staging tensors to the load
+        balancer, then drop the module attrs so they do not double-keep
+        the host memory.
+
+        Per the trtllm-moe-develop "CPU shared-staging buffer family"
+        rules, each per-expert ``nn.Parameter`` on the module must have
+        a corresponding CPU staging tensor in the ``weight_fns`` dict
+        passed to ``register_all_parameter_slot_and_to_fix_weight_fns``;
+        otherwise the load balancer either crashes on the first
+        cross-rank sync or silently leaves stale slots after migration.
+        """
+        weight_fns = {
+            'mega_fc1_weight': module.local_shared_mega_fc1_weight_tensors,
+            'mega_fc1_weight_sf':
+            module.local_shared_mega_fc1_weight_sf_tensors,
+            'mega_fc2_weight': module.local_shared_mega_fc2_weight_tensors,
+            'mega_fc2_weight_sf':
+            module.local_shared_mega_fc2_weight_sf_tensors,
+        }
+        module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
+        for attr in ('local_shared_mega_fc1_weight_tensors',
+                     'local_shared_mega_fc1_weight_sf_tensors',
+                     'local_shared_mega_fc2_weight_tensors',
+                     'local_shared_mega_fc2_weight_sf_tensors'):
+            delattr(module, attr)
+
+    @staticmethod
+    def _copy_blocked_sf_with_pad(src: torch.Tensor, dst: torch.Tensor, *,
+                                  name: str, hidden: int,
+                                  intermediate: int) -> None:
+        """Copy ``src`` blocked SF into ``dst``; tolerate src width
+        smaller than the registered ``dst`` width (zero-pad the tail),
+        raise if larger (would indicate the flat-size formula and the
+        kernel are out of sync)."""
+        actual_w = src.shape[-1]
+        dst_w = dst.shape[-1]
+        if actual_w == dst_w:
+            dst.copy_(src, non_blocking=True)
+            return
+        if actual_w < dst_w:
+            dst.zero_()
+            dst[:, :actual_w].copy_(src, non_blocking=True)
+            return
+        raise RuntimeError(
+            f"{name} width ({dst_w}) < actual blocked SF width "
+            f"({actual_w}); the *_sf_flat_size formula is out of sync "
+            f"with the kernel (hidden={hidden}, "
+            f"intermediate={intermediate}).")
+
+    def _check_v1_alpha_gate(self, module: torch.nn.Module) -> None:
+        """Reject checkpoints whose per-expert / per-layer NVFP4 scales
+        are not all 1.0 within FP32 tolerance.
+
+        Until the ported kernel ABI is extended to carry ``fc31_alpha`` /
+        ``fc2_alpha`` / ``fc2_input_scale`` (see MEGAMOE_CUTEDSL_DESIGN.md
+        "NVFP4 scale and alpha ABI"), the MegaMoE CuteDSL kernel
+        internally treats those values as 1.0. Running on a checkpoint
+        where any of them differs from 1.0 silently produces wrong
+        results; raise a clear error instead so callers fall back via
+        the factory.
+
+        Test-only escape hatch: setting
+        ``TRTLLM_MEGAMOE_CUTEDSL_BYPASS_V1_ALPHA_GATE=1`` skips the
+        check. This exists ONLY for unit tests that need to drive the
+        EPLB shared-staging / migration code paths end-to-end through
+        synthetic weights where alpha != 1; production paths must
+        leave the env var unset.
+        """
+        import os as _os
+        if _os.environ.get("TRTLLM_MEGAMOE_CUTEDSL_BYPASS_V1_ALPHA_GATE",
+                           "0") == "1":
+            return
+        ones_fc31_alpha = torch.ones_like(module.fc31_alpha.data)
+        ones_fc2_alpha = torch.ones_like(module.fc2_alpha.data)
+        ones_fc2_input_scale = torch.ones_like(module.fc2_input_scale.data)
+        if not torch.allclose(
+                module.fc31_alpha.data.detach(), ones_fc31_alpha, atol=0,
+                rtol=1e-3):
+            raise NotImplementedError(
+                "MegaMoECuteDsl v1 requires every fc31_alpha == 1.0 (the "
+                "ported kernel hard-codes the FC1 epilogue alpha; see "
+                "MEGAMOE_CUTEDSL_DESIGN.md 'NVFP4 scale and alpha ABI'). "
+                f"Got fc31_alpha={module.fc31_alpha.data.detach().cpu().tolist()}. "
+                "Fall back to CutlassFusedMoE / CuteDslFusedMoE until the "
+                "kernel ABI extension lands.")
+        if not torch.allclose(
+                module.fc2_alpha.data.detach(), ones_fc2_alpha, atol=0,
+                rtol=1e-3):
+            raise NotImplementedError(
+                "MegaMoECuteDsl v1 requires every fc2_alpha == 1.0; got "
+                f"fc2_alpha={module.fc2_alpha.data.detach().cpu().tolist()}. "
+                "Fall back to CutlassFusedMoE / CuteDslFusedMoE until the "
+                "kernel ABI extension lands.")
+        if not torch.allclose(module.fc2_input_scale.data.detach(),
+                              ones_fc2_input_scale,
+                              atol=0,
+                              rtol=1e-3):
+            raise NotImplementedError(
+                "MegaMoECuteDsl v1 requires fc2_input_scale == 1.0 "
+                "(kernel norm_const is hard-coded); got "
+                f"fc2_input_scale={float(module.fc2_input_scale.data.detach().cpu())}. "
+                "Fall back to CutlassFusedMoE / CuteDslFusedMoE until the "
+                "kernel ABI extension lands.")
+
+
 class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn

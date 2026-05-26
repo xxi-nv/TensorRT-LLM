@@ -1468,8 +1468,15 @@ class AutoTuner:
         if dtype == torch.float4_e2m1fn_x2:
             return (torch.rand(shapes, device=device) * 10 - 5).to(
                 torch.uint8).view(dtype)
-        else:
-            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # PyTorch's direct ``.to(float8_*)`` cast can trip on certain
+            # GPU/driver combinations (illegal memory access during the
+            # cast kernel). Bridge through ``uint8`` like the FP4 branch
+            # above. Backends that need real FP8 numerics during
+            # autotuning should set up their own warmup data.
+            return (torch.rand(shapes, device=device) * 10 - 5).to(
+                torch.uint8).view(dtype)
+        return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

@@ -59,14 +59,25 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import W4A8MXFP4MXFP8Meg
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)
 
 
+_MEGAMOE_BACKEND_TYPES = {
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+}
+
+
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Every MegaMoE backend (DG + CuteDSL) resolves an EP ProcessGroup
+    at construction time via ``_resolve_ep_pg``. Single-process tests
+    must therefore initialise ``torch.distributed`` even when the test
+    only exercises ``ep_size == 1`` -- otherwise the constructor raises
+    ``MegaMoe*Unavailable``. Both MegaMoE backends need the same fixture
+    so the dist helper must accept the full set."""
+    if backend_type not in _MEGAMOE_BACKEND_TYPES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -175,7 +186,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             moe_tp_size=1,
             moe_ep_size=4,
         ),
-        moe_backend=MoeBackendType.MEGAMOE.value,
+        moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
     with pytest.raises(
@@ -230,7 +241,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -261,7 +272,7 @@ def run_backend_moe(
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         args["workspace"] = backend.get_workspace(m_max, 128)
-    elif backend_type == MoeBackendType.MEGAMOE:
+    elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
@@ -293,7 +304,8 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
-    MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
 ]
 
 # Data types to test
@@ -546,6 +558,17 @@ def test_moe_backend(
     if backend_type == MoeBackendType.DENSEGEMM:
         monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
 
+    # MEGAMOE_CUTEDSL v1 alpha gate (see
+    # NVFP4MegaMoECuteDslMethod._check_v1_alpha_gate) rejects any checkpoint
+    # whose fc31_alpha / fc2_alpha / fc2_input_scale deviates from 1.0
+    # because the ported kernel hard-codes alpha=1 / norm_const=1. The
+    # backend test uses NVFP4QuantizeUtil which always produces non-1
+    # weight_scale_2 values; bypass the gate so the load -> post-load ->
+    # run_moe path can be exercised end-to-end here. Production paths leave
+    # the env var unset and the gate stays enforced.
+    if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
+        monkeypatch.setenv("TRTLLM_MEGAMOE_CUTEDSL_BYPASS_V1_ALPHA_GATE", "1")
+
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False
     if is_gated:
@@ -737,3 +760,659 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+# ============================================================================
+# MegaMoECuteDsl focused tests
+#
+# The MegaMoECuteDsl backend is gated behind a CUDA 13 Cutlass DSL runtime
+# (PR #14354) and an NVSHMEM-backed symmetric-memory provider (hard gate
+# in MEGAMOE_CUTEDSL_DESIGN.md). Until both land, the full ``run_moe`` path
+# is unreachable in production. The tests below cover the contract that IS
+# implementable today:
+#   * package import / module-level constants
+#   * ``can_implement`` positive and negative cases
+#   * ``to_blocked`` / ``from_blocked`` byte-equivalence
+#   * tactic representation: validation, JSON serialization, ``repr``
+#     round-trip, ``group_hint`` resolution
+#   * ``quantize_input`` zero-token short-circuit (also exercises the
+#     scheduler refactor that no longer special-cases zero-token chunks)
+#   * v1 alpha-gate rejection inside ``NVFP4MegaMoECuteDslMethod``
+#   * ``run_moe`` raises the clear ``MegaMoeCuteDslUnavailable`` error
+#     until the provider lands
+# ============================================================================
+
+
+def _skip_if_no_megamoe_cutedsl_runtime():
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl import (
+        is_megamoe_cute_dsl_runtime_available,
+    )
+
+    ok, reason = is_megamoe_cute_dsl_runtime_available()
+    if not ok:
+        pytest.skip(reason)
+
+
+def test_megamoe_cutedsl_kernel_package_imports():
+    """Importing the lazy package surface must not pull the heavyweight
+    kernel module on environments without the CUDA 13 Cutlass DSL runtime;
+    only the constants + blocked_scale helpers are loaded eagerly.
+    """
+    from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import (
+        Nvfp4BlockSize,
+        SfPaddingBlock,
+        from_blocked,
+        to_blocked,
+    )
+
+    assert Nvfp4BlockSize == 16
+    assert SfPaddingBlock == 128
+    assert callable(to_blocked)
+    assert callable(from_blocked)
+
+
+@pytest.mark.parametrize(
+    "rows,cols",
+    [(8, 4), (128, 16), (256, 32), (1, 1), (0, 0)],
+)
+def test_megamoe_cutedsl_to_blocked_roundtrip(rows, cols):
+    """``from_blocked(to_blocked(x))`` must recover the original raw scale
+    bytes for representative shapes used by FC1/FC2 SF tensors.
+    """
+    from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import from_blocked, to_blocked
+
+    if rows == 0 or cols == 0:
+        raw = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device="cpu")
+        flat = to_blocked(raw)
+        # Empty input must short-circuit to a length-0 view.
+        assert flat.numel() == 0
+        return
+
+    # Use bytewise-deterministic values so the byte-equivalence test is
+    # robust to FP8 NaN canonicalization.
+    raw_uint8 = (
+        (torch.arange(rows * cols, dtype=torch.int32) % 200).to(torch.uint8).reshape(rows, cols)
+    )
+    raw_fp8 = raw_uint8.view(torch.float8_e4m3fn)
+    flat = to_blocked(raw_fp8)
+    recovered = from_blocked(flat, rows, cols)
+    assert recovered.shape == (rows, cols)
+    assert torch.equal(recovered.view(torch.uint8), raw_uint8), (
+        f"to_blocked/from_blocked roundtrip mismatch for ({rows}, {cols})"
+    )
+
+
+def test_megamoe_cutedsl_can_implement_positive_and_negative():
+    """``MegaMoECuteDsl.can_implement`` is a pure-Python capability query
+    that does not require CUDA. It should:
+
+    * Accept ``NVFP4 + bf16 + SM100-aligned shapes`` when running on an
+      SM100 GPU with the required cu13 Cutlass DSL symbols available.
+    * Reject non-NVFP4 quant, non-bf16 activations, ``swiglu_gptoss_style``,
+      and unaligned hidden/intermediate shapes regardless of host
+      environment (the negative checks short-circuit before the
+      SM/runtime probe).
+    """
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl
+
+    ok, reason = MegaMoECuteDsl.can_implement(QuantAlgo.W4A8_MXFP4_MXFP8)
+    assert not ok, "must reject non-NVFP4 quant"
+    assert "NVFP4" in reason
+
+    ok, reason = MegaMoECuteDsl.can_implement(QuantAlgo.NVFP4, dtype_activation=torch.float16)
+    assert not ok, "must reject non-bf16 activation"
+    assert "bfloat16" in reason or "bf16" in reason.lower()
+
+    ok, reason = MegaMoECuteDsl.can_implement(QuantAlgo.NVFP4, swiglu_gptoss_style=True)
+    assert not ok, "must reject swiglu_gptoss_style"
+
+    ok, reason = MegaMoECuteDsl.can_implement(QuantAlgo.NVFP4, hidden_size=33)
+    assert not ok, "must reject unaligned hidden_size"
+    assert "32" in reason
+
+    ok, reason = MegaMoECuteDsl.can_implement(QuantAlgo.NVFP4, intermediate_size=15)
+    assert not ok, "must reject unaligned intermediate_size"
+    assert "16" in reason
+
+    # Positive case: requires SM100 + cu13 cutlass-dsl. Run if available.
+    if not torch.cuda.is_available():
+        pytest.skip("positive can_implement check needs an SM100 GPU")
+    sm = torch.cuda.get_device_capability(0)
+    if sm[0] != 10:
+        pytest.skip(f"positive can_implement check needs SM100 family, got {sm}")
+    _skip_if_no_megamoe_cutedsl_runtime()
+    ok, reason = MegaMoECuteDsl.can_implement(
+        QuantAlgo.NVFP4, hidden_size=2048, intermediate_size=2048
+    )
+    assert ok, f"positive can_implement failed: {reason}"
+
+
+def test_megamoe_cutedsl_tactic_validation():
+    """Tactic tuples must pass the kernel-side validation (see
+    MEGAMOE_CUTEDSL_DESIGN.md "MegaMoECuteDsl tactic representation").
+
+    Tactics live in :mod:`tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op`
+    (the runner module), not in the backend module — matching the
+    boundary used by ``fused_moe_cute_dsl.py`` for its inner runners
+    (``cute_dsl_custom_ops.py`` owns the Runner + op + tactic).
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+        DEFAULT_MEGAMOE_TACTIC,
+        enumerate_megamoe_candidate_tactics,
+        resolve_megamoe_group_hint,
+        validate_megamoe_tactic,
+    )
+
+    # Default tactic must be valid once group_hint is resolved.
+    tactic = (
+        list(DEFAULT_MEGAMOE_TACTIC[0]),
+        list(DEFAULT_MEGAMOE_TACTIC[1]),
+        DEFAULT_MEGAMOE_TACTIC[2],
+        max(1, resolve_megamoe_group_hint(tuple(DEFAULT_MEGAMOE_TACTIC[1]))),
+        DEFAULT_MEGAMOE_TACTIC[4],
+        DEFAULT_MEGAMOE_TACTIC[5],
+    )
+    validate_megamoe_tactic(tactic)
+
+    # All run_mega_tests.sh-derived candidate tactics must validate.
+    for cand in enumerate_megamoe_candidate_tactics():
+        validate_megamoe_tactic(cand)
+
+    def _patched(idx, value):
+        new = list(tactic)
+        new[idx] = value
+        return tuple(new)
+
+    # Negative cases (positional index in the 6-tuple):
+    with pytest.raises(ValueError, match="mma_tiler_mnk"):
+        validate_megamoe_tactic(_patched(0, [64, 128, 256]))
+    with pytest.raises(ValueError, match="cluster_shape_mnk"):
+        validate_megamoe_tactic(_patched(1, [1, 2, 1]))
+    with pytest.raises(ValueError, match="use_2cta_instrs"):
+        validate_megamoe_tactic(_patched(2, True))
+    with pytest.raises(ValueError, match="resolved_group_hint"):
+        validate_megamoe_tactic(_patched(3, None))
+    with pytest.raises(ValueError, match="load_balance_mode"):
+        validate_megamoe_tactic(_patched(4, "clc"))
+
+
+def test_megamoe_cutedsl_tactic_json_and_repr_roundtrip():
+    """Tactic tuples must round-trip through ``eval(repr(tactic))`` so
+    the AutoTuner cache can serialize them. Inner fields are
+    JSON-friendly primitives so ``json.dumps`` also works (the tuple
+    casts to a list at the top level, but the round-tripped value
+    compares structurally equal when re-wrapped as tuple).
+    """
+    import json
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import DEFAULT_MEGAMOE_TACTIC
+
+    tactic = (
+        list(DEFAULT_MEGAMOE_TACTIC[0]),
+        list(DEFAULT_MEGAMOE_TACTIC[1]),
+        DEFAULT_MEGAMOE_TACTIC[2],
+        4,
+        DEFAULT_MEGAMOE_TACTIC[4],
+        DEFAULT_MEGAMOE_TACTIC[5],
+    )
+
+    # repr round-trip preserves both tuple structure and inner list values.
+    restored = eval(repr(tactic))
+    assert restored == tactic
+
+    # json round-trip: tuple becomes list at top level, re-wrap as tuple.
+    serialized = json.dumps(list(tactic))
+    restored_json = tuple(json.loads(serialized))
+    assert restored_json == tactic
+
+
+def test_megamoe_cutedsl_quantize_input_zero_tokens():
+    """``MegaMoECuteDsl.quantize_input`` must accept zero-token input
+    without launching ``fp4_quantize`` so the FusedCommMoEScheduler can
+    call it uniformly for empty chunks. The empty layout is NVFP4 packed
+    bytes + plain K-major FP8 SF bytes (uint8 alias).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for quantize_input")
+    _skip_if_no_megamoe_cutedsl_runtime()
+    sm = torch.cuda.get_device_capability(0)
+    if sm[0] != 10:
+        pytest.skip(f"MegaMoECuteDsl requires SM100 family, got {sm}")
+
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl
+
+    routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = 4
+    pretrained_config.hidden_size = 1024
+    pretrained_config.intermediate_size = 1024
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=quant_config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    backend = MegaMoECuteDsl(
+        routing_method=routing_method,
+        num_experts=4,
+        hidden_size=1024,
+        intermediate_size=1024,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+    )
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+        megamoe_activation_sf_bytes_per_row,
+    )
+
+    empty_x = torch.empty((0, 1024), dtype=torch.bfloat16, device="cuda")
+    x_fp4, x_sf = backend.quantize_input(empty_x)
+    assert x_fp4.shape[0] == 0
+    assert x_fp4.shape[1] == 1024 // 2
+    assert x_sf.shape[0] == 0
+    # hidden=1024 -> ceil(1024/16)=64, round_up(64, 4)=64 (no pad needed)
+    assert x_sf.shape[1] == megamoe_activation_sf_bytes_per_row(1024) == 64
+
+
+def test_megamoe_cutedsl_run_moe_multi_rank_requires_ep_pg():
+    """Multi-rank (``ep_size > 1``) ``run_moe`` requires a real EP
+    process group so the ``MegaMoeSymmMemProvider`` can run its
+    rendezvous collective. The provider is backed by PyTorch's
+    ``torch.distributed._symmetric_memory`` (cuMem-based NVSHMEM
+    equivalent already used by ``SymmetricMemoryAllReduce``).
+
+    Without a live ProcessGroup, ``_get_symm_provider`` raises
+    ``MegaMoeCuteDslUnavailable`` with an actionable message so the
+    user can switch to Ray / DeviceMesh / mpirun.
+
+    Single-rank degenerate path (``ep_size == 1``) is supported and
+    exercised by the module-level
+    ``test_megamoe_cutedsl_factory_routing_and_scheduler`` test on a
+    real GPU. Real multi-rank end-to-end is covered by the multi-GPU
+    EP tests once the OCI worktree is rebuilt.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for backend instantiation")
+    _skip_if_no_megamoe_cutedsl_runtime()
+    sm = torch.cuda.get_device_capability(0)
+    if sm[0] != 10:
+        pytest.skip(f"MegaMoECuteDsl requires SM100 family, got {sm}")
+
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import (
+        MegaMoECuteDsl,
+        MegaMoeCuteDslUnavailable,
+    )
+
+    routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = 4
+    pretrained_config.hidden_size = 1024
+    pretrained_config.intermediate_size = 1024
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=quant_config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    backend = MegaMoECuteDsl(
+        routing_method=routing_method,
+        num_experts=4,
+        hidden_size=1024,
+        intermediate_size=1024,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+    )
+
+    # Force multi-rank ep_size AFTER the backend was constructed
+    # single-rank: the symm provider was therefore NOT allocated at
+    # ``create_weights`` time (per design, provider rendezvous is a
+    # build-time collective). ``run_moe`` must raise a clear
+    # MegaMoeCuteDslUnavailable when the cached provider is missing.
+    backend.ep_size = 4
+    backend.ep_rank = 0
+    backend._symm_provider = None  # ensure no leftover
+
+    # Non-empty inputs so run_moe reaches the multi-rank branch
+    # (zero-token short-circuit returns before the provider check).
+    x_buf = torch.zeros((1, 1024 // 2), dtype=torch.uint8, device="cuda")
+    sf_buf = torch.zeros((1, 1024 // 16), dtype=torch.uint8, device="cuda")
+    topk_ids = torch.zeros((1, 2), dtype=torch.int32, device="cuda")
+    topk_w = torch.zeros((1, 2), dtype=torch.float32, device="cuda")
+    with pytest.raises(MegaMoeCuteDslUnavailable, match="symmetric-memory"):
+        backend.run_moe(
+            x=x_buf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_w,
+            x_sf=sf_buf,
+            output_dtype=torch.bfloat16,
+        )
+
+
+def test_megamoe_cutedsl_alpha_gate_rejects_non_one():
+    """``NVFP4MegaMoECuteDslMethod._check_v1_alpha_gate`` must reject any
+    checkpoint whose ``fc31_alpha`` / ``fc2_alpha`` / ``fc2_input_scale``
+    deviates from 1.0 within FP32 tolerance, because the ported kernel
+    hard-codes those values (see MEGAMOE_CUTEDSL_DESIGN.md "NVFP4 scale
+    and alpha ABI"). Once the kernel ABI is extended, this gate is
+    removed and the test should be updated to assert pass-through.
+    """
+    from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
+
+    class _StubModule:
+        # Mimic the minimal nn.Module surface the gate needs (Parameter-like).
+        class _Param:
+            def __init__(self, data):
+                self.data = data
+
+        def __init__(self, fc31_alpha, fc2_alpha, fc2_input_scale):
+            self.fc31_alpha = _StubModule._Param(fc31_alpha)
+            self.fc2_alpha = _StubModule._Param(fc2_alpha)
+            self.fc2_input_scale = _StubModule._Param(fc2_input_scale)
+
+    method = NVFP4MegaMoECuteDslMethod()
+
+    # All-ones must pass.
+    method._check_v1_alpha_gate(
+        _StubModule(
+            torch.ones(4, dtype=torch.float32),
+            torch.ones(4, dtype=torch.float32),
+            torch.tensor(1.0, dtype=torch.float32),
+        )
+    )
+
+    # One non-1 fc31_alpha entry must raise.
+    bad_fc31 = torch.ones(4, dtype=torch.float32)
+    bad_fc31[2] = 0.5
+    with pytest.raises(NotImplementedError, match="fc31_alpha"):
+        method._check_v1_alpha_gate(
+            _StubModule(
+                bad_fc31, torch.ones(4, dtype=torch.float32), torch.tensor(1.0, dtype=torch.float32)
+            )
+        )
+
+    # Non-1 fc2_input_scale must raise.
+    with pytest.raises(NotImplementedError, match="fc2_input_scale"):
+        method._check_v1_alpha_gate(
+            _StubModule(
+                torch.ones(4, dtype=torch.float32),
+                torch.ones(4, dtype=torch.float32),
+                torch.tensor(2.0, dtype=torch.float32),
+            )
+        )
+
+
+def test_megamoe_cutedsl_sf_byte_width_helper():
+    """``megamoe_activation_sf_bytes_per_row`` must match
+    ``round_up(ceil(hidden / 16), 4)`` so that backend SF staging and
+    ``quantize_input`` output match the kernel TMA load expectation
+    (``sf_uint32_per_token = ceil(hidden / 64)`` uint32 per row,
+    i.e. ``ceil(hidden / 64) * 4`` bytes). Hidden sizes that are 32-
+    aligned but not 64-aligned (1568, 1632, 2080) must round up by 2.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+        megamoe_activation_sf_bytes_per_row,
+    )
+
+    # Aligned-to-64 hidden sizes: row width == hidden // 16 exactly.
+    for hidden in (1024, 2048, 4096):
+        assert megamoe_activation_sf_bytes_per_row(hidden) == hidden // 16
+        assert megamoe_activation_sf_bytes_per_row(hidden) % 4 == 0
+
+    # 32-aligned-only hidden sizes: row width pads up by 2 bytes to the
+    # next multiple of 4 columns (one uint32 column covers 64 elements).
+    for hidden in (1568, 1632, 2080):
+        sf_cols = megamoe_activation_sf_bytes_per_row(hidden)
+        raw_cols = (hidden + 15) // 16
+        assert sf_cols == raw_cols + 2, (
+            f"hidden={hidden}: expected {raw_cols + 2} byte cols, got {sf_cols}"
+        )
+        assert sf_cols % 4 == 0
+        # And it must equal `ceil(hidden / 64) * 4` (kernel formula).
+        assert sf_cols == ((hidden + 63) // 64) * 4
+
+    # Sanity: non-positive or non-32-aligned hidden must raise.
+    with pytest.raises(ValueError):
+        megamoe_activation_sf_bytes_per_row(0)
+    with pytest.raises(ValueError):
+        megamoe_activation_sf_bytes_per_row(48)
+
+
+def test_megamoe_cutedsl_atomic_counter_in_candidates():
+    """Sweep ``load_balance_mode in {"static", "atomic_counter"}`` per
+    the design (``MegaMoECuteDsl tactic representation`` /
+    ``LoadBalanceMode`` enum). The previous v1 sweep only emitted
+    ``static`` tactics; ``atomic_counter`` is kernel-supported (see
+    ImplDesc.__post_init__ in fc1_fc2_fuse_sched.py) and was being
+    skipped by the autotuner.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+        enumerate_megamoe_candidate_tactics,
+    )
+
+    tactics = enumerate_megamoe_candidate_tactics()
+    modes = {t[4] for t in tactics}
+    assert "static" in modes, f"static load_balance_mode missing from candidates: {tactics!r}"
+    assert "atomic_counter" in modes, (
+        f"atomic_counter load_balance_mode missing from candidates: {tactics!r}"
+    )
+    # ``clc`` was intentionally excluded (routes through a different
+    # scheduler not wired through FC12 fused kernel here).
+    assert "clc" not in modes
+
+
+def test_megamoe_cutedsl_fc1_gate_up_interleave_byte_equivalence():
+    """Byte-equivalence check for ``_build_mega_format_weights`` FC1
+    gate/up 16-atom interleave.
+
+    Per MEGAMOE_CUTEDSL_DESIGN.md "FC1 gate/up interleave" and upstream
+    ``swiglu_fold_interleave_16`` in ``runner_fc12.py``, the kernel's
+    FC1 epilogue indexes the output column ``c`` as
+    ``gate_col = 2*(c//16)*16 + c%16``, ``up_col = (2*(c//16)+1)*16 + c%16``.
+    That means the storage layout along the ``expand_intermediate``
+    axis MUST be
+    ``[gate[0:16], up[0:16], gate[16:32], up[16:32], ...]``.
+
+    The parent ``w3_w1_weight`` stores ``[w3 | w1]`` cat'd along M;
+    ``up = w3 = w3_w1[:intermediate]``, ``gate = w1 = w3_w1[intermediate:]``.
+
+    This test fills the parent buffer with a deterministic byte pattern
+    that encodes (slot, M, K) so any wrong axis / wrong gate-vs-up
+    assignment / wrong stride shows up as a mismatch.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for tensor allocation")
+    _skip_if_no_megamoe_cutedsl_runtime()
+
+    from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
+
+    # Pick small shapes that exercise multiple gate/up pairs (n_pairs >= 2)
+    # and a non-trivial slot dimension. intermediate must be a multiple of 16.
+    num_local_slots = 2
+    hidden = 64  # h_bytes = 32 (NVFP4 packed); 4 SF cols per row at sf_vec=16
+    intermediate = 32  # n_pairs = 2
+    expand_intermediate = 2 * intermediate  # 64
+    h_bytes = hidden // 2
+
+    # Encode each byte as ``(slot+1) << 24 | (m+1) << 12 | (k+1) >> 4`` style
+    # — we just want every byte to be uniquely traceable. Use a numpy-style
+    # arange-based fill instead.
+    w3_w1 = torch.zeros(
+        (num_local_slots, expand_intermediate, h_bytes), dtype=torch.uint8, device="cuda"
+    )
+    for s in range(num_local_slots):
+        for m in range(expand_intermediate):
+            for k in range(h_bytes):
+                # 8 bits is too narrow for unique triplets at full shape,
+                # but for (2,64,32) we have 4096 cells and only 1 byte; we
+                # encode position modulo 251 (largest prime < 256) so
+                # collisions are extremely unlikely along the axes we slice.
+                w3_w1[s, m, k] = (s * 7919 + m * 251 + k * 19) & 0xFF
+
+    # Parent stores [w3 | w1]: w3 = up_part (first half along M), w1 = gate_part.
+    up_part_ref = w3_w1[:, :intermediate, :].clone()
+    gate_part_ref = w3_w1[:, intermediate:, :].clone()
+
+    # Minimal stub module that mimics the surface
+    # ``_build_mega_format_weights`` reads from.
+    mega_fc1_weight = torch.zeros(
+        (num_local_slots, expand_intermediate, h_bytes), dtype=torch.uint8, device="cuda"
+    )
+    mega_fc2_weight = torch.zeros(
+        (num_local_slots, hidden, intermediate // 2), dtype=torch.uint8, device="cuda"
+    )
+    # The SF arrays are exercised by other tests; fill with zeros and supply
+    # the helper a matching empty SF input via a smaller pattern.
+    w2_weight = torch.empty(
+        (num_local_slots, hidden, intermediate // 2), dtype=torch.uint8, device="cuda"
+    )
+    w2_weight.random_(0, 256)
+
+    # Build a minimal SF parent matching the expected shape (slots,
+    # expand_intermediate, hidden // 16) so the SF leg does not raise.
+    sf_cols = hidden // 16
+    w3_w1_sf = torch.zeros(
+        (num_local_slots, expand_intermediate, sf_cols),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_sf = torch.zeros(
+        (num_local_slots, hidden, intermediate // 16),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    # mega_fc1_weight_sf / mega_fc2_weight_sf live at the kernel-side
+    # ``round_up`` shape; pass an oversized destination so the SF copy
+    # path does not raise.
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        NVFP4MegaMoECuteDslMethod as _Method,
+    )
+
+    # ``mega_fc{1,2}_weight_sf`` are 2D ``(num_local_slots, flat_size)``
+    # parameters created by ``NVFP4MegaMoECuteDslMethod.create_weights``.
+    # The helpers return the per-slot flat size given (intermediate, hidden)
+    # / (hidden, intermediate); pass that exact layout here.
+    fc1_sf_dst = torch.zeros(
+        (num_local_slots, _Method.fc1_sf_flat_size(intermediate, hidden)),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    fc2_sf_dst = torch.zeros(
+        (num_local_slots, _Method.fc2_sf_flat_size(hidden, intermediate)),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    class _StubParam:
+        def __init__(self, data):
+            self.data = data
+
+    class _StubModule:
+        def __init__(self):
+            self.expert_size_per_partition = num_local_slots
+            self.intermediate_size_per_partition = intermediate
+            self.hidden_size = hidden
+            self.expand_intermediate_size_per_partition = expand_intermediate
+            self.w3_w1_weight = _StubParam(w3_w1)
+            self.w2_weight = _StubParam(w2_weight)
+            self.w3_w1_weight_scale = _StubParam(w3_w1_sf)
+            self.w2_weight_scale = _StubParam(w2_sf)
+            self.mega_fc1_weight = _StubParam(mega_fc1_weight)
+            self.mega_fc2_weight = _StubParam(mega_fc2_weight)
+            self.mega_fc1_weight_sf = _StubParam(fc1_sf_dst)
+            self.mega_fc2_weight_sf = _StubParam(fc2_sf_dst)
+
+    method = NVFP4MegaMoECuteDslMethod()
+    module = _StubModule()
+    method._build_mega_format_weights(module)
+    torch.cuda.synchronize()
+
+    # ============== FC1 byte-equivalence check ==============
+    # Reconstruct the expected layout from gate_part_ref / up_part_ref
+    # using the design's documented indexing:
+    #   mega[slot, 2*i*16 + j, :]     == gate_part[slot, i*16 + j, :]
+    #   mega[slot, (2*i+1)*16 + j, :] == up_part[slot, i*16 + j, :]
+    n_pairs = intermediate // 16
+    expected_fc1 = torch.empty_like(mega_fc1_weight)
+    for s in range(num_local_slots):
+        for i in range(n_pairs):
+            for j in range(16):
+                expected_fc1[s, 2 * i * 16 + j, :] = gate_part_ref[s, i * 16 + j, :]
+                expected_fc1[s, (2 * i + 1) * 16 + j, :] = up_part_ref[s, i * 16 + j, :]
+
+    assert torch.equal(mega_fc1_weight, expected_fc1), (
+        "mega_fc1_weight byte pattern does not match the "
+        "[gate[0:16], up[0:16], gate[16:32], ...] contract documented "
+        "in MEGAMOE_CUTEDSL_DESIGN.md 'FC1 gate/up interleave'. Either "
+        "the gate <-> up assignment is flipped (gate must be w1 = "
+        "w3_w1[intermediate:], up must be w3 = w3_w1[:intermediate]) "
+        "or the M-axis stride / chunking is wrong."
+    )
+
+    # ============== FC2 byte-equivalence check ==============
+    # FC2 is a byte-copy of w2_weight (the kernel boundary applies
+    # permute(0,2,1) on consumption; storage is preserved).
+    assert torch.equal(mega_fc2_weight, w2_weight), (
+        "mega_fc2_weight must be byte-equal to w2_weight (kernel does "
+        "the permute at consumption time, not at staging time)."
+    )
+
+
+def test_megamoe_deepgemm_quantize_input_zero_tokens():
+    """Regression test for the FusedCommMoEScheduler refactor that now
+    calls ``backend.quantize_input`` for zero-token chunks too. The DG
+    backend must return its DG-specific empty layout (FP8 + packed-UE8M0
+    int32 SF) so the scheduler stays layout-agnostic.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for backend instantiation")
+
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
+        MegaMoEDeepGemm as _DG,
+    )
+
+    # Build the backend without weights; we only exercise the empty path
+    # which short-circuits before the DG kernel is touched.
+    routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = 4
+    pretrained_config.hidden_size = 1024
+    pretrained_config.intermediate_size = 1024
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
+        skip_create_weights_in_init=True,
+    )
+
+    # The DG capability probe needs the bundled deep_gemm module. Skip if
+    # not available; the empty-path semantic is then unreachable here but
+    # documented behaviour is unaffected.
+    try:
+        backend = _DG(
+            routing_method=routing_method,
+            num_experts=4,
+            hidden_size=1024,
+            intermediate_size=1024,
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            init_load_balancer=False,
+        )
+    except Exception as e:
+        pytest.skip(f"MegaMoEDeepGemm cannot be instantiated on this host: {e}")
+
+    empty_x = torch.empty((0, 1024), dtype=torch.bfloat16, device="cuda")
+    x_fp8, x_sf = backend.quantize_input(empty_x)
+    assert x_fp8.shape[0] == 0
+    assert x_fp8.dtype == torch.float8_e4m3fn
+    assert x_sf.shape[0] == 0
+    assert x_sf.dtype == torch.int32
+    assert x_sf.shape[1] == 1024 // 128
