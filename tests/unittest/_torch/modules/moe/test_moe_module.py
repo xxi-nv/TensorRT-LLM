@@ -66,7 +66,6 @@ from _torch.modules.moe.moe_test_utils import (
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
@@ -724,29 +723,41 @@ def _test_moe_worker_impl(
 
 
 # ---------------------------------------------------------------------------
-# Module-scoped MPIPoolExecutor reuse (perf).
+# Shared MPIPoolExecutor reuse (perf).
 #
 # Creating/destroying an MPIPoolExecutor per test case re-spawns workers that
 # re-import tensorrt_llm and re-init CUDA/NCCL/comm (~20s/case, dwarfing the
 # ~2s of actual MoE compute). Reusing one executor for the whole module makes
-# that a one-time cost. The per-case communication method is applied per task
-# (in _moe_worker_entry) instead of being baked into worker init, so every case
-# still runs with exactly the TRTLLM_FORCE_COMM_METHOD it requested.
+# that a one-time cost. The multi-GPU cases run on the shared, module-scoped
+# ``mpi_pool_executor`` fixture from conftest (world_size=4 via indirect
+# parametrization), the same pool other multi-GPU tests use.
 #
-# The executor is provided through a module-scoped fixture. Its pool manager
-# thread is spawned lazily on first submit and persists by design, so the
-# multi-GPU tests disable pytest-threadleak via @pytest.mark.threadleak(
-# enabled=False) (same convention as the conftest mpi_pool_executor users
-# test_moe_a2a / test_autotuner), rather than excluding it in pytest.ini.
+# The conftest fixture is a plain MPIPoolExecutor with no initializer, so the
+# per-worker setup the old dedicated fixture did in its initializer (sys.path
+# alignment + MASTER_ADDR/PORT rendezvous env) is applied per task in
+# _moe_worker_entry via _apply_worker_setup (idempotent, so harmless on a
+# reused worker). The per-case communication method is likewise applied per
+# task so every case still runs with exactly the TRTLLM_FORCE_COMM_METHOD it
+# requested, and _reset_moe_comm_state runs after each case to match the
+# fresh-process semantics of a per-case executor.
+#
+# The pool manager thread is spawned lazily on first submit and persists by
+# design, so the multi-GPU tests disable pytest-threadleak via
+# @pytest.mark.threadleak(enabled=False) (same convention as the other conftest
+# mpi_pool_executor users test_moe_a2a / test_autotuner).
 # ---------------------------------------------------------------------------
 
 
-def _moe_init_worker(custom_paths, master_port):
-    # Align worker sys.path with the main process for submodule import.
+def _apply_worker_setup(custom_paths, master_port):
+    # The shared conftest ``mpi_pool_executor`` has no initializer, so the
+    # per-worker setup the previous dedicated pool did in its initializer is
+    # applied here per task. It is idempotent, so repeating it on a reused
+    # worker across cases is harmless.
+    # 1) Align worker sys.path with the main process for submodule import.
     for custom_path in custom_paths:
         if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
             sys.path.append(custom_path)
-    # Force the local loopback rendezvous: master_port is probed on 127.0.0.1
+    # 2) Force the local loopback rendezvous: master_port is probed on 127.0.0.1
     # (see _get_free_tcp_port), so MASTER_ADDR must match it and not an inherited
     # cluster hostname, otherwise the loopback-probed port may bind a different
     # interface. All workers share one node here, so loopback is always reachable.
@@ -782,7 +793,12 @@ def _reset_moe_comm_state():
         torch.cuda.empty_cache()
 
 
-def _moe_worker_entry(comm_method_type, *worker_args):
+def _moe_worker_entry(worker_setup, comm_method_type, *worker_args):
+    # ``worker_setup`` carries the per-worker environment (sys.path + rendezvous
+    # env) that the previous dedicated pool applied via its initializer; the
+    # shared conftest ``mpi_pool_executor`` has none, so apply it here per task.
+    custom_paths, master_port = worker_setup
+    _apply_worker_setup(custom_paths, master_port)
     # Per-task comm method: must be set per case (not baked into the reused
     # worker) so each case gets exactly the comm method it requested.
     # MegaMoEDeepGemm / MegaMoECuteDsl pass the IGNORE sentinel and own their
@@ -798,27 +814,24 @@ def _moe_worker_entry(comm_method_type, *worker_args):
 
 
 @pytest.fixture(scope="module")
-def moe_multi_gpu_executor():
-    """Module-scoped MPIPoolExecutor shared by all multi-GPU MoE cases.
+def moe_master_port():
+    """Stable loopback port for MegaMoE torch.distributed rendezvous.
 
-    Reused for the whole module so each case avoids re-spawning workers. The
-    pool's manager thread is spawned lazily on first submit and persists by
-    design, so the multi-GPU tests disable pytest-threadleak via
-    @pytest.mark.threadleak(enabled=False) (same convention as the other
-    mpi_pool_executor users, test_moe_a2a / test_autotuner). world_size is 4.
+    Computed once per module so every reused worker (and every case) uses the
+    same MASTER_PORT; torch.distributed is initialized lazily on the first
+    MegaMoE case and reused thereafter. The multi-GPU MoE cases run on the
+    shared module-scoped ``mpi_pool_executor`` (world_size=4) from conftest,
+    which persists across cases (hence @pytest.mark.threadleak(enabled=False),
+    same convention as the other mpi_pool_executor users test_moe_a2a /
+    test_autotuner). This preserves the per-module pool reuse (no per-case
+    worker re-spawn) that amortizes the ~20s worker/CUDA/comm init.
     """
-    world_size = 4
-    master_port = _get_free_tcp_port()
-    with MPIPoolExecutor(
-        initializer=_moe_init_worker,
-        initargs=(sys.path, master_port),
-        max_workers=world_size,
-    ) as executor:
-        yield executor
+    return _get_free_tcp_port()
 
 
 def _test_moe_multi_gpu(
     executor,
+    master_port,
     comm_method_type,
     moe_backend,
     quant_algo,
@@ -841,7 +854,8 @@ def _test_moe_multi_gpu(
     Test MoE module with multi-GPU support.
 
     Args:
-        executor: Shared module-scoped MPIPoolExecutor (see moe_multi_gpu_executor)
+        executor: Shared module-scoped MPIPoolExecutor (conftest ``mpi_pool_executor``)
+        master_port: Loopback port for MegaMoE torch.distributed rendezvous
         comm_method_type: Communication method type
         moe_backend: Backend type string
         quant_algo: Quantization algorithm
@@ -863,11 +877,13 @@ def _test_moe_multi_gpu(
 
     mapping = _create_mapping_for_parallel_mode(world_size, parallel_mode)
 
+    worker_setup = (sys.path, master_port)
     results = executor.map(
         _moe_worker_entry,
         *zip(
             *[
                 (
+                    worker_setup,
                     comm_method_type,
                     moe_backend,
                     dtype,
@@ -1698,6 +1714,7 @@ MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
     MULTI_GPU_TEST_PARAMS,
 )
 @pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 def test_configurable_moe_multi_gpu(
     parallel_mode,
     comm_method_type,
@@ -1710,7 +1727,8 @@ def test_configurable_moe_multi_gpu(
     swiglu_alpha,
     swiglu_beta,
     swiglu_limit,
-    moe_multi_gpu_executor,
+    mpi_pool_executor,
+    moe_master_port,
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
@@ -1744,9 +1762,10 @@ def test_configurable_moe_multi_gpu(
     ):
         dtype_routing_logits = torch.float32
 
-    world_size = 4
+    world_size = mpi_pool_executor.num_workers
     _test_moe_multi_gpu(
-        moe_multi_gpu_executor,
+        mpi_pool_executor,
+        moe_master_port,
         comm_method_type,
         moe_backend,
         quant_algo,
@@ -2104,6 +2123,7 @@ EPLB_TEST_PARAMS = (
     EPLB_TEST_PARAMS,
 )
 @pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 def test_configurable_moe_multi_gpu_eplb(
     parallel_mode,
     comm_method_type,
@@ -2113,7 +2133,8 @@ def test_configurable_moe_multi_gpu_eplb(
     model_config,
     num_slots,
     routing_method_cls,
-    moe_multi_gpu_executor,
+    mpi_pool_executor,
+    moe_master_port,
 ):
     skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
 
@@ -2124,9 +2145,10 @@ def test_configurable_moe_multi_gpu_eplb(
         dtype,
     )
 
-    world_size = 4
+    world_size = mpi_pool_executor.num_workers
     _test_moe_multi_gpu(
-        moe_multi_gpu_executor,
+        mpi_pool_executor,
+        moe_master_port,
         comm_method_type,
         moe_backend,
         quant_algo,
