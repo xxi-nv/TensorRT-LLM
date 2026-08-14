@@ -1,5 +1,6 @@
 from .configurable_moe import ConfigurableMoE
-from .create_moe import create_moe, resolve_moe_cls, resolve_moe_impl
+from .create_moe import (EXECUTION_UNIT_IMPL_CLASSES, MoEImplClass, create_moe,
+                         resolve_moe_cls, resolve_moe_impl)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -31,6 +32,7 @@ __all__ = [
     "ConfigurableMoE",
     "create_load_balanced_logits",
     "create_moe",
+    "EXECUTION_UNIT_IMPL_CLASSES",
     "CuteDslB12xFusedMoE",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",
@@ -46,6 +48,7 @@ __all__ = [
     "moe_load_balancer_set_repeated_for_next_layer",
     "MoE",
     "MoEImplBase",
+    "MoEImplClass",
     "MoeLoadBalancer",
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
