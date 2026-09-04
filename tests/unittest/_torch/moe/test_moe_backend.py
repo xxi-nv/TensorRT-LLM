@@ -59,6 +59,10 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
+    DeepgemmCudaCppFp8BlockScalesImpl,
+    DeepGemmFusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -69,13 +73,24 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoERejectReason,
     MoERunContext,
     MoEStaticCapability,
+    canonical_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
     collect_moe_environment,
     override_moe_environment,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
+    MOE_IMPL_REGISTRY,
+    MoEImplId,
+    MoEImplQuery,
+)
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,
+    MegaMoECuteDsl,
+    MegaMoEDeepGemm,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
@@ -516,6 +531,478 @@ def test_marlin_override_quant_config_degrades_per_layer():
 
 
 # ============================================================================
+# Canonical implementation identity
+# ============================================================================
+# DeepGemm is the first leaf to carry a MoEImplId, so these tests pin down the
+# mechanism the remaining backends reuse as they migrate: one identity per
+# class, the registry as the only map from identity to class, and a pinned
+# identity that fails hard exactly where a backend literal would have degraded.
+
+_DEEPGEMM_IMPL_ID = "deepgemm.cuda_cpp.grouped_gemm.fp8_block_scales"
+
+
+def _deepgemm_model_config(quant_algo=QuantAlgo.FP8_BLOCK_SCALES):
+    cfg = ModelConfig()
+    cfg.moe_backend = "DEEPGEMM"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def _deepgemm_environment(sm: int = 100) -> MoEEnvironment:
+    """DeepGemm's own SM window, so quantization stays the only variable."""
+    return MoEEnvironment(sm=sm)
+
+
+def test_deepgemm_identity_round_trips_through_registry():
+    identity = DeepgemmCudaCppFp8BlockScalesImpl.descriptor.identity
+    assert identity.canonical() == _DEEPGEMM_IMPL_ID
+    assert MoEImplId.parse(_DEEPGEMM_IMPL_ID) == identity
+    assert MOE_IMPL_REGISTRY.lookup(identity) is DeepgemmCudaCppFp8BlockScalesImpl
+
+
+def test_deepgemm_identity_quant_segment_matches_its_gate():
+    """The id segment and the algo ``can_implement`` accepts are one fact."""
+    identity = DeepgemmCudaCppFp8BlockScalesImpl.descriptor.identity
+    assert identity.quant == canonical_quant(QuantAlgo.FP8_BLOCK_SCALES).lower()
+
+
+def test_deepgemm_declares_its_contract_only_in_the_descriptor():
+    """One literal, so what the registry publishes is what the scheduler reads."""
+    impl = DeepgemmCudaCppFp8BlockScalesImpl
+    descriptor = impl.descriptor
+    assert impl.capabilities is descriptor.capabilities
+    assert impl.input_requirement is descriptor.input_requirement
+    assert impl.scheduler_kind is descriptor.scheduler_kind
+
+
+def test_pinned_deepgemm_identity_resolves_to_the_leaf():
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(_deepgemm_model_config(), impl_id=_DEEPGEMM_IMPL_ID)
+    assert impl_class_for(report) is DeepgemmCudaCppFp8BlockScalesImpl
+    assert report.selected_by == "pinned"
+    assert report.requested == _DEEPGEMM_IMPL_ID
+    assert not report.degraded
+
+
+def test_pinned_partial_identity_resolves_to_the_same_leaf():
+    """A partial identity is legal; IMPL_PRIORITY resolves among the matches."""
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(_deepgemm_model_config(), impl_id="deepgemm")
+    assert impl_class_for(report) is DeepgemmCudaCppFp8BlockScalesImpl
+    assert report.requested == "deepgemm.*.*.*"
+
+
+def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
+    """The two request tracks are meant to differ exactly here."""
+    config = _deepgemm_model_config(QuantAlgo.NVFP4)
+    with override_moe_environment(_deepgemm_environment()):
+        by_literal = resolve_moe_impl(config)
+        by_identity = resolve_moe_impl(config, impl_id=_DEEPGEMM_IMPL_ID)
+
+    assert impl_class_for(by_literal) is CutlassFusedMoE
+    assert by_literal.degraded
+
+    assert by_identity.winner is None
+    assert by_identity.selected_by == "failed"
+    assert [rejection.reason for rejection in by_identity.rejected] == [
+        MoERejectReason.QUANT_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(by_identity)
+
+
+def test_unknown_identity_token_raises_before_any_candidate_is_asked():
+    with override_moe_environment(_deepgemm_environment()):
+        with pytest.raises(ValueError, match="unknown MoE impl token"):
+            resolve_moe_impl(_deepgemm_model_config(), impl_id="nosuchprovider")
+
+
+def test_identity_matching_nothing_registered_raises():
+    """Built as a query rather than parsed, to get past the token vocabulary."""
+    with override_moe_environment(_deepgemm_environment()):
+        with pytest.raises(ValueError, match="matches no registered implementation"):
+            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="nvfp4"))
+
+
+def test_registration_leaves_the_backend_literal_path_unchanged():
+    """Registering an identity must not move which kernel AUTO / DEEPGEMM picks.
+
+    The class it lands on is the leaf, because that is the only constructible
+    half of the pair -- but it is the same kernel the literal always selected.
+    """
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(_deepgemm_model_config())
+    assert impl_class_for(report) is DeepgemmCudaCppFp8BlockScalesImpl
+    assert report.selected_by == "pinned"
+    assert report.requested == "DEEPGEMM"
+
+
+# ============================================================================
+# MegaMoE DeepGEMM implementation identity
+# ============================================================================
+# The same mechanism as the section above, on the second leaf to declare an
+# identity. Two things are new. ``deepgemm`` as a bare provider token now
+# matches two leaves, so the disambiguation is exercised rather than assumed.
+# And this leaf overrides ``cache_derived_state`` to allocate its SymmBuffer,
+# an override the GMS read-only reader must still reach.
+#
+# Problem and deployment are passed explicitly instead of being derived from a
+# ModelConfig: MegaMoE gates on SM, dtype, both TMA alignments, topology, and
+# an optional DeepGEMM build, and stating them here keeps quantization the only
+# variable across these tests.
+
+_MEGAMOE_DEEPGEMM_IMPL_ID = "deepgemm.cuda_cpp.mega_moe.w4a8_mxfp4_mxfp8"
+
+
+def _megamoe_problem(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8) -> MoEProblem:
+    """A problem MegaMoE's non-quant gates all accept."""
+    return MoEProblem(
+        quant=canonical_quant(quant_algo),
+        dtype_act=torch.bfloat16,
+        # Both widths are % 512 == 0, which is what the packed-UE8M0 SF rows
+        # need to stay TMA-aligned.
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=False,
+    )
+
+
+def _megamoe_deployment() -> MoEDeployment:
+    """EP-only single rank on SM100, with the DG mega kernel present."""
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=100, available_deps=(MoEDep.DEEPGEMM_MEGAMOE.value,)),
+    )
+
+
+def _megamoe_model_config() -> ModelConfig:
+    cfg = ModelConfig()
+    cfg.moe_backend = MoeBackendType.MEGAMOE_DEEPGEMM.value
+    return cfg
+
+
+def test_megamoe_deepgemm_identity_round_trips_through_registry():
+    identity = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.descriptor.identity
+    assert identity.canonical() == _MEGAMOE_DEEPGEMM_IMPL_ID
+    assert MoEImplId.parse(_MEGAMOE_DEEPGEMM_IMPL_ID) == identity
+    assert MOE_IMPL_REGISTRY.lookup(identity) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+
+
+def test_megamoe_deepgemm_identity_quant_segment_matches_its_gate():
+    """The id segment and the algo ``can_implement`` accepts are one fact."""
+    identity = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.descriptor.identity
+    assert identity.quant == canonical_quant(QuantAlgo.W4A8_MXFP4_MXFP8).lower()
+
+
+def test_megamoe_deepgemm_declares_its_contract_only_in_the_descriptor():
+    """One literal, so what the registry publishes is what the scheduler reads."""
+    impl = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    descriptor = impl.descriptor
+    assert impl.capabilities is descriptor.capabilities
+    assert impl.input_requirement is descriptor.input_requirement
+    assert impl.scheduler_kind is descriptor.scheduler_kind
+    # The kernel owns its own dispatch and combine, so this one is load-bearing:
+    # publishing EXTERNAL_COMM would have ConfigurableMoE layer host-side comm
+    # on top of the SymmBuffer.
+    assert descriptor.scheduler_kind is MoESchedulerKind.FUSED_COMM
+
+
+def test_pinned_megamoe_deepgemm_identity_resolves_to_the_leaf():
+    report = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=_megamoe_deployment(),
+        impl_id=_MEGAMOE_DEEPGEMM_IMPL_ID,
+    )
+    assert impl_class_for(report) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    assert report.selected_by == "pinned"
+    assert report.requested == _MEGAMOE_DEEPGEMM_IMPL_ID
+    assert not report.degraded
+
+
+def test_pinned_kernel_token_alone_reaches_the_megamoe_leaf():
+    """``mega_moe`` belongs to one leaf, so the kernel segment is enough."""
+    report = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=_megamoe_deployment(),
+        impl_id="mega_moe",
+    )
+    assert impl_class_for(report) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    assert report.requested == "*.*.mega_moe.*"
+
+
+def test_bare_deepgemm_provider_is_disambiguated_by_the_quant_gates():
+    """One provider token, two leaves, and the gates are what choose.
+
+    The mega leaf precedes the grouped-GEMM leaf in ``IMPL_PRIORITY``, so
+    priority order alone would send both requests below to the mega one. Their
+    ``quant`` segments are disjoint, which is why each lands on its own.
+    """
+    deployment = _megamoe_deployment()
+    mega = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=deployment,
+        impl_id="deepgemm",
+    )
+    grouped = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(QuantAlgo.FP8_BLOCK_SCALES),
+        deployment=deployment,
+        impl_id="deepgemm",
+    )
+
+    assert impl_class_for(mega) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    assert impl_class_for(grouped) is DeepgemmCudaCppFp8BlockScalesImpl
+    assert mega.requested == grouped.requested == "deepgemm.*.*.*"
+
+
+def test_pinned_megamoe_identity_fails_hard_where_the_backend_literal_degrades():
+    """The two request tracks are meant to differ exactly here."""
+    config = _megamoe_model_config()
+    problem = _megamoe_problem(QuantAlgo.NVFP4)
+    deployment = _megamoe_deployment()
+
+    by_literal = resolve_moe_impl(config, problem=problem, deployment=deployment)
+    by_identity = resolve_moe_impl(
+        config,
+        problem=problem,
+        deployment=deployment,
+        impl_id=_MEGAMOE_DEEPGEMM_IMPL_ID,
+    )
+
+    assert impl_class_for(by_literal) is CutlassFusedMoE
+    assert by_literal.degraded
+
+    assert by_identity.winner is None
+    assert by_identity.selected_by == "failed"
+    assert [rejection.reason for rejection in by_identity.rejected] == [
+        MoERejectReason.QUANT_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(by_identity)
+
+
+def test_registering_megamoe_leaves_the_backend_literal_path_unchanged():
+    """Registration must not move which kernel MEGAMOE_DEEPGEMM picks.
+
+    As above, the literal now lands on the leaf -- the constructible half --
+    running the same kernel it always did.
+    """
+    report = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=_megamoe_deployment(),
+    )
+    assert impl_class_for(report) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    assert report.selected_by == "pinned"
+    assert report.requested == MoeBackendType.MEGAMOE_DEEPGEMM.value
+
+
+def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
+    """The GMS read-only reader reaches the override through the wrapper.
+
+    ``ConfigurableMoE`` marks itself ``_weights_removed`` so the loader does not
+    run the wrapper's hooks on top of the backend's, which leaves the backend
+    reachable only as a registered submodule. Losing the override there is
+    silent -- the SymmBuffer simply never gets allocated and the failure
+    surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
+    not just the override in isolation.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
+    backend = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.__new__(DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend._alloc_symm_buffer = MagicMock()
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend._alloc_symm_buffer.assert_called_once_with()
+    backend.quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
+
+
+# ============================================================================
+# One class per identity
+# ============================================================================
+# Each DeepGEMM identity is declared on the class that executes it: one class
+# owns the descriptor and all four abstract methods. No abstract parent sits
+# above it, because there is nothing to share yet -- a parent carrying no
+# identity, implementing nothing, and having exactly one subclass would only
+# add a hop. The pre-identity names survive as module-level aliases, so both
+# request tracks and every legacy call site land on that one class and a run
+# reports one name. These are the checks that make that true rather than
+# intended.
+
+_LEGACY_ALIAS_PAIRS = (
+    pytest.param(DeepGemmFusedMoE, DeepgemmCudaCppFp8BlockScalesImpl, id="grouped_gemm"),
+    pytest.param(MegaMoEDeepGemm, DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl, id="mega_moe"),
+)
+
+_DEEPGEMM_IMPLS = (
+    pytest.param(DeepgemmCudaCppFp8BlockScalesImpl, id="grouped_gemm"),
+    pytest.param(DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl, id="mega_moe"),
+)
+
+_ABSTRACT_METHODS = ("can_implement", "_get_quant_method", "quantize_input", "run_moe")
+
+
+@pytest.mark.parametrize("legacy, impl", _LEGACY_ALIAS_PAIRS)
+def test_the_legacy_name_is_the_implementation_itself(legacy, impl):
+    """An alias, not a base class -- otherwise one kernel gets two identities.
+
+    Reintroducing a parent under the old name is the tempting way to keep the
+    legacy call sites working. It also splits the kernel into a name that
+    resolves and a name that does not, which is what ``is`` forbids here.
+    """
+    assert legacy is impl
+
+
+@pytest.mark.parametrize("impl", _DEEPGEMM_IMPLS)
+def test_the_identity_and_the_implementation_sit_on_one_class(impl):
+    """What is published and what executes are declared together, so neither drifts."""
+    assert "descriptor" in vars(impl)
+    for name in _ABSTRACT_METHODS:
+        assert name in vars(impl)
+    # Nothing left abstract: the class the tables name is the class that runs.
+    assert not impl.__abstractmethods__
+
+    # Taken off the class's own descriptor rather than restated beside it.
+    assert impl.scheduler_kind is impl.descriptor.scheduler_kind
+    assert impl.capabilities is impl.descriptor.capabilities
+    assert impl.input_requirement is impl.descriptor.input_requirement
+
+
+@pytest.mark.parametrize("impl", _DEEPGEMM_IMPLS)
+def test_the_registry_addresses_exactly_this_class(impl):
+    """The published identity resolves back to the class that declared it."""
+    registered = {MOE_IMPL_REGISTRY.lookup(ident) for ident in MOE_IMPL_REGISTRY.identities()}
+    assert impl in registered
+    assert MOE_IMPL_REGISTRY.lookup(impl.descriptor.identity) is impl
+
+
+def test_both_entrances_reach_the_same_class_under_one_name():
+    """The coarse literal and the pin agree on the class and on the report.
+
+    ``_legacy_backend_name`` still answers with ``__name__``, so this also
+    pins down that the reported name is the identity-derived one on both
+    tracks -- there is no second name a caller could see.
+    """
+    with override_moe_environment(_deepgemm_environment()):
+        by_literal = resolve_moe_impl(_deepgemm_model_config())
+        by_pin = resolve_moe_impl(_deepgemm_model_config(), impl_id=_DEEPGEMM_IMPL_ID)
+
+    assert impl_class_for(by_literal) is DeepgemmCudaCppFp8BlockScalesImpl
+    assert impl_class_for(by_pin) is impl_class_for(by_literal)
+    assert by_literal.winner == by_pin.winner == "DeepgemmCudaCppFp8BlockScalesImpl"
+
+
+@pytest.mark.parametrize("impl", _DEEPGEMM_IMPLS)
+def test_create_moe_backend_dispatches_the_impl(monkeypatch, impl):
+    """Resolution stops at the class; this is where that class gets built.
+
+    The dispatch chain in ``create_moe.py`` matches by ``issubclass``, and a
+    class that falls past every branch reaches the ``Unsupported moe backend``
+    raise at the tail. Resolution tests cannot catch that.
+    """
+    constructed = {}
+
+    def record_only(self, **kwargs):
+        constructed["cls"] = type(self)
+        torch.nn.Module.__init__(self)
+
+    monkeypatch.setattr(impl, "__init__", record_only)
+
+    backend = create_moe_backend(
+        moe_cls=impl,
+        routing_method=MagicMock(),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+
+    assert constructed["cls"] is impl
+    assert isinstance(backend, impl)
+
+
+# ============================================================================
+# Identity query parsing
+# ============================================================================
+# Two leaves are registered by the time these run, so the vocabulary spans two
+# kernel names and two quants -- enough for the parse to have something to get
+# wrong. A query locates each token's field by value, never by position, which
+# is what lets a user type the one token they remember instead of
+# reconstructing a four-field ID. Registration keeps the four fields' value
+# sets disjoint precisely so that lookup stays unambiguous.
+
+
+def test_identity_segments_may_be_written_in_any_order():
+    """A reversed ID is the same request, and still renders canonically."""
+    reversed_text = ".".join(reversed(_MEGAMOE_DEEPGEMM_IMPL_ID.split(".")))
+    assert reversed_text != _MEGAMOE_DEEPGEMM_IMPL_ID
+
+    canonical = MOE_IMPL_REGISTRY.parse_query(_MEGAMOE_DEEPGEMM_IMPL_ID)
+    assert MOE_IMPL_REGISTRY.parse_query(reversed_text) == canonical
+    # Rendering is canonical however it was typed, so a resolution report
+    # reads the same either way.
+    assert canonical.describe() == _MEGAMOE_DEEPGEMM_IMPL_ID
+
+
+def test_out_of_order_pin_resolves_to_the_same_leaf():
+    """Order-independence has to hold at the resolution entrance, not just the parse."""
+    report = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=_megamoe_deployment(),
+        impl_id="w4a8_mxfp4_mxfp8.mega_moe.cuda_cpp.deepgemm",
+    )
+    assert impl_class_for(report) is DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
+    assert report.selected_by == "pinned"
+    assert report.requested == _MEGAMOE_DEEPGEMM_IMPL_ID
+
+
+def test_two_values_for_one_field_is_rejected():
+    """Free order does not mean a field may be pinned twice.
+
+    With position no longer constraining anything, this check is the only
+    thing standing between a contradictory request and a silent win for
+    whichever token happened to be read last.
+    """
+    with pytest.raises(ValueError, match="sets field 'kernel_name' twice"):
+        MOE_IMPL_REGISTRY.parse_query("mega_moe.grouped_gemm")
+
+
+def test_more_segments_than_fields_is_rejected():
+    """Wildcards claim no field, so only the segment count bounds them."""
+    with pytest.raises(ValueError, match="more than the 4 fields"):
+        MOE_IMPL_REGISTRY.parse_query("deepgemm.*.*.*.*")
+
+
+def test_a_mistyped_token_is_answered_with_near_misses():
+    """The vocabulary grows one entry per leaf, so listing all of it would not scale."""
+    with pytest.raises(ValueError, match=r"Closest known values: \['mega_moe'\]"):
+        MOE_IMPL_REGISTRY.parse_query("mega_moo")
+
+
+# ============================================================================
 # TRTLLM-Gen SiTu backend contract
 # ============================================================================
 # SiTu rides the generic SwiGLU geometry, so the host-side wiring is easy to
@@ -862,7 +1349,7 @@ def test_megamoe_cache_derived_state_sets_initial_assignments_once():
 
 
 def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
-    moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    moe = DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl.__new__(DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl)
     torch.nn.Module.__init__(moe)
     quant_method = SimpleNamespace(cache_derived_state=MagicMock())
     moe.quant_method = quant_method
@@ -908,7 +1395,7 @@ def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
     monkeypatch.setattr(
         create_moe_module,
         "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
+        MagicMock(return_value=DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl),
     )
     activation = SiTuActivation(gate_softcap=4.0, linear_softcap=25.0)
 
@@ -970,11 +1457,13 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
         moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
+    # The check runs inside ``__init__``, before any distributed setup, so the
+    # rejection is reachable without a process group.
     with pytest.raises(
         ValueError,
         match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
     ):
-        MegaMoEDeepGemm(
+        DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl(
             routing_method=routing_method,
             num_experts=10,
             hidden_size=512,
