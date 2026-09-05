@@ -36,19 +36,6 @@ from .fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
-from .fused_moe_trtllm_gen import (
-    FlashinferTrtllmGenBf16Impl,
-    FlashinferTrtllmGenFp8BlockScalesImpl,
-    FlashinferTrtllmGenNvfp4Impl,
-    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
-    FlashinferTrtllmGenW4a16Mxfp4Impl,
-    TrtllmTrtllmGenFp8BlockScalesImpl,
-    TrtllmTrtllmGenNvfp4Impl,
-    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
-    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
-    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
-    TrtllmTrtllmGenW4a16Mxfp4Impl,
-)
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
 from .impl_contract import (
@@ -67,6 +54,19 @@ from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
 from .mega_moe import DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl
 from .moe_load_balancer import get_moe_load_balancer
+from .trtllm_gen import (
+    FlashinferTrtllmGenBf16Impl,
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenNvfp4Impl,
+    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    FlashinferTrtllmGenW4a16Mxfp4Impl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    TrtllmTrtllmGenW4a16Mxfp4Impl,
+)
 
 if TYPE_CHECKING:
     from .routing import BaseMoeRoutingMethod, RoutingMethodType

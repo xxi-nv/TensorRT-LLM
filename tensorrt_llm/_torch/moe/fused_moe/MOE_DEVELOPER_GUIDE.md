@@ -153,7 +153,7 @@ Still on old path (standalone, with embedded communication):
 | File | Backend | Hardware | Scenario | Scheduler |
 |------|---------|----------|----------|-----------|
 | `fused_moe_cutlass.py` | `CutlassFusedMoE` | SM80+ | High throughput, most comprehensive quant support | `EXTERNAL_COMM` |
-| `fused_moe_trtllm_gen.py` | eleven leaves under the abstract `TRTLLMGenFusedMoE` (see [The eleven TRTLLM-Gen leaves](#the-eleven-trtllm-gen-leaves)) | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer's `trtllm_bf16_moe` (gated on `MoEDep.FLASHINFER_BF16_MOE`, not on a quant algo) | `EXTERNAL_COMM` |
+| `fused_moe_trtllm_gen.py` + `trtllm_gen/` | the abstract `TRTLLMGenFusedMoE` and its eleven leaves (see [The eleven TRTLLM-Gen leaves](#the-eleven-trtllm-gen-leaves) and [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer's `trtllm_bf16_moe` (gated on `MoEDep.FLASHINFER_BF16_MOE`, not on a quant algo) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaCppFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103 | FP8 Block Scales on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
@@ -177,6 +177,32 @@ workspace so the executor invokes `checkpoint_prepare()` and
 do not add concrete strategy checks or inspect private workspace attributes.
 The executor request queue owns the persistent admission state around the
 checkpoint operation and reopens admission only after a complete wakeup.
+
+### TRTLLM-Gen leaves (`fused_moe/trtllm_gen/`)
+
+The abstract parent stays outside the package, in `fused_moe_trtllm_gen.py`:
+it owns construction, weight creation, the shared capability gates, and
+`trtllm_gen_leaf`, and it is what the rest of the tree means by "a TRTLLM-Gen
+MoE". Only what carries an identity, plus the two layers that exist solely to
+serve those, moved in here.
+
+| File | Role |
+|------|------|
+| `mixins.py` | `TrtllmProviderMixin` / `FlashinferProviderMixin` — the three constants that follow from `provider` alone |
+| `bases.py` | five per-quant abstract classes carrying `_get_quant_method` / `quantize_input` / `run_moe` for the formats that have two providers |
+| `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
+| `flashinfer_<quant>.py` | one registered FlashInfer leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `bf16` |
+
+One module per leaf, named `<provider>_<quant>` — the two identity segments
+that actually differ across the eleven. The technique and kernel segments are
+`trtllm_gen` / `fused_moe` for all of them, which the package name says once.
+The two native-only formats (`w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8`) have no entry
+in `bases.py` and subclass `TRTLLMGenFusedMoE` directly: a per-quant parent
+implementing three methods for exactly one subclass buys nothing.
+
+Importing the package is what registers the leaves, which `moe_resolution`
+guarantees for the resolution path; `trtllm_gen_leaf` imports it lazily so a
+caller that reached the parent module directly still gets a correct lookup.
 
 ### MegaMoE (`fused_moe/mega_moe/`)
 

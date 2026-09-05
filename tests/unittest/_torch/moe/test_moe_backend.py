@@ -66,8 +66,6 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
-    TrtllmTrtllmGenNvfp4Impl,
-    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
     trtllm_gen_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -107,6 +105,10 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
+)
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
 from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
