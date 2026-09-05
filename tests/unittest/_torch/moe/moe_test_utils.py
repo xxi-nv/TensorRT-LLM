@@ -26,15 +26,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import (
-    CuteDslFusedMoE,
-    CutlassFusedMoE,
-    MarlinFusedMoE,
-    TRTLLMGenFusedMoE,
-)
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFusedMoE, CutlassFusedMoE, MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import trtllm_gen_leaf
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -73,16 +69,25 @@ class MoeBackendType(str, Enum):
     MARLIN = "MARLIN"
 
 
-def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
+def get_backend_class(
+    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo] = None
+) -> Type[MoE]:
     """Get the MoE backend class for a given backend type.
 
     The two DeepGEMM entries use the identity-derived names rather than the
     ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` aliases, matching what resolution
     reports.
+
+    ``TRTLLM`` is not one class but eleven leaves keyed by (provider, quant), so
+    it needs ``quant_algo`` and returns the native-provider leaf for that
+    format. The FlashInfer siblings are opt-in and reached through resolution,
+    never by asking for "the TRTLLM backend".
     """
+    if backend_type is MoeBackendType.TRTLLM:
+        return trtllm_gen_leaf(quant_algo)
+
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
-        MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepgemmCudaCppFp8BlockScalesImpl,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
@@ -1183,7 +1188,13 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        backend_cls = get_backend_class(backend_type)
+        try:
+            backend_cls = get_backend_class(backend_type, quant_algo)
+        except ValueError as exc:
+            # No leaf publishes this (provider, quant) pair, which is the same
+            # verdict the single TRTLLM-Gen ``can_implement`` used to return as
+            # QUANT_UNSUPPORTED.
+            return str(exc)
         problem = MoEProblem(
             quant=canonical_quant(quant_algo),
             dtype_act=dtype,

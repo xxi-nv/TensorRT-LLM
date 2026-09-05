@@ -78,7 +78,7 @@ def _check_backend_can_implement(
     own explicit checks in :func:`is_candidate_valid` with better messages.
     """
     try:
-        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
+        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()), quant_algo)
     except (ImportError, KeyError, RuntimeError, ValueError) as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
     problem = MoEProblem(

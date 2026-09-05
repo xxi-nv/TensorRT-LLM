@@ -70,7 +70,12 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        output_dtype = torch.bfloat16 if self.moe_backend_cls == TRTLLMGenFusedMoE else torch.float32
+        # ``issubclass``, not ``==``: the TRTLLM-Gen kernels are reached through
+        # eleven registered leaves under ``TRTLLMGenFusedMoE``, so an equality
+        # check would silently hand them float32 routing scales where they read
+        # bfloat16.
+        output_dtype = (torch.bfloat16 if issubclass(
+            self.moe_backend_cls, TRTLLMGenFusedMoE) else torch.float32)
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
             return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k,
                                                     output_dtype=output_dtype)

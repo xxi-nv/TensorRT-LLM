@@ -64,7 +64,12 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepGemmFusedMoE,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
+    TRTLLMGenFusedMoE,
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    trtllm_gen_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -77,6 +82,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     MoEDep,
+    MoEEnvFlag,
     collect_moe_environment,
     override_moe_environment,
 )
@@ -212,7 +218,10 @@ def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
         "tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen.get_sm_version",
         MagicMock(side_effect=AssertionError("SM probe must be short-circuited")),
     )
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The MXFP8-activation leaf: it is the one ``try_fused_route_quant`` can
+    # fire on, so declining has to be shown on it and not on a leaf that would
+    # decline for its quantization format anyway.
+    backend = TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl)
     hidden_states = MxFp8QuantizedTensor(
         fp8_tensor=torch.empty(1, 3584, dtype=torch.float8_e4m3fn),
         scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
@@ -229,13 +238,10 @@ def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
     fp8_tensor = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
     scaling_factor = torch.empty(2, 2, dtype=torch.uint8)
     hidden_states = MxFp8QuantizedTensor(fp8_tensor, scaling_factor)
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The NVFP4 leaf owns this path by identity now, so there is no quant-mode
+    # mock to set up: which branch runs is which class was constructed.
+    backend = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
     backend._weights_created = True
-    quant_mode = MagicMock()
-    quant_mode.has_any_quant.return_value = True
-    quant_mode.has_w4a8_mxfp4_fp8.return_value = False
-    quant_mode.has_nvfp4.return_value = True
-    backend.quant_config = SimpleNamespace(layer_quant_mode=quant_mode)
 
     quantized, scales = backend.quantize_input(hidden_states)
 
@@ -290,7 +296,9 @@ def create_test_backend(
     n_shared_experts: int = 0,
 ) -> MoE:
     """Create a MoE backend for testing."""
-    backend_cls = get_backend_class(backend_type)
+    backend_cls = get_backend_class(
+        backend_type, None if quant_config is None else quant_config.quant_algo
+    )
 
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
@@ -618,10 +626,15 @@ def test_unknown_identity_token_raises_before_any_candidate_is_asked():
 
 
 def test_identity_matching_nothing_registered_raises():
-    """Built as a query rather than parsed, to get past the token vocabulary."""
+    """Built as a query rather than parsed, to get past the token vocabulary.
+
+    ``fp8`` rather than a format some leaf implements: plain per-tensor FP8 has
+    no registered MoE implementation, which is what makes the query match
+    nothing while still being well-formed.
+    """
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
-            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="nvfp4"))
+            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="fp8"))
 
 
 def test_registration_leaves_the_backend_literal_path_unchanged():
@@ -899,6 +912,178 @@ def test_the_registry_addresses_exactly_this_class(impl):
     assert MOE_IMPL_REGISTRY.lookup(impl.descriptor.identity) is impl
 
 
+# ---------------------------------------------------------------------------
+# TRTLLM-Gen: eleven identities under one abstract parent
+# ---------------------------------------------------------------------------
+
+# The full grid, written out rather than generated, so a leaf that silently
+# stops registering fails here instead of shrinking a computed expectation.
+# Six native leaves; the FlashInfer wheel serves five of the seven formats --
+# it has no fp8/fp4-activation runner, and it alone has the unquantized one.
+_TRTLLM_GEN_IDS = (
+    "trtllm.trtllm_gen.fused_moe.nvfp4",
+    "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
+    "trtllm.trtllm_gen.fused_moe.w4a16_mxfp4",
+    "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
+    "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
+    "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8",
+    "flashinfer.trtllm_gen.fused_moe.nvfp4",
+    "flashinfer.trtllm_gen.fused_moe.fp8_block_scales",
+    "flashinfer.trtllm_gen.fused_moe.w4a16_mxfp4",
+    "flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
+    "flashinfer.trtllm_gen.fused_moe.none",
+)
+
+
+def _trtllm_gen_environment(
+    *, sm: int = 100, flashinfer: bool = False, use_flashinfer_flag: bool = False
+) -> MoEEnvironment:
+    """An SM100 host, with the FlashInfer wheel and its opt-in flag optional."""
+    deps = []
+    if flashinfer:
+        deps = [MoEDep.FLASHINFER.value, MoEDep.FLASHINFER_BF16_MOE.value]
+    return MoEEnvironment(
+        sm=sm,
+        available_deps=tuple(sorted(deps)),
+        env_flags=(
+            (MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER.value, "1" if use_flashinfer_flag else "0"),
+        ),
+    )
+
+
+def _single_rank_deployment(env: MoEEnvironment) -> MoEDeployment:
+    """EP-only single rank, so the environment stays the only variable."""
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=env,
+    )
+
+
+def _trtllm_gen_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def test_trtllm_gen_registers_exactly_eleven_identities():
+    """The grid is the deliverable: eleven addressable ids, no more, no fewer."""
+    registered = sorted(
+        identity.canonical()
+        for identity in MOE_IMPL_REGISTRY.identities()
+        if identity.technique == "trtllm_gen"
+    )
+    assert registered == sorted(_TRTLLM_GEN_IDS)
+
+
+@pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
+def test_trtllm_gen_identity_round_trips_through_registry(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    assert impl is not None
+    # Declared on the leaf itself, not inherited from the parent: an inherited
+    # descriptor would give eleven classes one identity.
+    assert "descriptor" in vars(impl)
+    assert impl.descriptor.identity.canonical() == impl_id
+    assert not impl.__abstractmethods__
+    assert impl.capabilities is impl.descriptor.capabilities
+    assert impl.input_requirement is impl.descriptor.input_requirement
+
+
+@pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
+def test_trtllm_gen_leaf_provider_agrees_with_its_identity(impl_id):
+    """``provider`` is the op-backend key and the id segment, so it is one value."""
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    assert impl.provider == impl.descriptor.identity.provider
+    assert impl.use_flashinfer == (impl.provider == "flashinfer")
+    # The output buffer the all-to-all workspace hands over is filled by the
+    # native runners only, which is exactly the provider split.
+    assert impl.writes_moe_output_into_workspace == (impl.provider == "trtllm")
+
+
+@pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
+def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id):
+    """Two leaves differing only in provider still admit one format each."""
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    quant = impl.descriptor.identity.quant
+    other = "nvfp4" if quant != "nvfp4" else "w4a16_mxfp4"
+    verdict = impl.can_implement(
+        MoEProblem(quant=other.upper(), dtype_act=torch.bfloat16),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+def test_trtllm_gen_parent_is_abstract_and_unaddressable():
+    """The name survives for ``issubclass``; it is not an implementation.
+
+    Both halves matter. No descriptor means the registry cannot hand the
+    parent to anyone, and no method bodies mean nothing could run if it did.
+    """
+    assert "descriptor" not in vars(TRTLLMGenFusedMoE)
+    assert TRTLLMGenFusedMoE not in {
+        MOE_IMPL_REGISTRY.lookup(ident) for ident in MOE_IMPL_REGISTRY.identities()
+    }
+    for name in _ABSTRACT_METHODS:
+        assert name not in vars(TRTLLMGenFusedMoE)
+
+
+def test_every_trtllm_gen_leaf_descends_from_the_surviving_name():
+    """What the ``issubclass`` dispatch in create_moe.py depends on."""
+    for impl_id in _TRTLLM_GEN_IDS:
+        impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+        assert issubclass(impl, TRTLLMGenFusedMoE)
+
+
+def test_trtllm_literal_picks_the_native_leaf_without_the_opt_in_flag():
+    """The default provider must not move just because FlashInfer is installed."""
+    with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
+        report = resolve_moe_impl(_trtllm_gen_model_config())
+    assert impl_class_for(report) is TrtllmTrtllmGenNvfp4Impl
+
+
+def test_trtllm_literal_moves_to_flashinfer_under_the_opt_in_flag():
+    """The old ``_check_flashinfer_backend_support`` switch, now in selection."""
+    with override_moe_environment(
+        _trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)
+    ):
+        report = resolve_moe_impl(_trtllm_gen_model_config())
+    assert impl_class_for(report).provider == "flashinfer"
+
+
+def test_pinned_flashinfer_leaf_is_turned_down_when_not_opted_in():
+    """A pin fails hard, and says it was a policy call rather than a capability."""
+    with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
+        report = resolve_moe_impl(
+            _trtllm_gen_model_config(), impl_id="flashinfer.trtllm_gen.fused_moe.nvfp4"
+        )
+    assert report.winner is None
+    assert [rejection.reason for rejection in report.rejected] == [MoERejectReason.PATH_NOT_ENABLED]
+
+
+def test_flashinfer_leaves_report_dep_missing_without_the_wheel():
+    """On a host with no FlashInfer, every FlashInfer leaf declines for that reason."""
+    deployment = _single_rank_deployment(_trtllm_gen_environment(use_flashinfer_flag=True))
+    for impl_id in _TRTLLM_GEN_IDS:
+        impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+        if impl.provider != "flashinfer":
+            continue
+        quant = impl.descriptor.identity.quant
+        verdict = impl.can_implement(
+            MoEProblem(
+                quant=None if quant == "none" else quant.upper(),
+                dtype_act=torch.bfloat16,
+            ),
+            deployment,
+        )
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+
+
 def test_both_entrances_reach_the_same_class_under_one_name():
     """The coarse literal and the pin agree on the class and on the report.
 
@@ -1045,7 +1230,11 @@ def _make_trtllm_gen_moe(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
     )
-    return TRTLLMGenFusedMoE(
+    # The leaf for this checkpoint's format. ``TRTLLMGenFusedMoE`` itself is
+    # abstract now, so the class has to come from the quantization the caller
+    # asked for.
+    leaf_cls = trtllm_gen_leaf(None if quant_config is None else quant_config.quant_algo)
+    return leaf_cls(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -1161,7 +1350,6 @@ def test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale() -> None:
     "quant_algo",
     [
         pytest.param(None, id="unquantized"),
-        pytest.param(QuantAlgo.FP8, id="fp8"),
         pytest.param(QuantAlgo.W4A16_MXFP4, id="w4a16_mxfp4"),
     ],
 )
@@ -1172,6 +1360,10 @@ def test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins(quant_algo) ->
     W4A8_MXFP4_MXFP8 (group-32) cubin families. Anything else has to be
     rejected at construction rather than silently resolving to SwiGLU, which
     is structurally wrong output that no shape check would catch.
+
+    Formats with no TRTLLM-Gen leaf at all (QuantAlgo.FP8, say) are no longer
+    part of this: since the split there is no class to construct for them, so
+    they are turned down by the registry lookup rather than by this check.
     """
     with pytest.raises(ValueError, match="requires one of .* quantization"):
         _make_trtllm_gen_moe(quant_config=QuantConfig(quant_algo=quant_algo), situ=True)

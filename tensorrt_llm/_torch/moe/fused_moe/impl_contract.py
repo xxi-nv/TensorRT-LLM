@@ -207,6 +207,18 @@ class MoEEnvironment:
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
 
+    def env_flag(self, name: str) -> Optional[str]:
+        """Value of a collected environment flag, or ``None`` if not collected.
+
+        The pairs are stored as a tuple so the structure stays hashable and the
+        fingerprint stays stable; this reader exists so a ``can_implement`` can
+        ask for one flag by name instead of reaching for ``os.environ``.
+        """
+        for flag, value in self.env_flags:
+            if flag == name:
+                return value
+        return None
+
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""
         payload = repr((self.sm, sorted(self.available_deps), self.env_flags))

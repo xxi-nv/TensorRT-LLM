@@ -128,7 +128,11 @@ def create_moe_backend(
             f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    # ``issubclass`` rather than ``==``: ``TRTLLMGenFusedMoE`` is the abstract
+    # parent of the eleven registered TRTLLM-Gen leaves, and it is those leaves
+    # that resolution hands over. An equality check would miss every one of them
+    # and fall through to the "Unsupported moe backend" raise below.
+    if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,

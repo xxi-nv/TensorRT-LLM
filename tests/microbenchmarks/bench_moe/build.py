@@ -47,29 +47,25 @@ from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
 
-# Map concrete MoE module class names to short backend identifiers used in
-# results and the dashboard. Anything not in this table falls back to the
-# upper-case class name.
-_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
-    "CutlassFusedMoE": "CUTLASS",
-    "TRTLLMGenFusedMoE": "TRTLLM",
-    "CuteDslFusedMoE": "CUTEDSL",
-    "DeepgemmCudaCppFp8BlockScalesImpl": "DEEPGEMM",
-    "DenseGEMMFusedMoE": "DENSEGEMM",
-    "DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl": "MEGAMOE_DEEPGEMM",
-    "MegaMoECuteDsl": "MEGAMOE_CUTEDSL",
-    "VanillaMoE": "VANILLA",
-}
-
 
 def _backend_name_from_module(moe) -> str:
-    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
+    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules.
+
+    Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
+    a backend that gains or splits classes stays labelled without an edit
+    here. A hand-written class-name table used to do this and went stale the
+    moment TRTLLM-Gen became eleven classes.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
+
     backend_attr = getattr(moe, "backend", None)
-    if backend_attr is not None and backend_attr is not moe:
-        backend_cls = type(backend_attr).__name__
-    else:
-        backend_cls = type(moe).__name__
-    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
+    backend_cls = (
+        type(backend_attr) if backend_attr is not None and backend_attr is not moe else type(moe)
+    )
+    for name, family in BACKEND_FAMILY.items():
+        if backend_cls in family:
+            return name
+    return backend_cls.__name__.upper()
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:

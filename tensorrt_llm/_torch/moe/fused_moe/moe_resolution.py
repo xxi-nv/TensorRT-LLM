@@ -36,7 +36,19 @@ from .fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
-from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from .fused_moe_trtllm_gen import (
+    FlashinferTrtllmGenBf16Impl,
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenNvfp4Impl,
+    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    FlashinferTrtllmGenW4a16Mxfp4Impl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    TrtllmTrtllmGenW4a16Mxfp4Impl,
+)
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
 from .impl_contract import (
@@ -85,7 +97,27 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
-    TRTLLMGenFusedMoE,
+    # The eleven TRTLLM-Gen leaves. FlashInfer ahead of the native leaf for the
+    # same format on purpose: that reproduces what
+    # ``_check_flashinfer_backend_support`` did, which was to switch a
+    # constructed layer over to FlashInfer whenever the opt-in flag was set and
+    # the wheel could serve the shape. The flag now lives in
+    # ``check_flashinfer_provider``, so with it unset every FlashInfer leaf
+    # rejects and resolution walks on to the native one below.
+    #
+    # Ordering within a provider does not matter: the ``quant`` segments are
+    # disjoint, so at most one leaf per provider can admit a given problem.
+    FlashinferTrtllmGenNvfp4Impl,
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenW4a16Mxfp4Impl,
+    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    FlashinferTrtllmGenBf16Impl,  # no native counterpart; flag-independent
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenW4a16Mxfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
     DeepgemmCudaCppFp8BlockScalesImpl,
     DenseGEMMFusedMoE,
     MarlinFusedMoE,
@@ -104,7 +136,24 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
     "DEEPGEMM": frozenset({DeepgemmCudaCppFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
-    "TRTLLM": frozenset({TRTLLMGenFusedMoE}),
+    # The coarse literal still names the whole family, so ``moe_backend:
+    # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and IMPL_PRIORITY picks
+    # which. A pinned ``impl_id`` names exactly one of the eleven.
+    "TRTLLM": frozenset(
+        {
+            FlashinferTrtllmGenNvfp4Impl,
+            FlashinferTrtllmGenFp8BlockScalesImpl,
+            FlashinferTrtllmGenW4a16Mxfp4Impl,
+            FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+            FlashinferTrtllmGenBf16Impl,
+            TrtllmTrtllmGenNvfp4Impl,
+            TrtllmTrtllmGenFp8BlockScalesImpl,
+            TrtllmTrtllmGenW4a16Mxfp4Impl,
+            TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+            TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+            TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+        }
+    ),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl}),
     "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
