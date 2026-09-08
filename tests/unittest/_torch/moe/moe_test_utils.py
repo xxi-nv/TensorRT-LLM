@@ -26,18 +26,25 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import (
-    CuteDslFusedMoE,
-    CutlassFusedMoE,
-    MarlinFusedMoE,
-    TRTLLMGenFusedMoE,
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFusedMoE, CutlassFusedMoE, MarlinFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    SimpleActivation,
+    SiTuActivation,
+    SwigluActivation,
+    SwigluBiasActivation,
+    activation_constant_names,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
+    find_trtllm_gen_leaf,
+    trtllm_gen_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
+    canonical_activation,
     canonical_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
@@ -70,11 +77,44 @@ class MoeBackendType(str, Enum):
     MARLIN = "MARLIN"
 
 
-def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
-    """Get the MoE backend class for a given backend type."""
+def get_backend_class(
+    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo] = None
+) -> Type[MoE]:
+    """Get the MoE backend class for a given backend type.
+
+    Raises when TRTLLM-Gen publishes no leaf for the format. Callers enumerating
+    combinations to decide what is worth running want ``find_backend_class``.
+    """
+    backend_class = find_backend_class(backend_type, quant_algo)
+    if backend_class is None:
+        # Reuse the raising lookup for its message, which lists what *is*
+        # registered rather than only naming what is missing.
+        return trtllm_gen_leaf(quant_algo)
+    return backend_class
+
+
+def find_backend_class(
+    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo] = None
+) -> Optional[Type[MoE]]:
+    """The MoE backend class, or ``None`` if TRTLLM-Gen has no leaf for the format.
+
+    ``TRTLLM`` is not one class but eleven leaves keyed by (provider, quant), so
+    it needs ``quant_algo``. It prefers the native leaf for that format and
+    falls back to the FlashInfer sibling, which is what "the TRTLLM backend"
+    has to mean for the unquantized format: bf16 has no native leaf, only
+    ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
+    exists and wins, so only bf16 tests are exercising a FlashInfer class.
+
+    Absence is returned rather than raised so that a parameter generator can
+    tell it apart from a real failure: catching the exception instead would let
+    a leaf that got unregistered read as a combination nobody meant to run, and
+    the sweep would go green by shrinking.
+    """
+    if backend_type is MoeBackendType.TRTLLM:
+        return find_trtllm_gen_leaf(quant_algo)
+
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
-        MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
@@ -1157,6 +1197,40 @@ def supports_autotuner_capture(
     return True
 
 
+def build_test_activation(
+    activation_type: ActivationType,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+) -> "SimpleActivation | SwigluActivation | SwigluBiasActivation | SiTuActivation":
+    """Package the flat parameters these tests parametrize over as one activation.
+
+    The tests still sweep alpha / beta / limit independently because that is
+    what ``quantize_util.get_swiglu_tensors`` produces for the reference
+    implementation. Presence of alpha or beta means the gpt-oss package, which
+    is the same rule the C++ op applied when it upgraded a bare ``Swiglu`` with
+    constants to ``SwigluBias``.
+
+    Lives here rather than next to the tests that build MoE layers with it
+    because the skip-reason helper below has to package the same sweep the same
+    way: selection reads *which* constants an activation carries, so a second
+    spelling of this rule would let a case be admitted by the parameter
+    generator and rejected by the layer, or the reverse.
+    """
+    kind = ActivationType(activation_type)
+    if kind is ActivationType.SiTu:
+        return SiTuActivation(gate_softcap=swiglu_alpha, linear_softcap=swiglu_beta)
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        return SwigluBiasActivation(
+            gate_sigmoid_scale=swiglu_alpha,
+            linear_offset=swiglu_beta,
+            clamp=swiglu_limit,
+        )
+    if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
+        return SwigluActivation(clamp=swiglu_limit)
+    return SimpleActivation(kind=kind)
+
+
 def get_quick_skip_reason(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -1175,7 +1249,28 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        backend_cls = get_backend_class(backend_type)
+        backend_cls = find_backend_class(backend_type, quant_algo)
+        if backend_cls is None:
+            # No leaf publishes this (provider, quant) pair, which is the same
+            # verdict the single TRTLLM-Gen ``can_implement`` used to return as
+            # QUANT_UNSUPPORTED. Asked as a query, so any other failure in the
+            # lookup still raises instead of being reported as a skip.
+            return f"no TRTLLM-Gen implementation for quant={canonical_quant(quant_algo) or 'none'}"
+        # Eligibility reads *which* constants an activation carries, not just
+        # its kind: a backend declaring ``limit=UNSUPPORTED`` serves unclamped
+        # SwiGLU and rejects clamped SwiGLU, and both are
+        # ``ActivationType.Swiglu``. Omit this and the problem claims no
+        # constants, admitting cases the layer then refuses.
+        #
+        # Only presence is read, so the values are stand-ins rather than the
+        # case's real constants -- which this helper is not given, and does not
+        # need: ``swiglu_gptoss_style`` is the caller's own summary of "alpha /
+        # beta / limit differ from the SwiGLU defaults" and gates all three
+        # together, so the package is either whole or absent. Routed through
+        # ``build_test_activation`` anyway so the mapping from that sweep to a
+        # carrier stays the one the tests build layers with.
+        present = 1.0 if swiglu_gptoss_style else None
+        activation = build_test_activation(ActivationType.Swiglu, present, present, present)
         problem = MoEProblem(
             quant=canonical_quant(quant_algo),
             dtype_act=dtype,
@@ -1185,6 +1280,8 @@ def get_quick_skip_reason(
             top_k=None if model_config is None else model_config.top_k,
             swiglu_gptoss_style=swiglu_gptoss_style,
             bias=swiglu_gptoss_style,
+            activation=canonical_activation(ActivationType.Swiglu),
+            activation_constants=activation_constant_names(activation),
         )
         # Multi-rank constraints are checked by the helpers below.
         deployment = MoEDeployment(

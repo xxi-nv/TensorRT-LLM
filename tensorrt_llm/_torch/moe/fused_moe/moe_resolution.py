@@ -36,7 +36,6 @@ from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
-from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
 from .impl_contract import (
@@ -55,6 +54,19 @@ from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
 from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl
 from .moe_load_balancer import get_moe_load_balancer
+from .trtllm_gen import (
+    FlashinferTrtllmGenBf16Impl,
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenNvfp4Impl,
+    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    FlashinferTrtllmGenW4a16Mxfp4Impl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    TrtllmTrtllmGenW4a16Mxfp4Impl,
+)
 
 if TYPE_CHECKING:
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
@@ -85,7 +97,27 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
-    TRTLLMGenFusedMoE,
+    # The eleven TRTLLM-Gen leaves. FlashInfer ahead of the native leaf for the
+    # same format on purpose: that reproduces what
+    # ``_check_flashinfer_backend_support`` did, which was to switch a
+    # constructed layer over to FlashInfer whenever the opt-in flag was set and
+    # the wheel could serve the shape. The flag now lives in
+    # ``check_flashinfer_provider``, so with it unset every FlashInfer leaf
+    # rejects and resolution walks on to the native one below.
+    #
+    # Ordering within a provider does not matter: the ``quant`` segments are
+    # disjoint, so at most one leaf per provider can admit a given problem.
+    FlashinferTrtllmGenNvfp4Impl,
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenW4a16Mxfp4Impl,
+    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    FlashinferTrtllmGenBf16Impl,  # no native counterpart; flag-independent
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenW4a16Mxfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
     DeepgemmCudaFp8BlockScalesImpl,
     DenseGEMMFusedMoE,
     MarlinFusedMoE,
@@ -104,7 +136,24 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
-    "TRTLLM": frozenset({TRTLLMGenFusedMoE}),
+    # The coarse literal still names the whole family, so ``moe_backend:
+    # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and IMPL_PRIORITY picks
+    # which. A pinned ``impl_id`` names exactly one of the eleven.
+    "TRTLLM": frozenset(
+        {
+            FlashinferTrtllmGenNvfp4Impl,
+            FlashinferTrtllmGenFp8BlockScalesImpl,
+            FlashinferTrtllmGenW4a16Mxfp4Impl,
+            FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
+            FlashinferTrtllmGenBf16Impl,
+            TrtllmTrtllmGenNvfp4Impl,
+            TrtllmTrtllmGenFp8BlockScalesImpl,
+            TrtllmTrtllmGenW4a16Mxfp4Impl,
+            TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+            TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+            TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+        }
+    ),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaW4a8Mxfp4Mxfp8Impl}),
     "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
@@ -117,6 +166,20 @@ if _UNRANKED:
         f"MoE impls named by BACKEND_FAMILY but absent from IMPL_PRIORITY: "
         f"{sorted(cls.__name__ for cls in _UNRANKED)}"
     )
+
+
+def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
+    """The ``moe_backend`` literal whose family contains ``impl_cls``.
+
+    The families above are disjoint, so at most one name matches. ``None``
+    means the class is reachable only through a pinned identity, never through
+    the coarse literal.
+    """
+    for name, family in BACKEND_FAMILY.items():
+        if impl_cls in family:
+            return name
+    return None
+
 
 # Widest coverage; default degradation target.
 FALLBACK_IMPL: MoEImplClass = CutlassFusedMoE
@@ -341,6 +404,34 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if FALLBACK_IMPL not in family and normalized not in NO_FALLBACK_BACKENDS:
         candidates.append(FALLBACK_IMPL)
     return candidates
+
+
+def family_yields_impl_backend(backend: str) -> Optional[bool]:
+    """Whether every candidate for ``backend`` is an execution unit.
+
+    ``create_moe`` must choose between wrapping in ``ConfigurableMoE`` and
+    returning a complete layer, and it makes that choice before this layer's
+    final quantization is known -- the wrapper resolves the leaf later, from
+    ``create_weights``. Derived from the same candidate list resolution walks
+    so the two cannot disagree:
+
+    - ``True``: every candidate is a ``MoEImplBase``, so the layer is a wrapper
+      around a backend whatever format this layer ends up with.
+    - ``False``: no candidate is, so the layer is complete whatever the format.
+    - ``None``: the family mixes both, so only resolution can say. ``TRITON``
+      is the one such family today (``TritonFusedMoE`` plus the Cutlass
+      fallback), and its caller keeps resolving eagerly.
+
+    Raises the same ValueError ``_candidates_for`` does for an unknown or
+    deprecated literal, which is where that check belongs: a caller asking
+    this question has not resolved yet and would otherwise learn much later.
+    """
+    is_impl = [issubclass(impl_cls, MoEImplBase) for impl_cls in _candidates_for(backend)]
+    if all(is_impl):
+        return True
+    if not any(is_impl):
+        return False
+    return None
 
 
 def _coerce_impl_query(impl_id: Union[str, MoEImplId, MoEImplQuery]) -> MoEImplQuery:

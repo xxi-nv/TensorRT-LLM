@@ -5448,8 +5448,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                            intermediate_size_per_partition: int):
         """The alignments create_weights will select for this shape.
 
-        Exposed as a classmethod because TRTLLMGenFusedMoE validates its
-        MoE-TP shard from __init__, i.e. before create_weights has run and
+        Exposed as a classmethod because TRTLLMGenNvfp4Base validates its
+        SiTu MoE-TP shard from __init__, i.e. before create_weights has run and
         shadowed the class attributes with instance ones. Reading the class
         attributes from there would validate against the unresolved default
         (32) and admit shards this method cannot lay out.

@@ -172,7 +172,7 @@ class _StopBlockInit(Exception):
 
 
 def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_config_dict=None):
-    """Run sparse-MoE initialization through its ``create_moe`` call.
+    """Run sparse-MoE initialization up to the MoE implementation it resolves.
 
     ``sm`` is declared, not probed. Which implementation wins is a function of
     the machine, so pinning an expected class while the environment comes from
@@ -215,25 +215,33 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
     # function. Both forms below resolve the submodule through sys.modules.
     from tensorrt_llm._torch.moe.fused_moe.create_moe import resolve_moe_cls as real_resolve_moe_cls
 
-    # Observe the resolution create_moe actually performs instead of
-    # reproducing its argument list here: a copy drifts, and a copy that omits
-    # e.g. swiglu_gptoss_style resolves to a different class than the layer
-    # will be built with, which the assertions below would not catch.
+    # Observe the resolution the layer actually performs instead of reproducing
+    # its argument list here: a copy drifts, and a copy that omits e.g.
+    # swiglu_gptoss_style resolves to a different class than the layer will be
+    # built with, which the assertions below would not catch.
     def _capture(model_config, **kwargs):
         captured["moe_backend"] = model_config.moe_backend
         captured["override"] = kwargs.get("override_quant_config")
         captured["moe_cls"] = real_resolve_moe_cls(model_config, **kwargs).__name__
         raise _StopBlockInit
 
-    with (
-        override_moe_environment(MoEEnvironment(sm=sm)),
-        patch(
-            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
-            _capture,
-        ),
-        pytest.raises(_StopBlockInit),
-    ):
-        Qwen3NextSparseMoeBlock(model_config, aux_stream=None, layer_idx=layer_idx)
+    # Two phases because the resolution moved: ``create_moe`` no longer picks
+    # the implementation class -- ``ConfigurableMoE`` does, from
+    # ``create_weights``, once layerwise quantization has settled this layer's
+    # format. Constructing under the patch would abort before there is a layer
+    # to ask, so the patch goes on the second phase alone. Both run inside the
+    # declared environment: the block consults it when it rewrites the backend
+    # request for an excluded layer.
+    with override_moe_environment(MoEEnvironment(sm=sm)):
+        block = Qwen3NextSparseMoeBlock(model_config, aux_stream=None, layer_idx=layer_idx)
+        with (
+            patch(
+                "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
+                _capture,
+            ),
+            pytest.raises(_StopBlockInit),
+        ):
+            block.experts.create_weights()
     return captured
 
 
@@ -270,7 +278,7 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     "backend,sm,quant_algo,expected_moe_cls",
     [
         ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "CutlassFusedMoE"),
-        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TRTLLMGenFusedMoE"),
+        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TrtllmTrtllmGenFp8BlockScalesImpl"),
         ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaFp8BlockScalesImpl"),
         ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),
     ],

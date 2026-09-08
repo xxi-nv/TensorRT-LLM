@@ -1071,8 +1071,7 @@ class Deepseekv3MoE(nn.Module):
         if self.use_dp:
             # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
-        elif hasattr(self.experts, 'num_fused_shared_expert'
-                     ) and self.experts.num_fused_shared_expert > 0:
+        elif self._experts_will_fuse_shared():
             shared_tp_size = self.mapping.moe_tp_size
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
@@ -1086,6 +1085,24 @@ class Deepseekv3MoE(nn.Module):
                 shared_output_scale = shared_tp_size / self.mapping.tp_size
 
         return shared_tp_size, shared_output_scale
+
+    def _experts_will_fuse_shared(self) -> bool:
+        """Whether the routed experts will absorb the shared experts.
+
+        Asked while this module is still being built, so it cannot be read off
+        an allocated backend: ``ConfigurableMoE`` binds its backend -- and with
+        it the fused count -- in ``create_weights``, whereas the answer is
+        needed here to size the ``GatedMLP`` constructed a few lines later.
+        ``will_fuse_shared_expert`` is the pre-binding form of the same rule.
+
+        ``getattr`` because ``self.experts`` need not be a ``ConfigurableMoE``:
+        the unwrapped layers (``TritonFusedMoE``, ``VanillaMoE``) have no fused
+        path at all, and neither predicate exists on them.
+        """
+        predict = getattr(self.experts, "will_fuse_shared_expert", None)
+        if predict is not None:
+            return predict()
+        return getattr(self.experts, "num_fused_shared_expert", 0) > 0
 
     @staticmethod
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:

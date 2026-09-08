@@ -13,11 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MoE Op Backend Registry for TRTLLMGenFusedMoE.
+"""Per-provider kernel entry points for the TRTLLM-Gen MoE leaves.
 
-This module provides a registry-based backend abstraction for different MoE implementations
-(flashinfer and trtllm), reducing code duplication and improving maintainability.
+The two implementations differ in real ways -- FlashInfer translates activation
+and routing enums and probes which module a given release keeps them in, the
+native one validates SiTu inputs and picks between the NVFP4 and MXFP4 ops --
+so the argument marshalling in ``trtllm_gen/quant_bases.py`` can be written once
+per weight format and shared by that format's native and FlashInfer leaves.
+
+Follow-up: this is now a vtable, not a factory. Choosing a provider moved to
+``can_implement`` plus ``IMPL_PRIORITY`` when the single TRTLLM-Gen class split into
+one leaf per identity, so ``get_op_backend(self.provider)`` is a constant of
+the leaf class and the registry keys are the ``MoEImplId.provider`` values.
+That leaves the leaf carrying two dispatch axes for the same coordinates: the
+class resolves (provider, format) through its MRO, and then asks a held object
+to resolve (provider, format) again. Collapsing them means giving the provider
+traits classes in ``trtllm_gen/identity.py`` these methods and dropping this
+module -- a separate change, since it moves every kernel call site.
 """
 
 import os
@@ -48,16 +60,6 @@ def get_op_backend(name: str) -> "MoEOpBackend":
             f"Unknown op backend '{name}'. Available: {list(_MOE_OP_BACKEND_REGISTRY.keys())}"
         )
     return _MOE_OP_BACKEND_REGISTRY[name]()
-
-
-def get_available_op_backend() -> "MoEOpBackend":
-    """Get the best available backend (prefer flashinfer if available)."""
-    if "flashinfer" in _MOE_OP_BACKEND_REGISTRY:
-        try:
-            return get_op_backend("flashinfer")
-        except ImportError:
-            pass
-    return get_op_backend("trtllm")
 
 
 class MoEOpBackend:

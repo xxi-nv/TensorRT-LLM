@@ -104,16 +104,24 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
     sys.modules[module_name] = module
 
 
-def get_backend_class(backend_type: MoeBackendType):
-    """Import and return the concrete backend class for ``backend_type`` lazily."""
+def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
+    """Import and return the concrete backend class for ``backend_type`` lazily.
+
+    ``quant_algo`` is only consulted for ``TRTLLM``, whose eleven leaves are
+    keyed by quantization format; every other backend is one class.
+    """
     if backend_type == MoeBackendType.CUTLASS:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 
         return CutlassFusedMoE
     if backend_type == MoeBackendType.TRTLLM:
-        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+        # Eleven leaves keyed by (provider, quant), so the format has to be
+        # named. ``trtllm_gen_leaf`` returns the native leaf where one exists
+        # and the FlashInfer one for the unquantized format, which is what a
+        # run without the opt-in flag would select.
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import trtllm_gen_leaf
 
-        return TRTLLMGenFusedMoE
+        return trtllm_gen_leaf(quant_algo)
     if backend_type == MoeBackendType.CUTEDSL:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 

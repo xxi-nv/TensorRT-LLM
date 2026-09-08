@@ -1163,7 +1163,10 @@ class KimiK3MoERuntime(nn.Module):
                 "Kimi K3 packed-checkpoint streaming does not yet support "
                 "dynamic EPLB or replicated expert slots."
             )
-        local_expert_ids = list(self.routed_experts.backend.initial_local_expert_ids)
+        # Read off the wrapper, not its backend: the static partition is decided
+        # by ``MoE.__init__`` and only mirrored onto the backend, which does not
+        # exist yet -- ``ConfigurableMoE`` binds it in ``create_weights``.
+        local_expert_ids = list(self.routed_experts.initial_local_expert_ids)
         if local_expert_ids != list(
             range(local_expert_ids[0], local_expert_ids[0] + len(local_expert_ids))
         ):

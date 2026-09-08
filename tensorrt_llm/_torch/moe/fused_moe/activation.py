@@ -393,11 +393,12 @@ def materialize_activation_params(
 def resolve_activation_support(module: torch.nn.Module) -> MoEActivationSupport:
     """The declaration that applies to ``module``, class attribute or override.
 
-    Static for ten of the eleven backends. TRTLLM-Gen is the documented
-    exception: its clamp ABI is a per-expert tensor for the FP4 fused-activation
-    cubins but a by-value ``double`` for the FP8 block-scale separate-activation
-    kernel, which is not a property of the class, so it defines
-    ``resolve_activation_support`` and narrows the shape per instance.
+    A class attribute for every backend but one. TRTLLM-Gen's clamp ABI is a
+    per-expert tensor for the FP4 fused-activation cubins and a by-value
+    ``float`` for the FP8 block-scale separate-activation kernel, so its FP8
+    block-scale class overrides this to narrow the shape while the rest of the
+    family falls through to the class attribute. Probed with ``getattr`` for
+    exactly that reason: the narrowing sits on the one class it describes.
     """
     override = getattr(module, "resolve_activation_support", None)
     if callable(override):
@@ -451,8 +452,8 @@ def _write_activation_slot(
     state dict, which is where a plain attribute already was -- these are
     backend configuration, not checkpoint values.
 
-    A slot that is already a parameter stays one. ``TRTLLMGenFusedMoE`` promotes
-    the SiTu slots so they do travel in the state dict, and the exclude-modules
+    A slot that is already a parameter stays one. TRTLLM-Gen's FP4 block-scale
+    class promotes the SiTu slots so they do travel in the state dict, and the exclude-modules
     pass clears ``_weights_created`` without unregistering them, so this runs
     again over a live parameter.
     """

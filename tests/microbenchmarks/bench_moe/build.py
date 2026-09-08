@@ -47,29 +47,22 @@ from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
 
-# Map concrete MoE module class names to short backend identifiers used in
-# results and the dashboard. Anything not in this table falls back to the
-# upper-case class name.
-_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
-    "CutlassFusedMoE": "CUTLASS",
-    "TRTLLMGenFusedMoE": "TRTLLM",
-    "CuteDslFusedMoE": "CUTEDSL",
-    "DeepgemmCudaFp8BlockScalesImpl": "DEEPGEMM",
-    "DenseGEMMFusedMoE": "DENSEGEMM",
-    "DeepgemmCudaW4a8Mxfp4Mxfp8Impl": "MEGAMOE_DEEPGEMM",
-    "MegaMoECuteDsl": "MEGAMOE_CUTEDSL",
-    "VanillaMoE": "VANILLA",
-}
-
 
 def _backend_name_from_module(moe) -> str:
-    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
+    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules.
+
+    Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
+    a backend that gains or splits classes stays labelled without an edit
+    here. A hand-written class-name table used to do this and went stale the
+    moment TRTLLM-Gen became eleven classes.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
+
     backend_attr = getattr(moe, "backend", None)
-    if backend_attr is not None and backend_attr is not moe:
-        backend_cls = type(backend_attr).__name__
-    else:
-        backend_cls = type(moe).__name__
-    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
+    backend_cls = (
+        type(backend_attr) if backend_attr is not None and backend_attr is not moe else type(moe)
+    )
+    return backend_family_of(backend_cls) or backend_cls.__name__.upper()
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:
@@ -173,6 +166,40 @@ def _plain_activation(kind: ActivationType) -> MoEActivation:
     """
     payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
     return SimpleActivation(kind) if payload is SimpleActivation else payload()
+
+
+def eligibility_activation(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+    *,
+    swiglu_gptoss_style: bool,
+    activation_type: ActivationType,
+) -> MoEActivation:
+    """The carrier for a case, as far as its kind and which constants it fills.
+
+    Selection reads both halves of an activation -- the kind, and *which* of
+    alpha / beta / clamp are supplied, since clamped and unclamped SwiGLU share
+    one ``ActivationType``. So pruning has to package the case the same way the
+    build below does, or it prunes against a different question than the one
+    ``create_moe`` will answer.
+
+    It cannot reuse the build's own package: that one carries the per-expert
+    tensors ``quantize`` produces, which do not exist until weights are built.
+    The spec's scalars fill the same registers, which is all selection asks.
+    The SiTU and plain branches are shared outright so the two paths cannot
+    disagree about which activation a case runs.
+    """
+    situ = _situ_kwargs(model, moe_backend, quant_algo)
+    if situ:
+        return situ["activation"]
+    if swiglu_gptoss_style:
+        return SwigluBiasActivation(
+            gate_sigmoid_scale=model.swiglu_alpha,
+            linear_offset=model.swiglu_beta,
+            clamp=model.swiglu_limit,
+        )
+    return _plain_activation(activation_type)
 
 
 def _create_moe_for_benchmark(**kwargs):

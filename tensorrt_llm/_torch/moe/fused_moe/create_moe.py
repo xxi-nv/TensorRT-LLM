@@ -24,8 +24,10 @@ from .interface import MoE, MoEWeightLoadingMode
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
-                             derive_moe_layer_shapes, infer_swiglu_gptoss_style,
-                             resolve_moe_cls, resolve_moe_impl)
+                             derive_moe_layer_shapes,
+                             family_yields_impl_backend,
+                             infer_swiglu_gptoss_style, resolve_moe_cls,
+                             resolve_moe_impl)
 from .routing import BaseMoeRoutingMethod
 
 __all__ = [
@@ -128,7 +130,11 @@ def create_moe_backend(
             f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    # ``issubclass`` rather than ``==``: ``TRTLLMGenFusedMoE`` is the abstract
+    # parent of the eleven registered TRTLLM-Gen leaves, and it is those leaves
+    # that resolution hands over. An equality check would miss every one of them
+    # and fall through to the "Unsupported moe backend" raise below.
+    if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -338,30 +344,43 @@ def create_moe(
         "intermediate_size must be provided or model_config.pretrained_config "
         "must expose moe_intermediate_size / intermediate_size")
 
-    # Pass the same shapes / activation package the layer will be built with.
-    moe_cls = resolve_moe_cls(
-        model_config,
-        override_quant_config=override_quant_config,
-        dtype=dtype,
-        num_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        swiglu_gptoss_style=infer_swiglu_gptoss_style(
+    # Wrapped-vs-bare has to be decided here; the leaf class does not.
+    # ``ConfigurableMoE`` resolves that in ``create_weights``, once
+    # ``__post_init__`` has applied layerwise and exclusion-based quantization
+    # and this layer's ``quant_config`` is final -- resolving now would pick an
+    # identity for a format the layer may not end up running.
+    #
+    # This branch survives the delay because it needs no format: every
+    # candidate in a family answers it the same way. ``None`` is the one family
+    # that mixes both shapes, and there the eager resolution stays.
+    moe_cls: Optional[MoEImplClass] = None
+    wraps_impl = family_yields_impl_backend(model_config.moe_backend)
+    if wraps_impl is not True:
+        # Pass the same shapes / activation package the layer will be built with.
+        moe_cls = resolve_moe_cls(
+            model_config,
+            override_quant_config=override_quant_config,
+            dtype=dtype,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            swiglu_gptoss_style=infer_swiglu_gptoss_style(
+                bias=bias,
+                activation_type=activation.kind,
+            ),
             bias=bias,
-            activation_type=activation.kind,
-        ),
-        bias=bias,
-        activation=activation,
-        routing=routing_method,
-        layer_idx=layer_idx,
-        allow_degradation=allow_backend_degradation,
-    )
+            activation=activation,
+            routing=routing_method,
+            layer_idx=layer_idx,
+            allow_degradation=allow_backend_degradation,
+        )
+        wraps_impl = issubclass(moe_cls, MoEImplBase)
 
     # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
     # enough to be wrapped. Becoming *selectable* still needs the constructor
     # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
     # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
-    if issubclass(moe_cls, MoEImplBase):
+    if wraps_impl:
         return ConfigurableMoE(
             moe_cls=moe_cls,
             routing_method=routing_method,
@@ -379,12 +398,15 @@ def create_moe(
             bias=bias,
             activation=activation,
             communication_method=communication_method,
+            allow_backend_degradation=allow_backend_degradation,
         )
 
     # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
     if communication_method is not None:
         raise ValueError("communication_method requires ConfigurableMoE.")
+    assert moe_cls is not None, (
+        "the bare-layer path is only reached through eager resolution")
     return create_moe_backend(
         moe_cls=moe_cls,
         routing_method=routing_method,

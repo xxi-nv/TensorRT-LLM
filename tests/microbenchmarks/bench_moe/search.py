@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.activation import activation_constant_names
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -70,6 +71,7 @@ def _check_backend_can_implement(
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
     activation_type: ActivationType,
+    model: ModelSpec,
 ) -> Tuple[bool, Optional[str]]:
     """Resolve backend_str to its MoE class and ask whether it can serve this.
 
@@ -77,17 +79,37 @@ def _check_backend_can_implement(
     before ``_resolve_mapping_layout``, and the EP / comm constraints get their
     own explicit checks in :func:`is_candidate_valid` with better messages.
     """
+    # Imported here because ``cli.py`` reaches pruning without the build phase,
+    # and the build module pulls in the weight-generation stack.
+    from .build import eligibility_activation
+
     try:
-        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
+        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()), quant_algo)
     except (ImportError, KeyError, RuntimeError, ValueError) as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    # Both halves come off the carrier the build phase will use, not off
+    # ``activation_type``: the kind can differ from the spec's (a SiTU case
+    # keeps ``activation_type=SWIGLU`` and changes only the epilogue), and the
+    # kind alone never says which constants are filled. Left to the defaults,
+    # the problem would claim plain unclamped SwiGLU and admit cases
+    # ``create_moe`` then rejects.
+    activation = eligibility_activation(
+        model,
+        backend_str,
+        quant_algo,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        activation_type=activation_type,
+    )
     problem = MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,
         swiglu_gptoss_style=swiglu_gptoss_style,
-        # Defaults to SwiGLU when unset, which would make every upstream
-        # activation gate evaluate the wrong activation.
-        activation=canonical_activation(activation_type),
+        # Mirrors what the build phase passes the quantize util; left unset it
+        # defaults to ``None``, which the bias gates read as "not stated" and
+        # abstain on, admitting cases the build then rejects.
+        bias=swiglu_gptoss_style,
+        activation=canonical_activation(ActivationType(activation.kind)),
+        activation_constants=activation_constant_names(activation),
     )
     deployment = MoEDeployment(
         ep_size=1,
@@ -191,6 +213,7 @@ def is_candidate_valid(
         act_dtype,
         model.swiglu_gptoss_style,
         model.activation_type_enum,
+        model,
     )
     if not ok:
         return False, reason

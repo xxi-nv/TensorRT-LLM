@@ -15,11 +15,9 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                             MoEImplClass, RenormalizeMoeRoutingMethod,
+from ..moe.fused_moe import (BaseMoeRoutingMethod, RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
-                             RoutingMethodType, TRTLLMGenFusedMoE, create_moe,
-                             resolve_moe_cls)
+                             RoutingMethodType, create_moe)
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
@@ -38,17 +36,15 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend_cls: MoEImplClass = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
-        self.moe_backend_cls = moe_backend_cls
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
-        # FIXME: out_dtype=float32 does not work
-        # self.out_dtype = torch.float32 if moe_backend_cls == TRTLLMGenFusedMoE else dtype
+        # FIXME: out_dtype=float32 does not work, so the gate emits logits in
+        # the model dtype no matter which backend consumes them.
         self.out_dtype = dtype
 
         assert not apply_routing, "Qwen3Gate routing is called inside MoE"
@@ -70,13 +66,19 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        output_dtype = torch.bfloat16 if self.moe_backend_cls == TRTLLMGenFusedMoE else torch.float32
+        # Routing emits its own full-precision output for every backend. A
+        # backend that reads routing scales in a narrower type (TRTLLM-Gen asks
+        # for bfloat16) gets the conversion from the scheduler, which casts to
+        # ``backend.input_requirement.routing_scales_dtype`` once the backend is
+        # bound. Narrowing here instead would have to name the implementation
+        # class while the layer's quantization format is not yet final, and a
+        # guess that misses leaves routing below the precision the backend the
+        # layer actually binds requires -- which the scheduler can only catch,
+        # not repair.
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k,
-                                                    output_dtype=output_dtype)
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(top_k=self.top_k,
-                                               output_dtype=output_dtype)
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -111,16 +113,6 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=resolve_moe_cls(
-                model_config,
-                routing=RoutingMethodType.Renormalize,
-                # Match the create_moe call below, which passes no bias and no
-                # swiglu alpha/beta. Left unknown, gates that create_moe
-                # rejects abstain here and the gate would name a backend the
-                # layer does not run.
-                swiglu_gptoss_style=False,
-                layer_idx=layer_idx,
-            ),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA

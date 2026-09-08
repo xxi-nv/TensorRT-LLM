@@ -43,7 +43,7 @@ class MoEStaticCapability:
     supports_dwdp: bool = False
     # Legacy gate: ``assert moe_cls in supported_load_balancer_backends`` in
     # ``create_moe_backend``. Not the same question as the instance-level
-    # ``_supports_load_balancer()``, which TRTLLMGenFusedMoE overrides to mean
+    # ``_supports_load_balancer()``, which TrtllmGenFusedMoEBase overrides to mean
     # "separated routing is used".
     supports_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
@@ -82,7 +82,7 @@ class MoEInputRequirement:
     # the design sketched one to replace the scheduler's router-logits filter.
     # A class-level bool cannot express that condition: it also depends on the
     # routing method instance and on an environment override, neither of which
-    # is known per class. ``TRTLLMGenFusedMoE._routes_outside_the_kernel``
+    # is known per class. ``TrtllmGenFusedMoEBase._routes_outside_the_kernel``
     # answers it instead, next to the kernel whose contract it describes.
 
 
@@ -206,6 +206,18 @@ class MoEEnvironment:
 
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
+
+    def env_flag(self, name: str) -> Optional[str]:
+        """Value of a collected environment flag, or ``None`` if not collected.
+
+        The pairs are stored as a tuple so the structure stays hashable and the
+        fingerprint stays stable; this reader exists so a ``can_implement`` can
+        ask for one flag by name instead of reaching for ``os.environ``.
+        """
+        for flag, value in self.env_flags:
+            if flag == name:
+                return value
+        return None
 
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""

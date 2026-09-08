@@ -40,6 +40,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEEligibility,
     MoEProblem,
     MoERejectReason,
+    canonical_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
@@ -51,6 +52,20 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
+
+
+def _canonical_quant_key(quant_config: Optional[QuantConfig]) -> str:
+    """The format string a resolved implementation identity is keyed on.
+
+    ``canonical_quant`` folds a calibration recipe onto the format the kernel
+    actually runs (NVFP4_AWQ to nvfp4) and maps the model-level markers
+    (MIXED_PRECISION, NO_QUANT) to ``None``, which the identities spell
+    ``"none"``. Comparing at exactly this granularity is what keeps a
+    re-resolution a no-op unless the format itself moved.
+    """
+    algo = None if quant_config is None else quant_config.quant_algo
+    return canonical_quant(algo) or "none"
+
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
 # layer_idx + load balancer) and must be mirrored onto the backend after
@@ -159,6 +174,7 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"] = None,
         moe_cls: Optional[Type] = None,
         communication_method: Optional[str] = None,
+        allow_backend_degradation: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -173,7 +189,12 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
-        self._override_quant_config = override_quant_config
+        # A starting value for this layer's quant_config, not an authority over
+        # it: ``__post_init__`` may still give the layer a layerwise entry or an
+        # exclusion, and ``create_weights`` resolves against whatever is final
+        # by then. Callers that look ``quant_config_dict`` up themselves
+        # therefore keep working, and exclusions reach the MoE too -- which
+        # they did not while this value outranked ``self.quant_config``.
         if override_quant_config is not None:
             self.quant_config = override_quant_config
 
@@ -185,27 +206,36 @@ class ConfigurableMoE(MoE):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # ========== Create MoE Backend (selected by model_config.moe_backend) ==========
-        self._create_and_sync_backend(
-            model_config=model_config,
-            routing_method=routing_method,
-            override_quant_config=override_quant_config,
-            moe_cls=moe_cls,
-            **kwargs,
-        )
+        # ========== Backend binding state (backend itself comes later) ==========
+        # The backend is resolved and constructed in ``create_weights``, not
+        # here: its class *is* one quantization format, and this layer's format
+        # is not final until ``__post_init__`` has applied both halves of
+        # layerwise quantization. See ``create_weights``.
+        #
+        # ``self.backend`` is deliberately left *absent* rather than set to
+        # None. The delegating properties below reach it through
+        # ``self.backend``, so absence makes them raise AttributeError, which
+        # is what the ``hasattr`` / ``getattr`` guards at their call sites are
+        # written for; ``None`` would instead trip their inner asserts and
+        # raise AssertionError straight through those guards.
+        self._pinned_moe_cls = moe_cls
+        self._allow_backend_degradation = allow_backend_degradation
+        self._backend_bound = False
+        self._bound_quant_key: Optional[str] = None
+        # Read by the communication factory, so it needs an answer before the
+        # backend that owns it exists. Restated from the backend's class in
+        # ``_create_backend``.
+        self.use_flashinfer = False
 
         # ========== Optional DWDP integration ==========
-        # Must run BEFORE _create_comm_strategy_auto so the factory can skip
-        # alltoall strategies for DWDP (VA path swaps param.data; the backend
-        # reads from its own weight attrs, no comm strategy needed).
+        # Eligibility is a question about the backend, so both it and the comm
+        # strategy are decided in ``_install_backend_dependents``. Declared
+        # here because the
+        # wrapper answers about itself in the unbound window: ``destroy()``,
+        # ``calculate_num_chunks``, and ``enable_alltoall`` all read these.
         self.dwdp_manager = get_global_dwdp_manager()
         self.enable_dwdp = False
-        if self.dwdp_manager is not None and self._should_enable_dwdp():
-            self.enable_dwdp = True
-            self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
-
-        # ========== Create Communication Strategy ==========
-        self.comm = self._create_comm_strategy_auto()
+        self.comm: Optional[Communication] = None
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -229,7 +259,6 @@ class ConfigurableMoE(MoE):
 
         # Validate configuration
         self.validate_config()
-        self.validate_backend(self.backend)
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -237,12 +266,25 @@ class ConfigurableMoE(MoE):
         # TODO: in the future, all the weights related work should be done only in backend.
         self._weights_removed = True
 
-        # ========== Create forward scheduler (ExternalComm / FusedComm) ==========
-        # Constructed last so the scheduler may safely read any wrapper state
-        # (comm, aux_stream, event_dict, moe_max_num_tokens, dwdp_*) at init
-        # time without ordering surprises. Selection is based on
-        # ``backend.scheduler_kind`` set on the backend class.
-        self.scheduler: MoEScheduler = create_moe_scheduler(self)
+        # Bound here rather than from ``__post_init__`` for the construction
+        # paths that have no ``__post_init__`` to run: direct construction in
+        # tests and microbenchmarks, which then read ``moe.backend`` or call
+        # ``load_weights()`` straight away. ``AutoModelForCausalLM`` forces
+        # ``skip_create_weights_in_init=True`` for every
+        # ``DecoderModelForCausalLM``, so no production layer takes this path.
+        #
+        # Last in ``__init__`` because binding builds everything derived from
+        # the backend's class, and the scheduler among those reads the chunking
+        # state assigned above.
+        #
+        # The ``quant_config_dict`` half of the gate defers to __post_init__
+        # when the checkpoint states formats per layer. Exclusions alone do not
+        # defer -- they reset ``_weights_created`` on matching modules during
+        # __post_init__, and ``create_weights`` rebinds rather than silently
+        # keeping the identity picked for the pre-exclusion format.
+        has_post_init_quant_config = model_config.quant_config_dict is not None
+        if not model_config.skip_create_weights_in_init and not has_post_init_quant_config:
+            self.create_weights()
 
     @staticmethod
     @contextmanager
@@ -268,16 +310,85 @@ class ConfigurableMoE(MoE):
             model_config.skip_create_weights_in_init = previous
             model_config._frozen = True
 
-    def _create_and_sync_backend(
-        self,
-        *,
-        model_config: ModelConfig,
-        routing_method: BaseMoeRoutingMethod,
-        override_quant_config: Optional["QuantConfig"],
-        moe_cls: Optional[Type] = None,
-        **kwargs,
-    ) -> None:
-        """Build the MoE backend, mirror EPLB attrs, then create weights.
+    def _backend_model_config(self, quant_config: Optional[QuantConfig]) -> ModelConfig:
+        """``self.model_config`` with ``quant_config`` replaced, shallow.
+
+        Shallow on purpose. ``extra_attrs`` is a model-level shared registry:
+        the MoE layer weakrefs, the aux streams, and the fault-tolerance
+        ``EPGroupHealth`` all live there, and the last of those holds a
+        ``threading.Lock``, which no deep copy can carry. Every field other
+        than ``quant_config`` therefore keeps its object identity, and a copy
+        per layer stays cheap on a 61-layer model.
+
+        No ``_frozen`` bracketing: ``ModelConfig.__setattr__`` exempts
+        ``quant_config`` from the freeze, precisely so a layer can be given its
+        own format.
+        """
+        if quant_config is self.model_config.quant_config:
+            return self.model_config
+        backend_model_config = copy.copy(self.model_config)
+        backend_model_config.quant_config = quant_config
+        return backend_model_config
+
+    def _resolve_backend_cls(self, quant_config: Optional[QuantConfig]) -> Type:
+        """The implementation class serving ``quant_config`` for this layer.
+
+        ``_pinned_moe_cls`` short-circuits this for the two callers that name a
+        class: direct construction, and ``create_moe``'s one family whose
+        candidates mix a complete layer with a backend, where wrapped-vs-bare
+        could only be answered by resolving. A pin is taken at its word for the
+        same reason resolution takes a pinned identity at its word -- a caller
+        that named a class is asking for that one.
+
+        Refuses a class that is not an execution unit, which resolution can
+        return: those families hold a complete MoE layer, and one cannot be
+        installed as a backend. Refused rather than degraded, because the shape
+        of the layer was already decided in ``create_moe`` and the routing
+        precision the gate was built with went with it.
+        """
+        from tensorrt_llm._torch.moe.fused_moe.create_moe import (
+            infer_swiglu_gptoss_style,
+            resolve_moe_cls,
+        )
+
+        if self._pinned_moe_cls is not None:
+            return self._pinned_moe_cls
+        moe_cls = resolve_moe_cls(
+            self.model_config,
+            override_quant_config=quant_config,
+            dtype=self.dtype,
+            num_experts=self.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            swiglu_gptoss_style=infer_swiglu_gptoss_style(
+                bias=self.bias,
+                activation_type=self.activation_type,
+            ),
+            bias=self.bias,
+            activation=self.activation,
+            routing=self.routing_method,
+            layer_idx=self.layer_idx,
+            # Without this the fallback resolution silently allowed
+            # degradation, so a caller that asked for one specific backend
+            # could be handed Cutlass's numbers under that backend's name.
+            allow_degradation=self._allow_backend_degradation,
+        )
+        if not issubclass(moe_cls, MoEImplBase):
+            raise ValueError(
+                f"Layer {self.layer_idx} ends up at "
+                f"quant={_canonical_quant_key(quant_config)}, which resolves "
+                f"to {moe_cls.__name__} -- a complete MoE layer rather than an "
+                f"execution unit installable as ConfigurableMoE.backend. "
+                f"Choose a moe_backend that serves every format this model's "
+                f"layers use, or drop the layerwise override on this one."
+            )
+        return moe_cls
+
+    def _create_backend(self, quant_config: Optional[QuantConfig], moe_cls: Type) -> None:
+        """Construct and install ``moe_cls`` as the backend; mirror the EPLB attrs.
+
+        Weight allocation and everything derived from the backend's class are
+        the caller's next two steps, in that order -- see ``create_weights``.
 
         Why this dance:
         - ``init_load_balancer=False``: the backend would otherwise
@@ -288,43 +399,16 @@ class ConfigurableMoE(MoE):
           real values via ``_BACKEND_SYNC_ATTRS`` below.
         - ``skip_create_weights_in_init=True`` (via contextmanager): weights
           depend on ``layer_load_balancer`` / ``initial_local_expert_ids``
-          / etc., which only become known after the sync. Defer weight
-          creation to the explicit ``backend.create_weights()`` call below.
+          / etc., which only become known after the sync, so allocation waits
+          for the caller's ``create_weights()``.
         """
-        from tensorrt_llm._torch.moe.fused_moe.create_moe import (
-            create_moe_backend,
-            infer_swiglu_gptoss_style,
-            resolve_moe_cls,
-        )
+        from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 
-        # create_moe already resolved; direct constructors resolve here.
-        if moe_cls is None:
-            moe_cls = resolve_moe_cls(
-                model_config,
-                override_quant_config=override_quant_config,
-                dtype=self.dtype,
-                num_experts=self.num_experts,
-                hidden_size=self.hidden_size,
-                intermediate_size=self.intermediate_size,
-                swiglu_gptoss_style=infer_swiglu_gptoss_style(
-                    bias=kwargs.get("bias", False),
-                    activation_type=self.activation_type,
-                ),
-                bias=kwargs.get("bias", False),
-                activation=self.activation,
-                routing=self.routing_method,
-                layer_idx=self.layer_idx,
-            )
-
-        backend_model_config = model_config
-        if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
-            backend_model_config.quant_config = override_quant_config
-
+        backend_model_config = self._backend_model_config(quant_config)
         with self._temporarily_skip_weight_creation(backend_model_config):
             backend = create_moe_backend(
                 moe_cls=moe_cls,
-                routing_method=routing_method,
+                routing_method=self.routing_method,
                 num_experts=self.num_experts,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
@@ -333,18 +417,17 @@ class ConfigurableMoE(MoE):
                 model_config=backend_model_config,
                 aux_stream_dict=self.aux_stream_dict,
                 weight_loading_mode=self.weight_loading_mode,
-                bias=kwargs.get("bias", False),
+                bias=self.bias,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
                 layer_idx=None,
                 init_load_balancer=False,
                 activation=self.activation,
             )
 
-        # Backend acceptance is validated at the end of ``__init__`` instead
-        # of here so the validation hook can inspect ``self.comm`` and
-        # ``self.moe_max_num_tokens`` (assigned only after this method
-        # returns). Backends like ``MegaMoECuteDsl`` rely on that to
-        # enforce ``moe.comm is None`` without ``getattr`` guards.
+        # Backend acceptance is validated by ``_install_backend_dependents``
+        # instead of here so the validation hook can inspect ``self.comm``,
+        # which that method assigns. Backends like ``MegaMoECuteDsl`` rely on
+        # that to enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self._reject_non_divisible_ep_backend()
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
@@ -352,23 +435,84 @@ class ConfigurableMoE(MoE):
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
         # backend code path that reads e.g. ``self.layer_load_balancer`` or
         # ``self.num_slots`` sees the real values resolved by MoE.__init__.
-        if self.backend is not None:
-            for attr in _BACKEND_SYNC_ATTRS:
-                setattr(self.backend, attr, getattr(self, attr))
-            # ``expert_size_per_partition`` may have just changed (EPLB slots),
-            # and it sizes every per-expert activation constant.
-            install_activation_params(self.backend)
+        for attr in _BACKEND_SYNC_ATTRS:
+            setattr(self.backend, attr, getattr(self, attr))
+        # ``expert_size_per_partition`` may have just changed (EPLB slots),
+        # and it sizes every per-expert activation constant.
+        install_activation_params(self.backend)
 
-        # Sync done -- now the backend has enough info to allocate weight
-        # tensors with the right shard / slot count.
-        # Layerwise quantization is applied after the model is constructed.
-        # Defer allocation so the backend is built from the final wrapper
-        # quant_config rather than an earlier global value. Module exclusions
-        # reset _weights_created on matching modules during __post_init__, so
-        # unrelated exclusions retain the historical eager allocation path.
-        has_post_init_quant_config = model_config.quant_config_dict is not None
-        if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
-            self.create_weights()
+        self._adopt_backend_routing_scales_dtype()
+
+        # The format this identity was picked for, so a later ``create_weights``
+        # can tell whether the layer has since been moved to a different one.
+        self._bound_quant_key = _canonical_quant_key(quant_config)
+
+    def _adopt_backend_routing_scales_dtype(self) -> None:
+        """Have routing emit the scale precision the bound backend reads.
+
+        Changes no numbers. ``MoEScheduler`` narrows ``token_final_scales`` to
+        ``input_requirement.routing_scales_dtype`` either way, and the routing
+        op takes its output dtype as a kernel template parameter while
+        computing in float regardless -- so this only moves the conversion into
+        that kernel. What it saves is the separate elementwise launch the cast
+        would otherwise be, once per layer per forward, on every backend that
+        asks for something narrower than float32 (TRTLLM-Gen asks for
+        bfloat16).
+
+        Bind time is the earliest this is answerable: the requirement belongs
+        to the leaf, and which leaf serves this layer is not settled until the
+        format is. The pre-split form of this lived in the model, where
+        ``Qwen3Gate`` compared a resolved class against ``TRTLLMGenFusedMoE``;
+        that is now the abstract family base, so the comparison could only
+        return False once the family had leaves.
+
+        Float32 is the only value safe to overwrite, being routing's own
+        full-precision output. A routing method the model configured narrower
+        has already dropped mantissa bits that no assignment here can restore,
+        so it is left alone and the scheduler's assertion stays the authority
+        on whether it conflicts with the backend. That is also what keeps a
+        routing method shared across layers honest: if two of them bind to
+        backends that disagree, the second finds a non-float32 dtype, declines,
+        and the disagreement surfaces at that assertion instead of being
+        decided by whichever layer bound last.
+        """
+        required = self.backend.input_requirement.routing_scales_dtype
+        if required is None or required == torch.float32:
+            return
+        if getattr(self.routing_method, "output_dtype", None) != torch.float32:
+            return
+        self.routing_method.output_dtype = required
+
+    def _register_dwdp(self) -> None:
+        """Claim this layer for distributed weight sharing, if eligible.
+
+        Separate from ``_install_backend_dependents`` because it is keyed on
+        the layer, not on the backend: ``add_layer`` appends to the manager's
+        list, so a rebind that re-runs the rest must not re-run this.
+
+        Runs before the communication factory, which skips alltoall strategies
+        for a DWDP layer (the VA path swaps ``param.data`` and the backend
+        reads its own weight attrs, so no comm strategy is needed).
+
+        Safe this late in the lifecycle: ``DwdpManager.setup()`` runs from
+        ``py_executor_creator``, after weights are loaded.
+        """
+        if self.dwdp_manager is not None and self._should_enable_dwdp():
+            self.enable_dwdp = True
+            self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
+
+    def _install_backend_dependents(self) -> None:
+        """Build everything downstream of the backend's class.
+
+        Kept in the order the backends were written against: communication
+        strategy, then validation, then the scheduler -- last so it may read
+        any wrapper state (comm, aux_stream, event_dict, moe_max_num_tokens,
+        dwdp_*) without ordering surprises.
+        """
+        self.comm = self._create_comm_strategy_auto()
+        self.validate_backend(self.backend)
+        # Selection is based on ``backend.scheduler_kind``, a class attribute.
+        self.scheduler: MoEScheduler = create_moe_scheduler(self)
 
     def _reject_non_divisible_ep_backend(self) -> None:
         """Enforce the non-divisible-EP contract on the resolved backend.
@@ -416,12 +560,49 @@ class ConfigurableMoE(MoE):
     @property
     def num_fused_shared_expert(self) -> int:
         """Expose the backend's fused-shared-expert count so model code (e.g.
-        DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
-        this wrapper. Returns 0 when the backend does not support fusion."""
+        DeepseekV3 post_load_weights) sees it through this wrapper.
+
+        Zero while unbound, and zero for a backend without fusion. Callers that
+        need the answer *before* binding -- shared-expert TP sizing runs inside
+        the model's ``__init__`` -- must ask ``will_fuse_shared_expert``
+        instead, which does not need the instance.
+        """
+        if not self._backend_bound:
+            return 0
         return getattr(self.backend, "num_fused_shared_expert", 0)
 
+    def will_fuse_shared_expert(self) -> bool:
+        """Whether the backend this layer binds folds the shared experts in.
+
+        Answerable before ``create_weights`` has bound anything, which model
+        code building the layer needs: DeepseekV3 sizes its shared-expert TP
+        from this, and the ``GatedMLP`` that sizing feeds is constructed in the
+        same ``__init__``.
+
+        Predicted from ``self.quant_config`` as it stands now, which is the
+        model-level format (plus any explicit override) -- exactly the input the
+        backend used to be resolved from at construction. So the prediction and
+        the eventual binding agree unless per-layer quantization later moves
+        this layer to a format whose class does not fuse.
+
+        A disagreement is only reachable at all with fusion turned on, which is
+        opt-in per ``TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION``; with it unset every
+        class answers zero and the prediction cannot be wrong.
+        """
+        moe_cls = self._resolve_backend_cls(self.quant_config)
+        count = getattr(moe_cls, "fused_shared_expert_count", None)
+        if count is None:
+            return False
+        return count(self.model_config) > 0
+
     def fuse_shared_expert(self, shared_experts):
-        """Delegate shared-expert fusion to the backend (e.g. TRTLLMGenFusedMoE)."""
+        """Delegate shared-expert fusion to the backend.
+
+        Unguarded because every caller reaches this through
+        ``num_fused_shared_expert > 0`` above, which only a backend that
+        implements fusion can report -- so a backend without the method is not
+        asked for it.
+        """
         return self.backend.fuse_shared_expert(shared_experts)
 
     def validate_config(self):
@@ -641,6 +822,14 @@ class ConfigurableMoE(MoE):
 
         DP-padding handling and chunking live in the scheduler.
         """
+        if not self._backend_bound:
+            raise RuntimeError(
+                f"MoE layer {self.layer_idx} has no backend yet: the backend's "
+                f"class is this layer's quantization format, so it is bound in "
+                f"create_weights(), once __post_init__ has settled that format. "
+                f"Call create_weights() (or let __post_init__ run) before "
+                f"forward."
+            )
         input_ids = kwargs.get("input_ids")
 
         if isinstance(x, Fp4QuantizedTensor):
@@ -714,32 +903,125 @@ class ConfigurableMoE(MoE):
         backend.validate_configurable_moe(self)
 
     def create_weights(self):
-        """
-        Create weights - delegated to backend
+        """Bind the backend to this layer's final format, then allocate.
 
+        The wrapper's half of the quantization lifecycle, and the reason
+        binding lives here rather than in ``__init__``: this runs from
+        ``__post_init__`` *after* ``apply_layerwise_quant_config`` and
+        ``apply_quant_config_exclude_modules``, so ``self.quant_config`` is
+        final. A backend whose class *is* one quantization format therefore
+        gets picked for the format the layer actually runs.
+
+        ``Linear``, ``Attention``, and ``MLA`` already use ``create_weights``
+        as the post-quantization hook for the same reason -- ``TrtllmAttention``
+        rebuilds its ``FmhaManager`` from there.
+
+        Three outcomes, and the last is why the guard is not a plain
+        ``if self._backend_bound: return``:
+
+        - unbound: resolve, construct, allocate, then build everything derived
+          from the backend's class.
+        - bound to this same format: idempotent. Reached on every run, because
+          the backend is a registered submodule and ``__post_init__`` walks
+          ``named_modules()``, so it gets its own ``create_weights`` call right
+          after this one.
+        - bound to a *different* format: rebound, see ``_rebind_backend_to``.
+          Reachable only from the eager binding in ``__init__``, which an
+          exclusion can then move; returning early there would leave the layer
+          executing one format's kernels against another's config, silently.
         """
-        assert hasattr(self.backend, "create_weights"), (
-            f"Backend {self.backend.__class__.__name__} must implement create_weights()"
-        )
-        # An explicit override is authoritative. Otherwise use the wrapper's
-        # final value, after model __post_init__ has applied layerwise and
-        # exclusion-based quantization settings.
-        self.backend.quant_config = (
-            self._override_quant_config
-            if self._override_quant_config is not None
-            else self.quant_config
-        )
-        # The quant config just changed and a backend may resolve its activation
-        # ABI from it: TRTLLMGenFusedMoE narrows the clamp to a uniform scalar on
-        # the FP8 block-scale path, whose kernel takes one ``double`` by value.
-        # The install in __init__ ran against the pre-layerwise config, so a layer
-        # that layerwise quantization moved onto that path would otherwise keep a
-        # tensor clamp the kernel ignores. Guarded because a re-install
-        # re-materializes from ``activation``, undoing the in-place division
-        # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
+        quant_config = self.quant_config
+
+        if not self._backend_bound:
+            self._create_backend(quant_config, self._resolve_backend_cls(quant_config))
+            self.backend.quant_config = quant_config
+            result = self.backend.create_weights()
+            # Both after allocation, because that is the order the backends
+            # were written against: weights exist before the comm strategy and
+            # the scheduler.
+            self._register_dwdp()
+            self._install_backend_dependents()
+            self._backend_bound = True
+            return result
+
+        swapped = False
+        if _canonical_quant_key(quant_config) != self._bound_quant_key:
+            swapped = self._rebind_backend_to(quant_config)
+
+        self.backend.quant_config = quant_config
+        # Re-install because ``expert_size_per_partition`` sets the length of
+        # every per-expert activation constant, and it is wrapper-owned: the
+        # install inside the backend's own construction ran before the EPLB
+        # attrs were mirrored onto it.
+        #
+        # Guarded because a re-install re-materializes from ``activation``,
+        # undoing the in-place division NVFP4TRTLLMGenFusedMoEBaseMethod
+        # applies to beta and clamp.
         if not self.backend._weights_created:
             install_activation_params(self.backend)
-        return self.backend.create_weights()
+        result = self.backend.create_weights()
+        if swapped:
+            # After allocation, matching the first-bind order above: the comm
+            # strategy and the scheduler are written against a backend whose
+            # weights exist.
+            self._install_backend_dependents()
+        return result
+
+    def _rebind_backend_to(self, quant_config: Optional[QuantConfig]) -> bool:
+        """Re-resolve for ``quant_config``; swap the backend if it moved.
+
+        Restores what one class serving every format used to do for free: it
+        re-read ``quant_config`` at allocation time to pick its quant method.
+        Now that the format is the implementation's identity, the same
+        correction has to replace the implementation.
+
+        Returns whether the backend was replaced, so the caller can rebuild
+        everything derived from its class *after* allocating weights rather
+        than before -- the order the backends were written against.
+
+        DWDP registration is not repeated: ``add_layer`` appends to the
+        manager's list, so re-running it would claim this layer twice. The
+        eligibility *conclusion* is about the backend, though, and there is no
+        way to withdraw a claim, so a swap that would change it is refused
+        rather than left stale.
+
+        When the same class serves both formats there is nothing to replace,
+        and the caller's re-run of ``quant_method.create_weights`` is what
+        adopts the new format. That re-run registers only what the new method
+        needs, so a scale tensor the previous method registered stays in
+        ``_parameters`` -- carried over from the single-class era rather than
+        introduced here, and out of reach of a wrapper that does not know which
+        names a method claimed.
+        """
+        moe_cls = self._resolve_backend_cls(quant_config)
+        if moe_cls is type(self.backend):
+            # Record it so the comparison above does not re-resolve on every
+            # subsequent call.
+            self._bound_quant_key = _canonical_quant_key(quant_config)
+            return False
+
+        # Explicitly, before the last reference to it is dropped: DeepEP's
+        # ``Buffer.__del__`` enters a collective barrier, so letting GC decide
+        # when the old strategy is released lets ranks reach that barrier at
+        # different times and hang. ``_install_backend_dependents`` builds the
+        # replacement once the new backend has its weights.
+        if self.comm is not None:
+            self.comm.destroy()
+            self.comm = None
+
+        previously_claimed_for_dwdp = self.enable_dwdp
+        self._create_backend(quant_config, moe_cls)
+        if previously_claimed_for_dwdp and not self._should_enable_dwdp():
+            raise ValueError(
+                f"Layer {self.layer_idx} was claimed for distributed weight "
+                f"sharing while bound to a backend that supports it, and "
+                f"per-layer quantization has since moved it to "
+                f"{moe_cls.__name__}, which does not. The claim cannot be "
+                f"withdrawn, so this layer would swap parameter data on a "
+                f"backend that does not expect it. Drop the layerwise "
+                f"override or the exclusion on this layer, or disable DWDP."
+            )
+        return True
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """
@@ -813,18 +1095,27 @@ class ConfigurableMoE(MoE):
 
     @property
     def _weights_created(self):
-        """Check if weights have been created (required for quantization properties)"""
-        assert hasattr(self.backend, "_weights_created"), (
-            f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
-        )
+        """Whether this layer's weights exist, which the backend owns.
+
+        False while unbound, which is a real answer rather than a guard: with
+        no backend there are no weights. ``apply_quant_config_exclude_modules``
+        reads this through ``hasattr`` and then writes it, so an unbound layer
+        has to answer both without raising.
+        """
+        if not self._backend_bound:
+            return False
         return self.backend._weights_created
 
     @_weights_created.setter
     def _weights_created(self, value: bool) -> None:
-        """Update backend weight state during post-init quantization changes."""
-        assert hasattr(self.backend, "_weights_created"), (
-            f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
-        )
+        """Update backend weight state during post-init quantization changes.
+
+        A no-op while unbound: nothing has been allocated to invalidate, and
+        the exclusion that is writing this also rewrote ``self.quant_config``,
+        which is what ``create_weights`` resolves the backend from.
+        """
+        if not self._backend_bound:
+            return
         self.backend._weights_created = value
 
     # ========== Explicit Backend Attribute Proxies ==========

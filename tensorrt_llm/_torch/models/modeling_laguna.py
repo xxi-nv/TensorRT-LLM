@@ -38,14 +38,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import (
-    MiniMaxM2MoeRoutingMethod,
-    MoEImplClass,
-    RoutingMethodType,
-    SqrtSoftplusMoeRoutingMethod,
-    create_moe,
-    resolve_moe_cls,
-)
+from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, SqrtSoftplusMoeRoutingMethod, create_moe
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
@@ -69,12 +62,10 @@ class LagunaGate(nn.Module):
         num_experts: int,
         top_k: int,
         dtype: Optional[torch.dtype] = None,
-        moe_backend_cls: Optional[MoEImplClass] = None,
         scoring_func: str = "sigmoid",
     ) -> None:
         super().__init__()
         self.top_k = top_k
-        self.moe_backend_cls = moe_backend_cls
         if scoring_func not in ("sigmoid", "sqrtsoftplus"):
             raise ValueError(
                 f"Unsupported moe_router_score_func={scoring_func!r}; "
@@ -147,15 +138,9 @@ class LagunaMoE(nn.Module):
             num_experts=self.num_experts,
             top_k=self.top_k,
             dtype=config.torch_dtype,
-            moe_backend_cls=resolve_moe_cls(
-                model_config,
-                routing=RoutingMethodType.MiniMax2,
-                # Match the create_moe call below, which passes no bias and no
-                # swiglu alpha/beta. Left unknown, gates that create_moe
-                # rejects abstain here and the gate would name a backend the
-                # layer does not run.
-                swiglu_gptoss_style=False,
-            ),
+            # No backend class is passed: this gate emits float32 logits for
+            # every backend (see ``routing_method``), so the resolution that
+            # used to be done here only named a class nothing read.
             scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
 

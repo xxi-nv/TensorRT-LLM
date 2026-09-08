@@ -31,6 +31,7 @@ from _torch.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
+    build_test_activation,
     create_test_param,
     get_backend_class,
     iter_base_test_configs,
@@ -54,10 +55,8 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
-    SimpleActivation,
     SiTuActivation,
     SwigluActivation,
-    SwigluBiasActivation,
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
@@ -65,7 +64,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
+    TRTLLMGenFusedMoE,
+    trtllm_gen_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -97,6 +99,10 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
+)
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
 from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
@@ -204,11 +210,16 @@ def should_skip_gptoss(
 def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
     """An upstream fused down projection owns quantization on this path."""
     monkeypatch.delenv("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", raising=False)
+    # Patched in the module that owns the override, so the assertion fires if
+    # the pre-quantized short-circuit stops running before the SM probe.
     monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_w4a8_mxfp4_mxfp8.is_sm_100f",
         MagicMock(side_effect=AssertionError("SM probe must be short-circuited")),
     )
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The MXFP8-activation leaf: it is the one that overrides
+    # ``try_fused_route_quant`` at all, so declining has to be shown on it and
+    # not on a leaf that inherits the base's unconditional ``None``.
+    backend = TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl)
     hidden_states = MxFp8QuantizedTensor(
         fp8_tensor=torch.empty(1, 3584, dtype=torch.float8_e4m3fn),
         scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
@@ -225,47 +236,16 @@ def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
     fp8_tensor = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
     scaling_factor = torch.empty(2, 2, dtype=torch.uint8)
     hidden_states = MxFp8QuantizedTensor(fp8_tensor, scaling_factor)
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The NVFP4 leaf owns this path by identity now, so there is no quant-mode
+    # mock to set up: which branch runs is which class was constructed.
+    backend = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
     backend._weights_created = True
-    quant_mode = MagicMock()
-    quant_mode.has_any_quant.return_value = True
-    quant_mode.has_w4a8_mxfp4_fp8.return_value = False
-    quant_mode.has_nvfp4.return_value = True
-    backend.quant_config = SimpleNamespace(layer_quant_mode=quant_mode)
 
     quantized, scales = backend.quantize_input(hidden_states)
 
     assert quantized is fp8_tensor
     assert scales.data_ptr() == scaling_factor.data_ptr()
     assert torch.equal(scales, scaling_factor)
-
-
-def build_test_activation(
-    activation_type: ActivationType,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
-) -> "SimpleActivation | SwigluActivation | SwigluBiasActivation | SiTuActivation":
-    """Package the flat parameters these tests parametrize over as one activation.
-
-    The tests still sweep alpha / beta / limit independently because that is
-    what ``quantize_util.get_swiglu_tensors`` produces for the reference
-    implementation. Presence of alpha or beta means the gpt-oss package, which
-    is the same rule the C++ op applied when it upgraded a bare ``Swiglu`` with
-    constants to ``SwigluBias``.
-    """
-    kind = ActivationType(activation_type)
-    if kind is ActivationType.SiTu:
-        return SiTuActivation(gate_softcap=swiglu_alpha, linear_softcap=swiglu_beta)
-    if swiglu_alpha is not None or swiglu_beta is not None:
-        return SwigluBiasActivation(
-            gate_sigmoid_scale=swiglu_alpha,
-            linear_offset=swiglu_beta,
-            clamp=swiglu_limit,
-        )
-    if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
-        return SwigluActivation(clamp=swiglu_limit)
-    return SimpleActivation(kind=kind)
 
 
 def create_test_backend(
@@ -287,7 +267,9 @@ def create_test_backend(
     n_shared_experts: int = 0,
 ) -> MoE:
     """Create a MoE backend for testing."""
-    backend_cls = get_backend_class(backend_type)
+    backend_cls = get_backend_class(
+        backend_type, None if quant_config is None else quant_config.quant_algo
+    )
     if locality_domain_policy is None:
         locality_domain_policy = LocalityDomainPolicy(enabled=False)
 
@@ -573,7 +555,11 @@ def _make_trtllm_gen_moe(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
     )
-    return TRTLLMGenFusedMoE(
+    # The leaf for this checkpoint's format. ``TRTLLMGenFusedMoE`` itself is
+    # abstract now, so the class has to come from the quantization the caller
+    # asked for.
+    leaf_cls = trtllm_gen_leaf(None if quant_config is None else quant_config.quant_algo)
+    return leaf_cls(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -689,7 +675,6 @@ def test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale() -> None:
     "quant_algo",
     [
         pytest.param(None, id="unquantized"),
-        pytest.param(QuantAlgo.FP8, id="fp8"),
         pytest.param(QuantAlgo.W4A16_MXFP4, id="w4a16_mxfp4"),
     ],
 )
@@ -700,8 +685,16 @@ def test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins(quant_algo) ->
     W4A8_MXFP4_MXFP8 (group-32) cubin families. Anything else has to be
     rejected at construction rather than silently resolving to SwiGLU, which
     is structurally wrong output that no shape check would catch.
+
+    Formats with no TRTLLM-Gen leaf at all (QuantAlgo.FP8, say) are no longer
+    part of this: since the split there is no class to construct for them, so
+    they are turned down by the registry lookup rather than by this check.
+
+    The construction-time refusal is the second line of defence. Selection now
+    turns the same formats down before a leaf is ever built; see
+    ``test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin``.
     """
-    with pytest.raises(ValueError, match="requires one of .* quantization"):
+    with pytest.raises(ValueError, match="reaches no fused SiTu cubin"):
         _make_trtllm_gen_moe(quant_config=QuantConfig(quant_algo=quant_algo), situ=True)
 
 
