@@ -25,7 +25,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
 from .activation import MoEActivationSupport
-from .fused_moe_cutlass import CutlassFusedMoE
+from .cutlass import TrtllmCutlassNvfp4Impl
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -148,17 +148,28 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
     return True
 
 
-class CuteDslB12xFusedMoE(CutlassFusedMoE):
+class CuteDslB12xFusedMoE(TrtllmCutlassNvfp4Impl):
     """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
     Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
 
-    The only subclass of ``CutlassFusedMoE``, and the only backend for which
-    that is a real dependency rather than a shortcut: ``_route_to_cutlass``
-    sends every NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
-    ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
-    (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
-    LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
+    Inherits the CUTLASS **NVFP4 leaf**, not the family base: after the
+    per-format split the NVFP4 grouped-GEMM ``run_moe`` / ``quantize_input``
+    live on that leaf, and the prefill chunk this class routes to CUTLASS is
+    NVFP4 by definition. The two hand-offs below are therefore ordinary
+    ``super()`` calls rather than the unbound ``CutlassFusedMoE.<method>(self,
+    ...)`` form they used to need, and the inherited execution state (chunking
+    stream and events, ``use_fused_finalize``, the tuner flags, the LoRA slot
+    helpers, ``_tuner_shapes``) comes from the same place it always did.
+
+    The dependency is real rather than a shortcut, and it is one-sided: only
+    the ``NVFP4`` half of this backend touches CUTLASS. The ``W4A16_NVFP4``
+    half never does -- ``_route_to_cutlass`` returns False for it
+    unconditionally, and ``__init__`` patches the FlashInfer W4A16 tile
+    selector precisely because that path stays on the b12x decode kernel.
+    Splitting this class in two along that line, so the W4A16 half stops
+    inheriting CUTLASS at all, needs its own identity work and belongs with the
+    CuteDSL item rather than here.
 
     ``CuteDslFusedMoE.run_moe_nvfp4*`` is never reached from here, so the
     ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries it needs are not
@@ -167,13 +178,20 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
     class.
     """
 
-    # Inherited wholesale from CutlassFusedMoE, so every field is restated.
+    # ``descriptor`` is inherited from the NVFP4 leaf and therefore reads
+    # ``trtllm.cutlass.grouped_gemm.nvfp4``, which is only half true for this
+    # backend. It is harmless today: this class carries no ``@register_moe_impl``
+    # so it never enters the registry, and resolution reports name classes
+    # (``_legacy_backend_name``) rather than descriptors. Giving b12x its own
+    # identity is the CuteDSL item.
+    #
+    # Inherited wholesale from the NVFP4 leaf, so every field is restated.
     # No code path here reads ``w3_w1_bias`` / ``w2_bias`` or fuses LoRA, and
     # ``supports_eplb`` stays False -- which is why ``can_implement`` has to
     # decline ``d.eplb_enabled`` explicitly, since the inherited
     # ``_supports_load_balancer()`` answers True.
     # ``supports_apply_router_weight_on_input`` is False where the parent says
-    # True: only the NVFP4 prefill chunk reaches ``CutlassFusedMoE.run_moe``,
+    # True: only the NVFP4 prefill chunk reaches the inherited ``run_moe``,
     # while the decode path hands ``token_final_scales`` straight to the
     # flashinfer b12x wrapper, which has no declared behaviour for the ``None``
     # the scheduler's fold leaves there.
@@ -326,7 +344,7 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
             return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 
-    # ``post_load_weights`` is inherited from ``CutlassFusedMoE`` and
+    # ``post_load_weights`` is inherited from the Cutlass base and
     # dispatches to ``self.quant_method.transform_weights(self)`` — for this
     # backend ``self.quant_method`` is ``NVFP4CuteDslB12xFusedMoEMethod``
     # (see ``_get_quant_method`` override), which performs the SF un-normalization,
@@ -345,16 +363,14 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         """Hybrid dispatch entrypoint for activation handling.
 
         NVFP4 prefill chunks take the inherited
-        :meth:`CutlassFusedMoE.quantize_input` path so the downstream
+        inherited NVFP4 ``quantize_input`` path so the downstream
         ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode chunks and
         W4A16_NVFP4 chunks pass through unchanged because b12x quantizes
         activations internally (consumes a bf16 / fp16 ``x`` and produces its
         own scale factors).
         """
         if self._route_to_cutlass(x):
-            return CutlassFusedMoE.quantize_input(
-                self, x, post_quant_comm=post_quant_comm, **kwargs
-            )
+            return super().quantize_input(x, post_quant_comm=post_quant_comm, **kwargs)
         if isinstance(x, Fp4QuantizedTensor):
             raise ValueError(
                 "CuteDslB12xFusedMoE does not accept Fp4QuantizedTensor input "
@@ -372,7 +388,7 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         plan = require_comm_plan(self, ctx)
         x = ctx.x
         if self._route_to_cutlass(x):
-            # ``CutlassFusedMoE.run_moe`` forwards ``output_dtype`` straight
+            # The inherited ``run_moe`` forwards ``output_dtype`` straight
             # into the C++ ``trtllm::fused_moe`` op, which requires a concrete
             # high-precision ``ScalarType`` (uint8 / FP4-packed activations are
             # rejected at the kernel epilogue with "Invalid output type Byte").
@@ -386,8 +402,7 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
                     if isinstance(x, torch.Tensor) and x.dtype in _HIGH_PRECISION
                     else torch.bfloat16
                 )
-            return CutlassFusedMoE.run_moe(
-                self,
+            return super().run_moe(
                 replace(ctx, output_dtype=cutlass_output_dtype),
                 workspace=workspace,
             )

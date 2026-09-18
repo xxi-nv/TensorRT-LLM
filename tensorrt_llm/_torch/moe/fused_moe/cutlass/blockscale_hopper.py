@@ -14,16 +14,24 @@
 # limitations under the License.
 """``deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales``."""
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from typing import Optional, Tuple, Union
+
+import torch
+
+from ....utils import Fp4QuantizedTensor
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
 from ..impl_identity import register_moe_impl
+from ..quantization import DeepSeekFP8BlockScalesFusedMoEMethod
 from .base import CutlassFusedMoEBase
 from .eligibility import BF16_ONLY, SmSupport, check_cutlass_leaf
+from .grouped_gemm import GroupedGemmFlags, run_grouped_gemm
 from .identity import (
     KERNEL_HOPPER_GROUPED_GEMM,
     PROVIDER_DEEPGEMM,
     TECHNIQUE_CUDA,
     blockscale_descriptor,
 )
+from .input_quant import quantize_noop
 
 
 @register_moe_impl
@@ -69,6 +77,26 @@ class DeepgemmCudaHopperFp8BlockScalesImpl(CutlassFusedMoEBase):
     #: The block-scale GEMM runner only has BF16 A / output instantiations.
     supported_dtypes = BF16_ONLY
 
+    #: The one flag that redirects FC1/FC2 away from the CUTLASS grouped GEMM.
+    GROUPED_GEMM_FLAGS = GroupedGemmFlags(use_deepseek_fp8_block_scale=True)
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_cutlass_leaf(cls, p, d)
+
+    def _get_quant_method(self) -> object:
+        return DeepSeekFP8BlockScalesFusedMoEMethod()
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Pass through: the block-scale runner quantizes activations itself."""
+        del kwargs
+        return quantize_noop(self, x, post_quant_comm)
+
+    def run_moe(self, ctx: MoERunContext, *, workspace: Optional[dict] = None) -> torch.Tensor:
+        del workspace  # Cutlass allocates its own intermediates.
+        return run_grouped_gemm(self, ctx, self.GROUPED_GEMM_FLAGS)
