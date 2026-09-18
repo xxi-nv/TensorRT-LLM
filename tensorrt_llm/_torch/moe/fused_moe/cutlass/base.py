@@ -13,12 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
-
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....peft.lora.layer import (
@@ -28,7 +25,7 @@ from ....peft.lora.layer import (
     MoeLoraLayer,
 )
 from ....peft.lora.validation import has_moe_lora_targets
-from ....utils import ActivationType, AuxStreamType, EventType, Fp4QuantizedTensor
+from ....utils import ActivationType, AuxStreamType, EventType
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -36,22 +33,11 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import MoERunContext, require_comm_plan
-from ..quantization import UnquantizedFusedMoEMethod
+from ..impl_contract import MoERunContext
 
 # isort: off
 from ..quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod,
-    FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode,
-    MXFP8CutlassFusedMoEMethod,
-    NVFP4CutlassFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod,
-    W4A16NVFP4CutlassFusedMoEMethod,
-    W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod,
 )
 
 # isort: on
@@ -602,139 +588,9 @@ class CutlassFusedMoEBase(MoEImplBase):
             and not self.quant_config.layer_quant_mode.has_per_group_scaling()
         )
 
-    def quantize_input(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        post_quant_comm: bool = True,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Quantize input tensor - Cutlass-family implementation
-
-        Handles all quantization cases for Cutlass backend.
-
-        Args:
-            x: Input tensor to quantize
-            post_quant_comm: Whether this is for post-quantization communication
-                           (allgather or alltoall). If True, x_sf will be reshaped to 2D.
-
-        Returns:
-            Tuple of (quantized_x, x_sf)
-        """
-        x_sf = None
-        if self.has_any_quant:
-            # W4A16 NVFP4 path keeps activations hp; skip FP4 quant below.
-            if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
-                return x, None
-            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant
-                )
-            elif self.has_deepseek_fp8_block_scales:
-                # No quantization needed here, handled in kernel
-                pass
-            elif self.has_w4afp8:
-                # No quantization needed here, handled in kernel
-                pass
-            elif self.has_w4a16_mxfp4:
-                # Padding deferred to run_moe so that dispatch sends
-                # unpadded tensors (avoids NVLink workspace overallocation).
-                pass
-            elif self.has_int8_woq_per_channel:
-                # No quantization needed here, handled in kernel
-                pass
-            elif self.has_nvfp4:
-                if hasattr(self, "fc31_act_scale") and self.fc31_act_scale is not None:
-                    assert not isinstance(x, Fp4QuantizedTensor), (
-                        "Fp4QuantizedTensor is not expected for AWQ quantization."
-                    )
-                    x = x * self.fc31_act_scale
-
-                # Dynamic quantization: compute input_scale from current input
-                # and update alpha in-place (same tensor addresses for CUDA graph).
-                if self.force_dynamic_quantization and hasattr(self, "fc31_weight_scale_2"):
-                    FP8_MAX, E2M1_MAX = 448.0, 6.0
-                    amax_input = torch.amax(torch.abs(x)).float()
-                    dyn_input_scale = FP8_MAX * E2M1_MAX / amax_input
-
-                    # fc31_alpha[e] = weight_scale_2[e] / dyn_input_scale
-                    self.fc31_alpha.data.copy_(self.fc31_weight_scale_2.data / dyn_input_scale)
-                    self.fc31_input_scale.data.copy_(dyn_input_scale)
-
-                # Quantize based on communication scenario
-                if post_quant_comm:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        assert not x.is_sf_swizzled, (
-                            "Fp4QuantizedTensor should not be swizzled before communication"
-                        )
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                        x_row = x.shape[0]
-                    else:
-                        x_row = x.shape[0]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size, False, False
-                        )
-                    # Reshape x_sf to 2D for post-quant communication
-                    if x_sf is not None:
-                        x_sf = x_sf.view((x_row, -1))
-                else:
-                    if not isinstance(x, Fp4QuantizedTensor):
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size, False, True
-                        )
-            elif self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8:
-                # MXFP8 dynamic activation quantize. The MXFP8xMXFP8 path reuses
-                # the same activation quant kernel as W4A8 MXFP4xMXFP8 -- only
-                # the weight side differs (B element widens from fp4 to fp8).
-                if post_quant_comm:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                        x, False, alignment=self.quant_method.weight_alignment
-                    )
-                    # Reshape x_sf to 2D for post-quant communication
-                    # x.shape[0] is padded
-                    if x_sf is not None:
-                        x_sf = x_sf.view((x.shape[0], -1))
-                else:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                        x, True, alignment=self.quant_method.weight_alignment
-                    )
-            else:
-                raise ValueError(f"unsupported quantization mode: {self.quant_config.quant_mode}")
-
-        return x, x_sf
-
     def _supports_load_balancer(self) -> bool:
         """Every Cutlass leaf supports the load balancer."""
         return True
-
-    def _get_quant_method(self):
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
-            exclude_kv_cache=True
-        ):
-            if self.quant_config.layer_quant_mode.has_fp8_qdq():
-                return FP8QDQFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
-            elif self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
-                return W4A16NVFP4CutlassFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4CutlassFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group():
-                return WInt4AFP8FusedMoEMethod()
-            elif self.has_int8_woq_per_channel:
-                return INT8WoqPerChannelFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
-                return W4A8MXFP4FP8CutlassFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
-                return WFP4A16FusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
-                return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_mxfp8():
-                return MXFP8CutlassFusedMoEMethod()
-            else:
-                raise ValueError(f"Unsupported quantization mode: {self.quant_config.quant_mode}")
-        else:
-            return UnquantizedFusedMoEMethod()
 
     def supports_moe_output_in_alltoall_workspace(self):
         return True
@@ -757,250 +613,3 @@ class CutlassFusedMoEBase(MoEImplBase):
         else:
             tuner_num_tokens = ctx.x.shape[0] * self.mapping.tp_size
         return tuner_num_tokens, self.routing_method.top_k
-
-    def run_moe(
-        self,
-        ctx: MoERunContext,
-        *,
-        workspace: Optional[dict] = None,
-    ) -> torch.Tensor:
-        """
-        Run MoE computation with Cutlass backend.
-
-        This method encapsulates the core MoE computation logic, handling different
-        quantization schemes.
-
-        Returns:
-            final_hidden_states: Output tensor from MoE computation
-        """
-        del workspace  # Cutlass allocates its own intermediates.
-        plan = require_comm_plan(self, ctx)
-        x = ctx.x
-        token_selected_experts = ctx.token_selected_experts
-        token_final_scales = ctx.token_final_scales
-        x_sf = ctx.x_sf
-        output_dtype = ctx.output_dtype
-        lora_params = ctx.lora_params
-        is_sf_swizzled = plan.input_sf_swizzled
-        moe_output = plan.moe_output
-        enable_alltoall = plan.enable_alltoall
-        tuner_num_tokens, tuner_top_k = self._tuner_shapes(ctx, enable_alltoall)
-
-        # W4A16 NVFP4 fallback (SM<100).
-        if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
-            return self._run_moe_w4a16_nvfp4(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                output_dtype=output_dtype,
-                tuner_num_tokens=tuner_num_tokens,
-                tuner_top_k=tuner_top_k,
-                moe_output=moe_output,
-                enable_alltoall=enable_alltoall,
-            )
-
-        # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
-        # for large token counts due to cuTensorMapEncodeTiled limitations).
-        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
-            from ..fused_moe_triton_fp8_block_scale import run_triton_fp8_block_scale_moe
-
-            # forward_chunk sets token_final_scales=None when
-            # apply_router_weight_on_input=True (weights already folded into x);
-            # substitute ones so the Triton kernel's per-token scaling is a no-op.
-            if token_final_scales is None:
-                token_final_scales = torch.ones_like(token_selected_experts, dtype=torch.float32)
-            # token_selected_experts contains GLOBAL expert IDs in the non-alltoall
-            # path (slot_start .. slot_end-1 for this rank's local experts, plus
-            # IDs for other ranks).  The Triton kernel operates on LOCAL IDs
-            # (0 .. expert_size_per_partition-1), so remap and zero-scale any
-            # non-local token-expert pairs to suppress their contribution.
-            local_n = self.expert_size_per_partition
-            if enable_alltoall:
-                # After alltoall dispatch, IDs are already local; padding = local_n
-                local_ids = token_selected_experts.clamp(0, local_n - 1)
-                is_local = token_selected_experts < local_n
-            else:
-                slot_start = self.slot_start
-                local_ids = (token_selected_experts - slot_start).clamp(0, local_n - 1)
-                is_local = (token_selected_experts >= slot_start) & (
-                    token_selected_experts < slot_start + local_n
-                )
-            local_scales = token_final_scales * is_local.to(token_final_scales.dtype)
-            result = run_triton_fp8_block_scale_moe(
-                x,
-                local_ids,
-                local_scales,
-                self.w3_w1_weight,
-                self.quant_scales.fc_weight_scales,
-                self.w2_weight,
-                self.quant_scales.proj_weight_scales,
-                activation_type=self.activation_type,
-                output_dtype=output_dtype,
-            )
-            return result
-
-        # Pad input for mxfp4 alignment (128-aligned hidden_size).
-        # Done here rather than in quantize_input so that dispatch sends
-        # unpadded tensors and avoids NVLink workspace overallocation.
-        if self.has_w4a16_mxfp4:
-            pad_size = self.hidden_size - x.shape[-1]
-            if pad_size > 0:
-                x = torch.nn.functional.pad(x, (0, pad_size))
-
-        # Determine weight dtype based on quantization mode
-        weight_dtype = self.w3_w1_weight.dtype
-        if self.has_any_quant:
-            if self.has_w4afp8:
-                weight_dtype = torch.quint4x2
-            elif self.has_w4a16_mxfp4:
-                weight_dtype = torch.uint8
-
-        use_dynamic_fc2_scale = (
-            self.has_nvfp4
-            and getattr(self, "force_dynamic_quantization", False)
-            and hasattr(self, "fc2_weight_scale_2")
-        )
-
-        lora_kwargs = self._extract_moe_lora_tensors(lora_params)
-        if lora_kwargs is None:
-            lora_kwargs = {}
-
-        result = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            self.w3_w1_weight.view(weight_dtype),
-            self.w3_w1_bias,
-            self.w2_weight.view(weight_dtype),
-            self.w2_bias,
-            output_dtype,
-            quant_scales=list(self.quant_scales)
-            + ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
-            input_sf=x_sf,
-            swizzled_input_sf=is_sf_swizzled,
-            # ``swiglu_*`` are the moe_op schema's names for these registers
-            # (``ActivationParams`` in moe_kernels.h); SiTU fills the same three
-            # with tanh soft-caps.
-            swiglu_alpha=self.act_alpha,
-            swiglu_beta=self.act_beta,
-            swiglu_limit=self.act_clamp,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            enable_alltoall=enable_alltoall,
-            use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
-            use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
-            use_int8_woq_per_channel=self.has_int8_woq_per_channel,
-            # use_mxfp8_act_scaling drives dynamic MXFP8 activation quantization
-            # before the GEMM; required for both W4A8 MXFP4xMXFP8 and W8A8
-            # MXFP8xMXFP8 paths.
-            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8,
-            min_latency_mode=False,
-            use_fused_finalize=self.use_fused_finalize,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-            activation_type=self.activation_type,
-            unpadded_hidden_size=self.unpadded_hidden_size,
-            out_tensor=moe_output,
-            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
-            # use_mxfp8_weight_scaling selects the MXFP8xMXFP8 block-scaled
-            # kernel path within the <e4m3, e4m3> CutlassMoeFCRunner template
-            # (per-tensor FP8 otherwise).
-            use_mxfp8_weight_scaling=self.has_mxfp8,
-            **lora_kwargs,
-        )
-        # When moe_output is provided, the result is written in-place and
-        # fused_moe returns empty list to avoid aliasing constraint violation.
-        # Otherwise, unpack the single tensor from the returned list.
-        if moe_output is not None:
-            final_hidden_states = moe_output
-        else:
-            final_hidden_states = result[0]
-
-        return final_hidden_states
-
-    def _run_moe_w4a16_nvfp4(
-        self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        *,
-        enable_alltoall: bool,
-    ) -> torch.Tensor:
-        """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
-        a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
-        original (global) token_selected_experts. CUDA-graph capturable.
-
-        ``enable_alltoall`` has no default because it picks the expert-id remap
-        below, and either default is silently wrong for half the callers: the
-        ids are local after an alltoall dispatch and global otherwise, so a
-        wrong guess shifts every id by ``slot_start`` without failing.
-        """
-        assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
-
-        if output_dtype is None:
-            output_dtype = x.dtype
-
-        # Same EP id convention as the FP8 path above: global ids (or
-        # ``local_n``-padded under alltoall). Clamp to local range so the
-        # active-mask scatter is in-bounds; non-local tokens collapse onto a
-        # boundary expert (1 extra dequant/rank). ``trtllm.fused_moe`` below
-        # still gets the original global ids -- it does its own remap.
-        local_n = self.expert_size_per_partition
-        if enable_alltoall:
-            local_ids = token_selected_experts.clamp(0, local_n - 1)
-        else:
-            local_ids = (token_selected_experts - self.slot_start).clamp(0, local_n - 1)
-
-        w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
-            self, local_ids, output_dtype
-        )
-
-        # bf16 fused_moe with empty quant_scales (matches unquantized path).
-        result = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            w3_w1_hp,
-            self.w3_w1_bias,
-            w2_hp,
-            self.w2_bias,
-            output_dtype,
-            quant_scales=[],
-            input_sf=None,
-            swizzled_input_sf=False,
-            swiglu_alpha=self.act_alpha,
-            swiglu_beta=self.act_beta,
-            swiglu_limit=self.act_clamp,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            enable_alltoall=enable_alltoall,
-            use_deepseek_fp8_block_scale=False,
-            use_w4_group_scaling=False,
-            use_int8_woq_per_channel=False,
-            use_mxfp8_act_scaling=False,
-            min_latency_mode=False,
-            use_fused_finalize=self.use_fused_finalize,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-            activation_type=self.activation_type,
-            unpadded_hidden_size=self.unpadded_hidden_size,
-            out_tensor=moe_output,
-            use_dynamic_fc2_scale=False,
-        )
-        if moe_output is not None:
-            return moe_output
-        return result[0]

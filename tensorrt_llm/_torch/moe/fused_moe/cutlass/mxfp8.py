@@ -14,11 +14,19 @@
 # limitations under the License.
 """``trtllm.cutlass.grouped_gemm.mxfp8``."""
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from typing import Optional, Tuple, Union
+
+import torch
+
+from ....utils import Fp4QuantizedTensor
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
 from ..impl_identity import register_moe_impl
+from ..quantization import MXFP8CutlassFusedMoEMethod
 from .base import CutlassFusedMoEBase
 from .eligibility import HP_DTYPES, SmSupport, check_cutlass_leaf
+from .grouped_gemm import GroupedGemmFlags, run_grouped_gemm
 from .identity import cutlass_descriptor
+from .input_quant import quantize_mxfp8
 
 
 @register_moe_impl
@@ -47,7 +55,25 @@ class TrtllmCutlassMxfp8Impl(CutlassFusedMoEBase):
     supported_dtypes = HP_DTYPES
 
     supports_gptoss_style = True
+    #: Kernel-selection flags for this format.
+    GROUPED_GEMM_FLAGS = GroupedGemmFlags(use_mxfp8_act_scaling=True, use_mxfp8_weight_scaling=True)
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_cutlass_leaf(cls, p, d)
+
+    def _get_quant_method(self) -> object:
+        return MXFP8CutlassFusedMoEMethod()
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del kwargs
+        return quantize_mxfp8(self, x, post_quant_comm)
+
+    def run_moe(self, ctx: MoERunContext, *, workspace: Optional[dict] = None) -> torch.Tensor:
+        del workspace  # Cutlass allocates its own intermediates.
+        return run_grouped_gemm(self, ctx, self.GROUPED_GEMM_FLAGS)

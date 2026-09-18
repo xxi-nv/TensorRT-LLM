@@ -14,8 +14,14 @@
 # limitations under the License.
 """``trtllm.cutlass.grouped_gemm.nvfp4``."""
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from typing import Optional, Tuple, Union
+
+import torch
+
+from ....utils import Fp4QuantizedTensor
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
 from ..impl_identity import register_moe_impl
+from ..quantization import NVFP4CutlassFusedMoEMethod
 from .base import CutlassFusedMoEBase
 from .eligibility import (
     HP_DTYPES_WITH_FP8,
@@ -23,7 +29,9 @@ from .eligibility import (
     check_cutlass_leaf,
     check_nvfp4_shard_alignment,
 )
+from .grouped_gemm import DEFAULT_FLAGS, run_grouped_gemm
 from .identity import cutlass_descriptor
+from .input_quant import quantize_nvfp4
 
 
 @register_moe_impl
@@ -55,7 +63,36 @@ class TrtllmCutlassNvfp4Impl(CutlassFusedMoEBase):
 
     supports_gptoss_style = True
     rejects_gptoss_expert_bias = True
+    #: Kernel-selection flags for this format.
+    GROUPED_GEMM_FLAGS = DEFAULT_FLAGS
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_cutlass_leaf(cls, p, d, check_nvfp4_shard_alignment)
+
+    def _get_quant_method(self) -> object:
+        return NVFP4CutlassFusedMoEMethod()
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del kwargs
+        return quantize_nvfp4(self, x, post_quant_comm)
+
+    def run_moe(self, ctx: MoERunContext, *, workspace: Optional[dict] = None) -> torch.Tensor:
+        del workspace  # Cutlass allocates its own intermediates.
+        # Dynamic quantization appends the FC2 weight scale and asks the kernel
+        # to apply it; the static path leaves both alone.
+        use_dynamic_fc2_scale = self.force_dynamic_quantization and hasattr(
+            self, "fc2_weight_scale_2"
+        )
+        return run_grouped_gemm(
+            self,
+            ctx,
+            self.GROUPED_GEMM_FLAGS,
+            extra_quant_scales=[self.fc2_weight_scale_2] if use_dynamic_fc2_scale else (),
+            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
+        )
