@@ -146,7 +146,9 @@ def create_moe_backend(
             activation=activation,
         )
 
-    if moe_cls is CutlassFusedMoE or issubclass(moe_cls, MarlinFusedMoE):
+    # ``issubclass`` on both sides: each name is a family whose leaves are what
+    # resolution hands over, so an equality check would match nothing.
+    if issubclass(moe_cls, CutlassFusedMoE) or issubclass(moe_cls, MarlinFusedMoE):
         # The two whose constructor takes an expert-bias flag. Marlin declines
         # the flag itself, so the check above already rejected a True.
         return moe_cls(

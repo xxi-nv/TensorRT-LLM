@@ -48,6 +48,7 @@ from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
+from ..moe.fused_moe.cutlass import SmSupport, TrtllmCutlassNvfp4Impl
 from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                           W4A16NVFP4CutlassFusedMoEMethod)
@@ -832,10 +833,18 @@ def _use_w4a16_for_nvfp4_on_hopper():
         return
 
     original_linear = Linear.get_quant_method
+    # Still patchable on the family base: ``_get_quant_method`` stayed there
+    # when the Cutlass class split into per-format leaves, so every leaf
+    # inherits the patched version.
     original_moe = CutlassFusedMoE._get_quant_method
     original_mlp_create_weights = MLP.create_weights
-    nvfp4_entry = CutlassFusedMoE._QUANT_SUPPORT_TABLE[QuantAlgo.NVFP4]
-    original_sm_constraint = nvfp4_entry["sm_constraint"]
+    # The SM set is now declared by the leaf that implements NVFP4, not by a
+    # row in a table on the shared class. Note the resulting ID is honest
+    # about neither side: the checkpoint says NVFP4, this context makes the
+    # NVFP4 leaf admit SM90, and the patch above then hands it a W4A16 weight
+    # method. Making the layer resolve to the ``w4a16_nvfp4`` leaf instead is a
+    # separate change.
+    original_sm_support = TrtllmCutlassNvfp4Impl.sm_support
 
     def _patched_linear(self, quant_config):
         method = original_linear(self, quant_config)
@@ -856,9 +865,10 @@ def _use_w4a16_for_nvfp4_on_hopper():
         self._use_fused_relu2_quant = False
 
     # Allow SM 90 through can_implement(); existing entries preserved.
-    constraint_type, constraint_set = original_sm_constraint
-    nvfp4_entry["sm_constraint"] = (constraint_type,
-                                    frozenset(constraint_set) | {90})
+    # ``SmSupport`` is frozen, so this replaces the declaration rather than
+    # mutating it -- and the original is restored in the finally below.
+    TrtllmCutlassNvfp4Impl.sm_support = SmSupport(
+        allowed=original_sm_support.allowed | {90})
 
     Linear.get_quant_method = _patched_linear
     CutlassFusedMoE._get_quant_method = _patched_moe
@@ -869,7 +879,7 @@ def _use_w4a16_for_nvfp4_on_hopper():
         Linear.get_quant_method = original_linear
         CutlassFusedMoE._get_quant_method = original_moe
         MLP.create_weights = original_mlp_create_weights
-        nvfp4_entry["sm_constraint"] = original_sm_constraint
+        TrtllmCutlassNvfp4Impl.sm_support = original_sm_support
 
 
 @register_auto_model("NemotronHPuzzleForCausalLM")

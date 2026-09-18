@@ -64,7 +64,7 @@ from torch.autograd import DeviceType
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE, MoE
+from tensorrt_llm._torch.moe.fused_moe import MoE, find_cutlass_grouped_gemm_leaf
 from tensorrt_llm._torch.moe.fused_moe.communication import Communication, CommunicationFactory
 from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
 from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
@@ -1267,7 +1267,10 @@ def _run_benchmark_worker_under_current_mpi(
         moe = None
         if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
             routing_method = DefaultMoeRoutingMethod(top_k=top_k)
-            moe = CutlassFusedMoE(
+            # The leaf for this format: ``CutlassFusedMoE`` is the family base
+            # and abstract since the per-format split.
+            moe_cls = find_cutlass_grouped_gemm_leaf(quant_algo)
+            moe = moe_cls(
                 routing_method=routing_method,
                 num_experts=num_experts_total,
                 hidden_size=hidden_size,

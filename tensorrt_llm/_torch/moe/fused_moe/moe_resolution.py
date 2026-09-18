@@ -29,10 +29,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import ActivationParamShape, MoEActivation, activation_constant_names
+from .cutlass import CUTLASS_LEAVES
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
-from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
@@ -122,7 +122,12 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MarlinCudaNvfp4Impl,
     MarlinCudaW4a16Nvfp4Impl,
     TritonFusedMoE,
-    CutlassFusedMoE,  # widest coverage, hence the fallback
+    # The Cutlass family, in the order ``CUTLASS_LEAVES`` declares. Expanded
+    # rather than listed again, so the family has one source of order. It comes
+    # last because it is the fallback: widest coverage between the twelve of
+    # them, and the two ``fp8_block_scales`` leaves lead the group since their
+    # SM gates are the narrowest.
+    *CUTLASS_LEAVES,
     VanillaMoE,  # reference implementation, never preferred
 )
 
@@ -130,7 +135,12 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 # ``moe_backend`` literal and a pinned identity reach the same class for the
 # DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
-    "CUTLASS": frozenset({CutlassFusedMoE}),
+    # All twelve leaves, including the two whose identity is not ``cutlass``:
+    # ``moe_backend: CUTLASS`` has always served FP8 block scales on SM90 and
+    # SM120, and the coarse literal names the family that historically carried
+    # a format, not the ``technique`` token. Moving the SM90 leaf to DEEPGEMM
+    # is a follow-up that also has to update the checked-in H200 configs.
+    "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
@@ -183,7 +193,14 @@ def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
 
 
 # Widest coverage; default degradation target.
-FALLBACK_IMPL: MoEImplClass = CutlassFusedMoE
+#
+# A set rather than one class, because "widest coverage" stopped being a
+# property any single class has. It used to be ``CutlassFusedMoE``, which
+# served eleven formats by itself; after the split that name is an abstract
+# base with no descriptor and no single-format ``can_implement``, so it cannot
+# be a resolution candidate at all. The coverage is spread across the twelve
+# leaves, and the fallback is all of them.
+FALLBACK_IMPLS: Tuple[MoEImplClass, ...] = CUTLASS_LEAVES
 
 
 def _legacy_backend_name(impl_cls: MoEImplClass) -> str:
@@ -402,8 +419,12 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if family is None:
         raise ValueError(f"Unsupported moe backend: {backend}")
     candidates = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in family]
-    if FALLBACK_IMPL not in family and normalized not in NO_FALLBACK_BACKENDS:
-        candidates.append(FALLBACK_IMPL)
+    # Append the fallback family only when the request did not already name it.
+    # ``isdisjoint`` rather than a single membership test, because the fallback
+    # is now the whole Cutlass family: a request for CUTLASS already has all of
+    # them, and any other family gets them appended in priority order.
+    if family.isdisjoint(FALLBACK_IMPLS) and normalized not in NO_FALLBACK_BACKENDS:
+        candidates.extend(FALLBACK_IMPLS)
     return candidates
 
 
