@@ -31,7 +31,7 @@ from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import find_cutlass_grouped_gemm_leaf
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
@@ -122,7 +122,7 @@ def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
         by_literal = resolve_moe_impl(config)
         by_identity = resolve_moe_impl(config, impl_id=_DEEPGEMM_IMPL_ID)
 
-    assert impl_class_for(by_literal) is CutlassFusedMoE
+    assert impl_class_for(by_literal) is find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4)
     assert by_literal.degraded
 
     assert by_identity.winner is None

@@ -64,12 +64,16 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import (
+    CutlassFusedMoE,
+    find_cutlass_grouped_gemm_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -807,7 +811,9 @@ def test_marlin_is_selected_for_nvfp4():
 def test_marlin_degrades_to_cutlass_on_non_nvfp4(quant_algo):
     with override_moe_environment(_marlin_environment()):
         report = resolve_moe_impl(_marlin_model_config(quant_algo))
-    assert impl_class_for(report) is CutlassFusedMoE
+    # The family's leaf for this format, not the family base: resolution hands
+    # over one leaf, and which one is part of what the degradation did.
+    assert impl_class_for(report) is find_cutlass_grouped_gemm_leaf(quant_algo)
     assert report.degraded
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
@@ -820,7 +826,7 @@ def test_marlin_override_quant_config_degrades_per_layer():
             override_quant_config=QuantConfig(quant_algo=None),
             layer_idx=52,
         )
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is find_cutlass_grouped_gemm_leaf(None)
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
@@ -1278,9 +1284,13 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
 def test_apply_router_weight_on_input_support_is_not_inherited():
     """``CuteDslB12xFusedMoE`` is the one impl that keeps its ``CutlassFusedMoE``
     parent, and this is a field where the two disagree: only the NVFP4 prefill
-    chunk reaches the parent's ``run_moe``, while the decode path hands
-    ``token_final_scales`` to the flashinfer wrapper."""
-    assert CutlassFusedMoE.capabilities.supports_apply_router_weight_on_input
+    chunk reaches the Cutlass ``run_moe``, while the decode path hands
+    ``token_final_scales`` to the flashinfer wrapper.
+
+    Compared against the NVFP4 leaf rather than the family base: since the
+    per-format split, capabilities are declared by the leaves, and the NVFP4
+    one is what B12x's prefill chunk actually runs."""
+    assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
     assert not CuteDslB12xFusedMoE.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
@@ -3110,7 +3120,11 @@ def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
 
 
 @pytest.mark.parametrize(
-    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+    # The NVFP4 leaf, not the family base: ``can_implement`` is per leaf now,
+    # and this case is about the NVFP4 shard-alignment gate.
+    "backend_cls",
+    [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE],
+    ids=["cutlass", "cutedsl"],
 )
 @pytest.mark.parametrize(
     "intermediate_size,activation,moe_tp_size,rejected",
