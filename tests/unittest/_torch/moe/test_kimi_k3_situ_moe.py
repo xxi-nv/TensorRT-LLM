@@ -677,8 +677,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
     from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import find_cutlass_grouped_gemm_leaf
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
         BACKEND_FAMILY,
@@ -698,8 +698,11 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
                 )
             ),
         )
+    # Patch the leaf, not the family name: every leaf defines its own
+    # ``can_implement``, which would shadow a patch on the abstract base.
+    nvfp4_leaf = find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4)
     monkeypatch.setattr(
-        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+        nvfp4_leaf, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
     )
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     pretrained_config = PretrainedConfig()
@@ -724,7 +727,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
         allow_degradation=True,
     )
     assert report.degraded
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is nvfp4_leaf
 
     # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
     with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:

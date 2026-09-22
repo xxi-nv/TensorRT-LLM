@@ -1880,7 +1880,7 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         return None
 
     # CUTLASS backend
-    # Mapping based on CutlassFusedMoE._get_quant_method() logic
+    # Mirrors each CUTLASS leaf's _get_quant_method()
     if backend_str == "CUTLASS":
         DSFP8BlockScalesFusedMoEMethod = (
             DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm

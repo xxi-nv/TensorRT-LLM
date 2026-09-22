@@ -3578,7 +3578,7 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
     Loads an unmodified NVFP4 MoE ckpt; only load-time change is un-swizzling
     per-block scales once so the per-forward dequant skips that step.
-    ``CutlassFusedMoE.run_moe`` dispatches here and uses an active-mask Triton
+    ``TrtllmCutlassW4a16Nvfp4Impl.run_moe`` dispatches here and uses an active-mask Triton
     kernel (``dequant_active_experts_to_hp``) to dequant only routed experts
     into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
     """
@@ -3774,7 +3774,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
     block_scale_interleave) so the backend's
     hybrid prefill path can continue to consume the standard CUTLASS
-    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+    NVFP4 GroupGEMM layout via the inherited ``TrtllmCutlassNvfp4Impl.run_moe``.
 
     On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: SF un-normalization (multiply per-block

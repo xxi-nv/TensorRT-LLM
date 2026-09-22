@@ -64,10 +64,18 @@ from torch.autograd import DeviceType
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE, MoE
+from tensorrt_llm._torch.moe.fused_moe import MoE
 from tensorrt_llm._torch.moe.fused_moe.communication import Communication, CommunicationFactory
+from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
 from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
-from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
+from tensorrt_llm._utils import (
+    get_sm_version,
+    local_mpi_rank,
+    mpi_allgather,
+    mpi_barrier,
+    mpi_rank,
+    mpi_world_size,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -223,6 +231,21 @@ def _create_model_config(
         use_cuda_graph=False,
         use_low_precision_moe_combine=use_low_precision_moe_combine,
     )
+
+
+def _cutlass_leaf_for_quantize_input(quant_algo: QuantAlgo) -> Optional[type]:
+    """A Cutlass leaf whose ``quantize_input`` builds ``quant_algo``'s dispatch payload.
+
+    Only ``quantize_input`` runs here, never the GEMM, and the leaves publishing
+    one format share it: the two ``fp8_block_scales`` leaves differ only in the
+    SM their GEMM targets, and both pass activations through. So the leaf this
+    SM would run is preferred, and where none runs here any leaf of the format
+    still yields the same payload.
+    """
+    leaves = cutlass_leaves_in_resolution_order(quant_algo)
+    sm = get_sm_version()
+    any_leaf = leaves[0] if leaves else None
+    return next((leaf for leaf in leaves if leaf.sm_support.accepts(sm)), any_leaf)
 
 
 def _time_dispatch_and_combine(
@@ -1267,7 +1290,13 @@ def _run_benchmark_worker_under_current_mpi(
         moe = None
         if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
             routing_method = DefaultMoeRoutingMethod(top_k=top_k)
-            moe = CutlassFusedMoE(
+            moe_cls = _cutlass_leaf_for_quantize_input(quant_algo)
+            if moe_cls is None:
+                raise ValueError(
+                    f"No Cutlass leaf publishes {quant_algo.name}, so there is no "
+                    f"quantize_input to build the post-quant dispatch payload."
+                )
+            moe = moe_cls(
                 routing_method=routing_method,
                 num_experts=num_experts_total,
                 hidden_size=hidden_size,

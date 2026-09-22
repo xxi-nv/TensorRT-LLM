@@ -48,9 +48,6 @@ from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
-from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
-                                          W4A16NVFP4CutlassFusedMoEMethod)
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
@@ -174,6 +171,10 @@ class TransformerLayer(Attention):
                                **kwargs)
 
 
+# NVFP4 and the calibration recipes whose weights are plain NVFP4.
+_NVFP4_QUANT_ALGOS = (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC)
+
+
 class NemotronHMOE(nn.Module):
 
     def __init__(
@@ -292,6 +293,17 @@ class NemotronHMOE(nn.Module):
                     f"{module_prefix}.mixer.experts")):
             override_quant_config = QuantConfig(
                 kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+
+        # SM<100 has no NVFP4 MoE kernel. The W4A16 leaf loads the same NVFP4
+        # expert weights and dequantizes them every forward, so an NVFP4 layer
+        # is declared W4A16_NVFP4 here, where resolution reads it.
+        experts_quant_config = (override_quant_config if override_quant_config
+                                is not None else global_quant_config)
+        if (experts_quant_config is not None
+                and experts_quant_config.quant_algo in _NVFP4_QUANT_ALGOS
+                and get_sm_version() < 100):
+            override_quant_config = experts_quant_config.model_copy(
+                update={"quant_algo": QuantAlgo.W4A16_NVFP4})
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -849,30 +861,23 @@ def _force_moe_backend_for_w4a16_on_hopper(
 
 @contextmanager
 def _use_w4a16_for_nvfp4_on_hopper():
-    """SM<100 + NVFP4: swap NVFP4 quant methods -> W4A16 fallback,
-    loosen MoE SM constraint, and disable MLP's fused relu2+FP4 quant.
-    Class-level patches; model construction is single-threaded today.
+    """SM<100 + NVFP4: swap the NVFP4 linear method for its W4A16 fallback and
+    disable MLP's fused relu2+FP4 quant. The MoE experts need no patch:
+    ``NemotronHMOE`` builds them as W4A16_NVFP4, which resolves to the W4A16
+    CUTLASS leaf. Class-level patches; model construction is single-threaded
+    today.
     """
     if get_sm_version() >= 100:
         yield
         return
 
     original_linear = Linear.get_quant_method
-    original_moe = CutlassFusedMoE._get_quant_method
     original_mlp_create_weights = MLP.create_weights
-    nvfp4_entry = CutlassFusedMoE._QUANT_SUPPORT_TABLE[QuantAlgo.NVFP4]
-    original_sm_constraint = nvfp4_entry["sm_constraint"]
 
     def _patched_linear(self, quant_config):
         method = original_linear(self, quant_config)
         if type(method) is NVFP4LinearMethod:
             return W4A16NVFP4LinearMethod()
-        return method
-
-    def _patched_moe(self):
-        method = original_moe(self)
-        if type(method) is NVFP4CutlassFusedMoEMethod:
-            return W4A16NVFP4CutlassFusedMoEMethod()
         return method
 
     def _patched_mlp_create_weights(self):
@@ -881,21 +886,13 @@ def _use_w4a16_for_nvfp4_on_hopper():
         original_mlp_create_weights(self)
         self._use_fused_relu2_quant = False
 
-    # Allow SM 90 through can_implement(); existing entries preserved.
-    constraint_type, constraint_set = original_sm_constraint
-    nvfp4_entry["sm_constraint"] = (constraint_type,
-                                    frozenset(constraint_set) | {90})
-
     Linear.get_quant_method = _patched_linear
-    CutlassFusedMoE._get_quant_method = _patched_moe
     MLP.create_weights = _patched_mlp_create_weights
     try:
         yield
     finally:
         Linear.get_quant_method = original_linear
-        CutlassFusedMoE._get_quant_method = original_moe
         MLP.create_weights = original_mlp_create_weights
-        nvfp4_entry["sm_constraint"] = original_sm_constraint
 
 
 @register_auto_model("NemotronHPuzzleForCausalLM")
@@ -1003,7 +1000,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         # MIXED_PRECISION checkpoints, ``apply_layerwise_quant_config`` rebinds
         # per-layer ``quant_config`` to NVFP4 and then re-runs ``create_weights``
         # (see modeling_utils.py:543). Re-enter the context manager so the
-        # patched ``_get_quant_method`` catches that second pass.
+        # patched linear method catches that second pass. The MoE experts are
+        # unaffected: their W4A16_NVFP4 override is authoritative over the
+        # rebinding.
         with _use_w4a16_for_nvfp4_on_hopper():
             super().__post_init__()
 
