@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CuteDslB12xFusedMoE gating and dispatch tests."""
+"""B12x MoE backend gating and dispatch tests."""
 
 import sys
 import types
@@ -22,11 +22,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
@@ -49,6 +51,14 @@ pytestmark = pytest.mark.cpu_only
 # from the value under test hides a narrowing of that set, which is the
 # direction that silently drops hardware support.
 SUPPORTED_SM = [120, 121]
+
+# (leaf, the one quantization format it admits). The shared gates below are
+# parametrized over this so a gate that regresses on only one leaf still fails.
+B12X_LEAVES = [
+    (CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4),
+    (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
+]
+LEAF_IDS = [leaf.__name__ for leaf, _ in B12X_LEAVES]
 
 
 def _deployment(
@@ -89,24 +99,26 @@ def _problem(
     )
 
 
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
 @pytest.mark.parametrize("sm_version", [80, 89, 90, 100, 103])
-def test_can_implement_rejects_unsupported_sm(sm_version):
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(sm_version))
+def test_can_implement_rejects_unsupported_sm(leaf, quant_algo, sm_version):
+    verdict = leaf.can_implement(_problem(quant_algo), _deployment(sm_version))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
     assert f"SM{sm_version}" in verdict.detail
 
 
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
 @pytest.mark.parametrize("sm_version", SUPPORTED_SM)
-@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
-def test_can_implement_accepts_supported_sm(sm_version, quant_algo):
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(quant_algo), _deployment(sm_version))
+def test_can_implement_accepts_supported_sm(leaf, quant_algo, sm_version):
+    verdict = leaf.can_implement(_problem(quant_algo), _deployment(sm_version))
     assert verdict.eligible
     assert verdict.reject_reason is None
 
 
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
 @pytest.mark.parametrize(
-    "quant_algo",
+    "rejected_algo",
     [
         None,
         QuantAlgo.FP8,
@@ -115,51 +127,75 @@ def test_can_implement_accepts_supported_sm(sm_version, quant_algo):
         QuantAlgo.W4A8_MXFP4_FP8,
     ],
 )
-def test_can_implement_rejects_non_nvfp4(quant_algo):
-    """Only NVFP4 is supported; everything else must be turned away."""
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(quant_algo), _deployment(120))
+def test_can_implement_rejects_foreign_quant(leaf, quant_algo, rejected_algo):
+    """Each leaf admits one format; everything else must be turned away."""
+    del quant_algo
+    verdict = leaf.can_implement(_problem(rejected_algo), _deployment(120))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
-def test_can_implement_rejects_swiglu_gptoss_style():
-    verdict = CuteDslB12xFusedMoE.can_implement(
-        _problem(swiglu_gptoss_style=True), _deployment(120)
-    )
+@pytest.mark.parametrize(
+    "leaf,other_algo",
+    [
+        (CuteDslB12xNvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
+        (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.NVFP4),
+    ],
+    ids=LEAF_IDS,
+)
+def test_can_implement_rejects_the_other_leafs_quant(leaf, other_algo):
+    """The point of the split: neither leaf answers for the other's format.
+
+    Before the split one class claimed both, so a W4A16 layer could be handed
+    to the NVFP4 prefill path and vice versa.
+    """
+    verdict = leaf.can_implement(_problem(other_algo), _deployment(120))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_swiglu_gptoss_style(leaf, quant_algo):
+    verdict = leaf.can_implement(_problem(quant_algo, swiglu_gptoss_style=True), _deployment(120))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
-def test_can_implement_rejects_unsupported_activation_dtype(dtype):
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(dtype=dtype), _deployment(120))
+def test_can_implement_rejects_unsupported_activation_dtype(leaf, quant_algo, dtype):
+    verdict = leaf.can_implement(_problem(quant_algo, dtype=dtype), _deployment(120))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.DTYPE_UNSUPPORTED
 
 
-def test_can_implement_rejects_missing_flashinfer():
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, flashinfer=False))
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_missing_flashinfer(leaf, quant_algo):
+    verdict = leaf.can_implement(_problem(quant_algo), _deployment(120, flashinfer=False))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.DEP_MISSING
 
 
-def test_can_implement_rejects_eplb():
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_eplb(leaf, quant_algo):
     """EPLB is its own reject class, not a topology one: the machine is fine."""
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, eplb=True))
+    verdict = leaf.can_implement(_problem(quant_algo), _deployment(120, eplb=True))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.EPLB_UNSUPPORTED
 
 
-def test_can_implement_rejects_expert_parallelism():
-    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, ep_size=2))
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_expert_parallelism(leaf, quant_algo):
+    verdict = leaf.can_implement(_problem(quant_algo), _deployment(120, ep_size=2))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
 
 
-def test_can_implement_rejects_attention_dp_without_expert_parallelism():
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_attention_dp_without_expert_parallelism(leaf, quant_algo):
     """moe_tp == tp leaves ep_size at 1, so the EP gate alone would let this in."""
-    verdict = CuteDslB12xFusedMoE.can_implement(
-        _problem(), _deployment(120, ep_size=1, use_dp=True, parallel_size=2)
+    verdict = leaf.can_implement(
+        _problem(quant_algo), _deployment(120, ep_size=1, use_dp=True, parallel_size=2)
     )
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
@@ -167,21 +203,46 @@ def test_can_implement_rejects_attention_dp_without_expert_parallelism():
 
 
 # --------------------------------------------------------------------------
+# Leaf shape: which leaf can reach a CUTLASS kernel at all
+# --------------------------------------------------------------------------
+
+
+def test_nvfp4_leaf_inherits_the_cutlass_nvfp4_leaf():
+    """Its prefill chunk is CUTLASS NVFP4 grouped GEMM, reached via ``super()``."""
+    assert issubclass(CuteDslB12xNvfp4FusedMoE, TrtllmCutlassNvfp4Impl)
+
+
+def test_w4a16_leaf_cannot_reach_a_cutlass_kernel():
+    """W4A16_NVFP4 stays on the b12x kernel for every call, so the leaf carries
+    no CUTLASS execution path to fall back to -- enforced by type, not by a
+    runtime predicate."""
+    assert not issubclass(CuteDslB12xW4a16Nvfp4FusedMoE, TrtllmCutlassNvfp4Impl)
+    assert not hasattr(CuteDslB12xW4a16Nvfp4FusedMoE, "_route_to_cutlass")
+    assert not hasattr(CuteDslB12xW4a16Nvfp4FusedMoE, "_PREFILL_VIA_CUTLASS_THRESHOLD")
+
+
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_family_alias_matches_both_leaves(leaf, quant_algo):
+    """Callers outside this module gate on the family name."""
+    del quant_algo
+    assert issubclass(leaf, CuteDslB12xFusedMoE)
+
+
+# --------------------------------------------------------------------------
 # Hybrid CUTLASS-prefill / b12x-decode dispatch predicate tests
 #
 # ``_route_to_cutlass`` is a pure shape predicate on its input ``x``; we test
 # it via a stub that holds the class constant, sidestepping the full
-# CutlassFusedMoE constructor (which needs a routing method, real model
-# config, etc.).
+# constructor (which needs a routing method, real model config, etc.).
 # --------------------------------------------------------------------------
 
 
 class _RoutePredicateStub:
     """Minimal carrier for the unbound dispatch predicate."""
 
-    _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+    _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
 
-    _route_to_cutlass = CuteDslB12xFusedMoE._route_to_cutlass
+    _route_to_cutlass = CuteDslB12xNvfp4FusedMoE._route_to_cutlass
 
 
 def test_dispatch_routes_prefill_shape_via_cutlass():
@@ -203,16 +264,12 @@ def test_dispatch_decode_shape_takes_b12x():
 
 
 def test_w4a16_nvfp4_prefill_quantize_input_stays_on_b12x():
-    moe = object.__new__(CuteDslB12xFusedMoE)
+    """A prefill-sized batch is still a pass-through on the W4A16 leaf."""
+    moe = object.__new__(CuteDslB12xW4a16Nvfp4FusedMoE)
     moe.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
-    x = torch.empty(CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
+    x = torch.empty(CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
 
-    with patch.object(
-        CutlassFusedMoE,
-        "quantize_input",
-        side_effect=AssertionError("W4A16_NVFP4 prefill must not route through CUTLASS"),
-    ):
-        out, out_sf = CuteDslB12xFusedMoE.quantize_input(moe, x)
+    out, out_sf = CuteDslB12xW4a16Nvfp4FusedMoE.quantize_input(moe, x)
 
     assert out is x
     assert out_sf is None

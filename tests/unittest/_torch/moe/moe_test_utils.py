@@ -35,7 +35,10 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
@@ -107,8 +110,9 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``TRTLLM`` and ``MARLIN`` are not one class each but sets of leaves keyed by
-    quant (and, for TRTLLM-Gen, provider), so both need ``quant_algo``.
+    ``TRTLLM``, ``MARLIN`` and ``CUTE_DSL_B12X`` are not one class each but sets
+    of leaves keyed by quant (and, for TRTLLM-Gen, provider), so all three need
+    ``quant_algo``.
     TRTLLM-Gen prefers the native leaf for that format and falls back to the
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
@@ -125,6 +129,13 @@ def find_backend_class(
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTE_DSL_B12X:
+        # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
+        # W4A16_NVFP4 never leaves the b12x kernel.
+        return {
+            QuantAlgo.NVFP4: CuteDslB12xNvfp4FusedMoE,
+            QuantAlgo.W4A16_NVFP4: CuteDslB12xW4a16Nvfp4FusedMoE,
+        }.get(quant_algo)
 
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
@@ -134,7 +145,6 @@ def find_backend_class(
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
-        MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
     }
     return backend_class_map[backend_type]
 

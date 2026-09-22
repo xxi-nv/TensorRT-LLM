@@ -1359,14 +1359,15 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
 
 
 def test_apply_router_weight_on_input_support_is_not_inherited():
-    """``CuteDslB12xFusedMoE`` is the one impl that keeps its ``CutlassFusedMoE``
-    parent, and this is a field where the two disagree: only the NVFP4 prefill
-    chunk reaches the Cutlass ``run_moe``, while the decode path hands
-    ``token_final_scales`` to the flashinfer wrapper.
+    """The B12x family is the one that keeps a CUTLASS parent, and this is a
+    field where the two disagree: only the NVFP4 prefill chunk reaches the
+    Cutlass ``run_moe``, while the decode path hands ``token_final_scales`` to
+    the flashinfer wrapper. The family declares the capability, so the value
+    holds for both B12x leaves.
 
-    Compared against the NVFP4 leaf rather than the family base: since the
-    per-format split, capabilities are declared by the leaves, and the NVFP4
-    one is what B12x's prefill chunk actually runs."""
+    Compared against the NVFP4 leaf rather than the CUTLASS family base: since
+    the per-format split, capabilities are declared by the leaves, and the
+    NVFP4 one is what B12x's prefill chunk actually runs."""
     assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
     assert not CuteDslB12xFusedMoE.capabilities.supports_apply_router_weight_on_input

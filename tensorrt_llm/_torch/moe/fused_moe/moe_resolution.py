@@ -31,7 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import ActivationParamShape, MoEActivation, activation_constant_names
 from .cutlass import CUTLASS_LEAVES
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
 from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
@@ -94,7 +94,10 @@ MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 # ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` / ``MegaMoECuteDsl`` aliases, so
 # what is ranked here reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
-    CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
+    # The SM120/121 b12x leaves -- narrowest, so first. Their ``quant``
+    # segments are disjoint, so the order between them does not matter.
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
     CuteDslFusedMoE,
@@ -143,7 +146,9 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
-    "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL": frozenset(
+        {CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE, CuteDslFusedMoE}
+    ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({TrtllmCutedslDenseGemmNvfp4Impl}),
