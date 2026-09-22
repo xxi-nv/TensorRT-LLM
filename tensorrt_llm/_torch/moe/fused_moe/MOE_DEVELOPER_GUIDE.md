@@ -198,7 +198,7 @@ Still on old path (standalone, with embedded communication):
 
 | File | Backend | Hardware | Scenario | Scheduler |
 |------|---------|----------|----------|-----------|
-| `fused_moe_cutlass.py` | `CutlassFusedMoE` | SM80+ | High throughput, most comprehensive quant support | `EXTERNAL_COMM` |
+| `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its twelve leaves, one per quantization format (`CUTLASS_LEAVES`) | SM80+ | High throughput, most comprehensive quant support | `EXTERNAL_COMM` |
 | `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
@@ -658,8 +658,10 @@ whose class sets `supports_gptoss_style` (checked by
 it runs at resolution time).
 
 Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, MXFP8, NVFP4, and the
-MXFP4 family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `MXFP8`,
-`NVFP4`, `W4A16_MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel
+MXFP4 family. Since the leaf split this is no longer one list: those six leaves
+declare `supports_gptoss_style = True` and the other six inherit the `False`
+default from `CutlassFusedMoEBase`, which `check_gptoss_activation`
+(`cutlass/eligibility.py`) reads. The CUDA kernel
 is not the constraint — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
 `swiglu_beta` / `swiglu_limit` on the same call for every path, including
 NVFP4 (`CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1>`), and TMA-WS GEMM1
@@ -714,11 +716,13 @@ When adding new components, use these reference implementations:
 | Identity Tests | `test_moe_impl.py` | Add one section per implementation: the id round-trips through the registry, the leaf admits only its own format, and a pin fails rather than degrades. Tests that merely *use* the class belong in `test_moe_backend.py` |
 | Integration Tests | `test_moe_module.py` | Test Backend × Communication × EPLB combinations |
 
-**Note on backend inheritance:** New execution-unit backends should inherit from `MoEImplBase` (in `impl_base.py`), NOT from `CutlassFusedMoE` and NOT from `MoE`. `MoE` is the complete-layer type (`ConfigurableMoE`, `TritonFusedMoE`).
+**Note on backend inheritance:** New execution-unit backends should inherit from `MoEImplBase` (in `impl_base.py`), NOT from a CUTLASS class and NOT from `MoE`. `MoE` is the complete-layer type (`ConfigurableMoE`, `TritonFusedMoE`).
 
-`CutlassFusedMoE` is itself an execution unit now: it is no longer a `MoE` and has **no `forward`**, so it can only run as `ConfigurableMoE.backend`. Anything that needs a callable layer must wrap it (see `Llama4MinLatencyFusedMoE`, which extends `ConfigurableMoE` and pins `moe_cls=CutlassFusedMoE`).
+The CUTLASS classes are themselves execution units now: they are no longer a `MoE` and have **no `forward`**, so they can only run as `ConfigurableMoE.backend`. Anything that needs a callable layer must wrap one (see `Llama4MinLatencyFusedMoE`, which extends `ConfigurableMoE` and picks its leaf by quantization format via `find_cutlass_grouped_gemm_leaf`).
 
-These backends declare `MoEImplBase` directly — `CutlassFusedMoE`, `TrtllmGenFusedMoEBase`, `MarlinFusedMoEBase`, `TrtllmCutedslDenseGemmNvfp4Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`, `CuteDslFusedMoE`, and the two DeepGEMM implementations. `TrtllmGenFusedMoEBase` and `MarlinFusedMoEBase` declare it as abstract family roots and their leaves inherit through them, which is the shape the next note describes. Only `CuteDslB12xFusedMoE` still reaches it through another implementation, `CutlassFusedMoE`, as a historical shortcut; that concrete inheritance is broken in its own follow-up item, not here.
+These backends declare `MoEImplBase` directly — `CutlassFusedMoEBase`, `TrtllmGenFusedMoEBase`, `MarlinFusedMoEBase`, `TrtllmCutedslDenseGemmNvfp4Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`, `CuteDslFusedMoE`, and the two DeepGEMM implementations. The first three declare it as abstract family roots and their leaves inherit through them, which is the shape the next note describes.
+
+The one implementation that still inherits another implementation is `CuteDslB12xNvfp4FusedMoE`, and it does so on purpose: its prefill chunk *is* the CUTLASS NVFP4 grouped GEMM, reached through `super()`. Its sibling `CuteDslB12xW4a16Nvfp4FusedMoE` deliberately does not, because W4A16_NVFP4 never leaves the b12x kernel; it takes only `CutlassFusedMoEBase` for construction and the weight lifecycle. Giving the pair its own identity is a CuteDSL follow-up item.
 
 **Note on one class per identity:** an identity and the code it names belong on the same class. That class declares the `descriptor`, takes its three contract attributes off it, carries `@register_moe_impl`, and implements the four abstract methods of `MoEImplBase`: `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`. Both DeepGEMM implementations, `TrtllmCutedslMegaMoeNvfp4Impl` and `TrtllmCutedslDenseGemmNvfp4Impl` are shaped that way — each holds its identity, its construction, and its whole contract in one place.
 
