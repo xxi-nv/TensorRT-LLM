@@ -361,11 +361,13 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        # Layerwise quantization is applied after the model is constructed.
-        # Defer allocation so the backend is built from the final wrapper
-        # quant_config rather than an earlier global value. Module exclusions
-        # reset _weights_created on matching modules during __post_init__, so
-        # unrelated exclusions retain the historical eager allocation path.
+        # Layerwise quantization is applied after the model is constructed, so
+        # allocation waits for the final wrapper quant_config. The backend was
+        # already chosen from the quant_config seen at create_moe time, and one
+        # whose format is fixed refuses a final value that differs (see
+        # impl_contract.require_layer_quant_format). Module exclusions reset
+        # _weights_created on matching modules during __post_init__, so
+        # unrelated exclusions keep eager allocation.
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
@@ -726,7 +728,8 @@ class ConfigurableMoE(MoE):
         )
         # An explicit override is authoritative. Otherwise use the wrapper's
         # final value, after model __post_init__ has applied layerwise and
-        # exclusion-based quantization settings.
+        # exclusion-based quantization settings; a backend whose format is
+        # fixed at resolution refuses that value if it moved.
         self.backend.quant_config = (
             self._override_quant_config
             if self._override_quant_config is not None

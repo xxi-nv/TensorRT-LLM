@@ -65,12 +65,24 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    CUTLASS_LEAVES,
+    TrtllmCutlassNvfp4Impl,
+    TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmTritonFp8BlockScalesImpl,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xFusedMoE,
+    CuteDslB12xNvfp4FusedMoE,
+)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import (
+    CutlassFusedMoE,
+    find_cutlass_grouped_gemm_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
@@ -385,7 +397,8 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
 
 
 def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
-    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    cutlass_leaf = find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4)
+    backend = cutlass_leaf.__new__(cutlass_leaf)
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
@@ -849,7 +862,9 @@ def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_
 def test_marlin_degrades_to_cutlass_on_non_nvfp4(quant_algo):
     with override_moe_environment(_marlin_environment()):
         report = resolve_moe_impl(_marlin_model_config(quant_algo))
-    assert impl_class_for(report) is CutlassFusedMoE
+    # The family's leaf for this format, not the family base: resolution hands
+    # over one leaf, and which one is part of what the degradation did.
+    assert impl_class_for(report) is find_cutlass_grouped_gemm_leaf(quant_algo)
     assert report.degraded
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
@@ -862,7 +877,7 @@ def test_marlin_override_quant_config_degrades_per_layer():
             override_quant_config=QuantConfig(quant_algo=None),
             layer_idx=52,
         )
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is find_cutlass_grouped_gemm_leaf(None)
     assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
@@ -1389,11 +1404,16 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
 
 
 def test_apply_router_weight_on_input_support_is_not_inherited():
-    """``CuteDslB12xFusedMoE`` is the one impl that keeps its ``CutlassFusedMoE``
-    parent, and this is a field where the two disagree: only the NVFP4 prefill
-    chunk reaches the parent's ``run_moe``, while the decode path hands
-    ``token_final_scales`` to the flashinfer wrapper."""
-    assert CutlassFusedMoE.capabilities.supports_apply_router_weight_on_input
+    """The B12x family is the one that keeps a CUTLASS parent, and this is a
+    field where the two disagree: only the NVFP4 prefill chunk reaches the
+    Cutlass ``run_moe``, while the decode path hands ``token_final_scales`` to
+    the flashinfer wrapper. The family declares the capability, so the value
+    holds for both B12x leaves.
+
+    Compared against the NVFP4 leaf rather than the CUTLASS family base: since
+    the per-format split, capabilities are declared by the leaves, and the
+    NVFP4 one is what B12x's prefill chunk actually runs."""
+    assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
     assert not CuteDslB12xFusedMoE.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
@@ -3251,7 +3271,11 @@ def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
 
 
 @pytest.mark.parametrize(
-    "backend_cls", [CutlassFusedMoE, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+    # The NVFP4 leaf, not the family base: ``can_implement`` is per leaf now,
+    # and this case is about the NVFP4 shard-alignment gate.
+    "backend_cls",
+    [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE],
+    ids=["cutlass", "cutedsl"],
 )
 @pytest.mark.parametrize(
     "intermediate_size,activation,moe_tp_size,rejected",
@@ -3289,7 +3313,7 @@ def test_nvfp4_fc1_row_alignment_gate(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [CutlassFusedMoE, CuteDslFusedMoE],
+    [find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4), CuteDslFusedMoE],
     ids=["cutlass", "cutedsl"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
@@ -3330,3 +3354,107 @@ def test_unresolvable_layer_error_carries_rejection_details():
     )
     with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
         impl_class_for(report)
+
+
+# ============================================================================
+# CUTLASS leaves: run_moe reaches the op on CPU
+# ============================================================================
+# Each grouped-GEMM leaf's ``run_moe`` with ``torch.ops.trtllm.fused_moe``
+# replaced by a recorder, so a leaf reaching for state it does not carry fails
+# here without a GPU. Routed-expert LoRA operands reach the op from the two
+# leaves that fuse LoRA and from no other.
+
+_CUTLASS_GROUPED_GEMM_LEAVES = tuple(
+    leaf
+    for leaf in CUTLASS_LEAVES
+    # The dequantizing W4A16 leaf and the Triton leaf never issue this op.
+    if leaf not in (TrtllmCutlassW4a16Nvfp4Impl, TrtllmTritonFp8BlockScalesImpl)
+)
+
+
+def _cutlass_leaf_on_cpu(leaf_cls):
+    """A leaf carrying only the state its ``run_moe`` reads; no ``__init__``."""
+    leaf = leaf_cls.__new__(leaf_cls)
+    # Mock weights: the op is replaced, and a mock absorbs the per-format
+    # ``.view(dtype)`` reinterpretation that a real CPU tensor may refuse.
+    leaf.w3_w1_weight = MagicMock()
+    leaf.w2_weight = MagicMock()
+    leaf.w3_w1_bias = None
+    leaf.w2_bias = None
+    leaf.quant_scales = ()
+    leaf.act_alpha = None
+    leaf.act_beta = None
+    leaf.act_clamp = None
+    leaf.tp_size, leaf.tp_rank, leaf.ep_size, leaf.ep_rank = 1, 0, 1, 0
+    leaf.cluster_size, leaf.cluster_rank = 1, 0
+    leaf.use_fused_finalize = True
+    leaf.tune_max_num_tokens = 16
+    leaf.activation_type = ActivationType.Swiglu
+    leaf.hidden_size = 8
+    leaf.unpadded_hidden_size = 8
+    leaf.force_dynamic_quantization = False
+    return leaf
+
+
+def _cpu_run_context(num_tokens: int = 2, lora_params: Optional[dict] = None) -> MoERunContext:
+    return MoERunContext(
+        token_selected_experts=torch.zeros((num_tokens, 1), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, 1), dtype=torch.float32),
+        x=torch.zeros((num_tokens, 8), dtype=torch.bfloat16),
+        x_sf=None,
+        output_dtype=torch.bfloat16,
+        lora_params=lora_params,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+
+
+def _record_fused_moe(monkeypatch) -> list:
+    """Replace the op with a recorder; returns the list of keyword sets it saw."""
+    calls = []
+
+    def fused_moe(*args, **kwargs):
+        calls.append(kwargs)
+        return [torch.zeros_like(args[0])]
+
+    monkeypatch.setattr(torch.ops.trtllm, "fused_moe", fused_moe, raising=False)
+    return calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("leaf_cls", _CUTLASS_GROUPED_GEMM_LEAVES, ids=lambda cls: cls.__name__)
+def test_cutlass_leaf_run_moe_reaches_the_op(leaf_cls, monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    out = _cutlass_leaf_on_cpu(leaf_cls).run_moe(_cpu_run_context())
+    assert len(calls) == 1
+    assert out.shape == (2, 8)
+    assert not [name for name in calls[0] if "lora" in name]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls",
+    [leaf for leaf in _CUTLASS_GROUPED_GEMM_LEAVES if leaf.capabilities.supports_moe_lora],
+    ids=lambda cls: cls.__name__,
+)
+def test_cutlass_lora_leaf_forwards_its_lora_operands(leaf_cls, monkeypatch):
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(leaf_cls)
+    leaf._extract_moe_lora_tensors = lambda lora_params: {"fc1_lora_ranks": "fc1-ranks"}
+    leaf.run_moe(_cpu_run_context(lora_params={"num_seqs": 1}))
+    assert calls[0]["fc1_lora_ranks"] == "fc1-ranks"
+
+
+@pytest.mark.cpu_only
+def test_b12x_nvfp4_prefill_chunk_reaches_the_cutlass_op(monkeypatch):
+    """A prefill-sized chunk takes the inherited NVFP4 ``run_moe``."""
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(CuteDslB12xNvfp4FusedMoE)
+    num_tokens = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+    out = leaf.run_moe(_cpu_run_context(num_tokens=num_tokens))
+    assert len(calls) == 1
+    assert out.shape == (num_tokens, 8)

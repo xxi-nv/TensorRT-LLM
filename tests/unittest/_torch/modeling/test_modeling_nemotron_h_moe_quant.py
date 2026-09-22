@@ -173,15 +173,64 @@ def test_nemotron_h_moe_uses_module_prefix_for_mtp_sublayer_quant_config(suffix)
         "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
         side_effect=fake_create_moe,
     ):
-        with patch("torch.cuda.Event", side_effect=lambda: object()):
-            NemotronHMOE(
-                model_config=model_config,
-                layer_idx=52,
-                aux_stream_dict={AuxStreamType.MoeShared: None},
-                module_prefix="model.layers.52.layers.1",
-            )
+        # An SM with an NVFP4 MoE kernel, so the lookup is the only variable.
+        with patch(
+            "tensorrt_llm._torch.models.modeling_nemotron_h.get_sm_version",
+            return_value=100,
+        ):
+            with patch("torch.cuda.Event", side_effect=lambda: object()):
+                NemotronHMOE(
+                    model_config=model_config,
+                    layer_idx=52,
+                    aux_stream_dict={AuxStreamType.MoeShared: None},
+                    module_prefix="model.layers.52.layers.1",
+                )
 
     assert captured["override_quant_config"] is layer_quant_config
+
+
+@pytest.mark.parametrize(
+    ("sm_version", "expected_algo"),
+    [(90, QuantAlgo.W4A16_NVFP4), (100, QuantAlgo.NVFP4)],
+)
+def test_nemotron_h_moe_serves_nvfp4_experts_as_w4a16_below_sm100(sm_version, expected_algo):
+    """SM<100 has no NVFP4 MoE kernel, so the layer declares its NVFP4 experts
+    W4A16_NVFP4 at create_moe time and resolution picks the leaf that
+    dequantizes the same weights. Everything but the format carries over."""
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        group_size=16,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=["lm_head"],
+    )
+    model_config = _make_nemotron_h_moe_config(quant_config)
+    captured = {}
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        return nn.Identity()
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
+        side_effect=fake_create_moe,
+    ):
+        with patch(
+            "tensorrt_llm._torch.models.modeling_nemotron_h.get_sm_version",
+            return_value=sm_version,
+        ):
+            with patch("torch.cuda.Event", side_effect=lambda: object()):
+                NemotronHMOE(
+                    model_config=model_config,
+                    layer_idx=1,
+                    aux_stream_dict={AuxStreamType.MoeShared: None},
+                )
+
+    effective = captured["override_quant_config"] or captured["model_config"].quant_config
+    assert effective.quant_algo == expected_algo
+    assert effective.group_size == 16
+    assert effective.kv_cache_quant_algo == QuantAlgo.FP8
+    # The model-level config is shared by every layer and keeps its format.
+    assert model_config.quant_config.quant_algo == QuantAlgo.NVFP4
 
 
 @pytest.mark.parametrize(

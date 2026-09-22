@@ -17,13 +17,13 @@
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, Tuple
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
-    from tensorrt_llm.models.modeling_utils import QuantAlgo
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
@@ -390,6 +390,40 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
             f"{cls.__name__} implements quant={expected}, got {actual}",
         )
     return None
+
+
+class _BuiltLayer(Protocol):
+    """What :func:`require_layer_quant_format` reads off an implementation."""
+
+    quant_config: Optional["QuantConfig"]
+    layer_idx: Optional[int]
+
+
+def require_layer_quant_format(impl: _BuiltLayer, expected: str) -> None:
+    """Raise unless ``impl``'s final ``quant_config`` is the format ``expected``.
+
+    An implementation is chosen from the quantization a layer has when
+    ``create_moe`` runs, and a leaf *is* one format. The model's
+    ``__post_init__`` passes -- ``apply_layerwise_quant_config`` and
+    ``apply_quant_config_exclude_modules`` -- can still give the layer another
+    ``quant_config`` before its weights are allocated. Unchecked, the leaf then
+    allocates weights the checkpoint cannot fill, or runs with silently wrong
+    numerics, and the pass that moved the layer has already returned, so the
+    message has to carry the diagnosis.
+    """
+    quant_config = impl.quant_config
+    actual = normalize_quant(
+        canonical_quant(None if quant_config is None else quant_config.quant_algo)
+    )
+    if actual != expected:
+        raise ValueError(
+            f"{type(impl).__name__} implements quant={expected}, but layer "
+            f"{impl.layer_idx}'s quant_config resolves to {actual}. The "
+            f"implementation was picked when the layer was built; layerwise "
+            f"quantization or a module exclusion changed its format afterwards. "
+            f"Pass the layer's final quantization to create_moe as "
+            f"override_quant_config."
+        )
 
 
 def nvfp4_fc1_row_alignment_rejection(

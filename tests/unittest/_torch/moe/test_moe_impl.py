@@ -35,7 +35,11 @@ from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import (
+    CUTLASS_LEAVES,
+    CutlassFusedMoE,
+    find_cutlass_grouped_gemm_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
@@ -141,29 +145,34 @@ def test_pinned_deepgemm_rejects_post_silu_clamping():
     assert "post-SiLU clamping" in report.rejected[-1].detail
 
 
-@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
-def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
-    problem = MoEProblem(
-        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
-        dtype_act=torch.bfloat16,
-        activation_constants=frozenset({"clamp"}),
-        clamp_after_silu=True,
-    )
-    deployment = MoEDeployment(
-        ep_size=1,
-        tp_size=1,
-        use_dp=False,
-        num_slots=8,
-        env=MoEEnvironment(sm=sm),
-        parallel_size=1,
-    )
+@pytest.mark.parametrize(
+    "sm, impl_id, eligible",
+    [
+        (90, "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales", True),
+        (120, "trtllm.triton.blockscale_gemm.fp8_block_scales", False),
+    ],
+)
+def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, impl_id, eligible):
+    """FP8 block scales take the post-SiLU clamp mode only where the CUTLASS op runs.
 
-    verdict = CutlassFusedMoE.can_implement(problem, deployment)
+    The SM90 leaf issues the CUTLASS op, which takes the mode; the SM120 leaf
+    runs the Triton kernel, which has no clamp-order parameter.
+    """
+    activation = SwigluActivation(clamp=5.0, clamp_after_silu=True)
+    with override_moe_environment(MoEEnvironment(sm=sm)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
+            activation=activation,
+            impl_id=impl_id,
+            dtype=torch.bfloat16,
+        )
 
-    assert verdict.eligible is eligible
-    if not eligible:
-        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-        assert "Triton fallback" in verdict.detail
+    if eligible:
+        assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    else:
+        assert report.winner is None
+        assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert "post-SiLU clamping" in report.rejected[-1].detail
 
 
 def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
@@ -173,7 +182,7 @@ def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
         by_literal = resolve_moe_impl(config)
         by_identity = resolve_moe_impl(config, impl_id=_DEEPGEMM_IMPL_ID)
 
-    assert impl_class_for(by_literal) is CutlassFusedMoE
+    assert impl_class_for(by_literal) is find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4)
     assert by_literal.degraded
 
     assert by_identity.winner is None
@@ -194,13 +203,15 @@ def test_unknown_identity_token_raises_before_any_candidate_is_asked():
 def test_identity_matching_nothing_registered_raises():
     """Built as a query rather than parsed, to get past the token vocabulary.
 
-    ``fp8`` because plain per-tensor FP8 has no registered MoE implementation,
+    ``w8a8_sq_per_channel`` because SmoothQuant has no MoE implementation,
     which is what makes the query match nothing while staying well-formed
-    (``nvfp4`` is registered by TrtllmCutedslFusedFc12Nvfp4Impl).
+    (``fp8`` and ``nvfp4`` are both registered, by CUTLASS leaves among others).
     """
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
-            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="fp8"))
+            resolve_moe_impl(
+                _deepgemm_model_config(), impl_id=MoEImplQuery(quant="w8a8_sq_per_channel")
+            )
 
 
 @pytest.mark.parametrize("spec", ["*", "*.*.*.*", MoEImplQuery()], ids=["star", "wide", "query"])
@@ -1131,6 +1142,156 @@ def test_pinned_marlin_identity_resolves_to_its_leaf(quant_algo, impl_id):
         report = resolve_moe_impl(_marlin_model_config(quant_algo), impl_id=impl_id)
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert report.selected_by == "pinned"
+
+
+# =====================================================================
+# CUTLASS: one leaf per format
+# =====================================================================
+# Ten grouped-GEMM leaves, plus the two FP8-block-scale leaves whose kernels
+# are told apart by SM rather than by format. The family name stays for
+# ``issubclass``; resolution always hands over a leaf.
+
+_CUTLASS_IDS = (
+    "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales",
+    "trtllm.triton.blockscale_gemm.fp8_block_scales",
+    "trtllm.cutlass.grouped_gemm.nvfp4",
+    "trtllm.cutlass.grouped_gemm.w4a16_nvfp4",
+    "trtllm.cutlass.grouped_gemm.mxfp8",
+    "trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8",
+    "trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8",
+    "trtllm.cutlass.grouped_gemm.w4a16_mxfp4",
+    "trtllm.cutlass.grouped_gemm.w4a8_awq",
+    "trtllm.cutlass.grouped_gemm.w8a16",
+    "trtllm.cutlass.grouped_gemm.fp8",
+    "trtllm.cutlass.grouped_gemm.none",
+)
+
+
+def _cutlass_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def _cutlass_environment(impl) -> MoEEnvironment:
+    """An SM the leaf's kernel is built for, so quantization stays the only variable."""
+    support = impl.sm_support
+    sm = support.minimum if support.minimum is not None else min(support.allowed)
+    return MoEEnvironment(sm=sm)
+
+
+def _cutlass_problem(quant: str) -> MoEProblem:
+    return MoEProblem(quant=None if quant == "none" else quant.upper(), dtype_act=torch.bfloat16)
+
+
+def test_cutlass_family_is_exactly_the_twelve_registered_leaves():
+    """The grid is the deliverable: twelve addressable ids, one leaf each."""
+    registered = sorted(leaf.descriptor.identity.canonical() for leaf in CUTLASS_LEAVES)
+    assert registered == sorted(_CUTLASS_IDS)
+
+
+@pytest.mark.parametrize("impl_id", _CUTLASS_IDS)
+def test_cutlass_identity_round_trips_through_registry(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    assert impl in CUTLASS_LEAVES
+    # ``vars``, not attribute access: an inherited descriptor would give two
+    # classes one identity.
+    assert "descriptor" in vars(impl)
+    assert impl.descriptor.identity.canonical() == impl_id
+    assert not impl.__abstractmethods__
+    assert issubclass(impl, CutlassFusedMoE)
+
+
+@pytest.mark.parametrize("impl_id", _CUTLASS_IDS)
+def test_cutlass_leaf_admits_only_its_own_format(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    quant = impl.descriptor.identity.quant
+    other = "w4a16_mxfp4" if quant != "w4a16_mxfp4" else "nvfp4"
+    verdict = impl.can_implement(
+        _cutlass_problem(other), _single_rank_deployment(_cutlass_environment(impl))
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+@pytest.mark.parametrize("impl_id", _CUTLASS_IDS)
+def test_cutlass_leaf_admits_the_format_it_publishes(impl_id):
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    verdict = impl.can_implement(
+        _cutlass_problem(impl.descriptor.identity.quant),
+        _single_rank_deployment(_cutlass_environment(impl)),
+    )
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.parametrize(
+    "quant_algo, sm, impl_id",
+    [
+        pytest.param(None, 90, "trtllm.cutlass.grouped_gemm.none", id="none"),
+        pytest.param(QuantAlgo.NVFP4, 100, "trtllm.cutlass.grouped_gemm.nvfp4", id="nvfp4"),
+        pytest.param(
+            QuantAlgo.FP8_BLOCK_SCALES,
+            90,
+            "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales",
+            id="fp8_block_scales-sm90",
+        ),
+        pytest.param(
+            QuantAlgo.FP8_BLOCK_SCALES,
+            120,
+            "trtllm.triton.blockscale_gemm.fp8_block_scales",
+            id="fp8_block_scales-sm120",
+        ),
+    ],
+)
+def test_cutlass_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm, impl_id):
+    """``moe_backend: CUTLASS`` names the family; the quant -- and, for
+    ``fp8_block_scales``, the SM -- picks which leaf."""
+    with override_moe_environment(MoEEnvironment(sm=sm)):
+        report = resolve_moe_impl(_cutlass_model_config(quant_algo), dtype=torch.bfloat16)
+    assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    assert not report.degraded
+
+
+def test_pinned_cutlass_identity_fails_hard_on_another_format():
+    """A pin names one format; asked for another it fails instead of degrading."""
+    with override_moe_environment(MoEEnvironment(sm=100)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.MXFP8),
+            impl_id="trtllm.cutlass.grouped_gemm.nvfp4",
+            dtype=torch.bfloat16,
+        )
+    assert report.winner is None
+    assert report.selected_by == "failed"
+    assert [rejection.reason for rejection in report.rejected] == [
+        MoERejectReason.QUANT_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(report)
+
+
+def test_a_cutlass_leaf_refuses_a_layer_whose_format_moved_after_it_was_picked():
+    """``create_weights`` checks the final ``quant_config`` before allocating.
+
+    ``__new__`` without ``__init__``: the check reads three attributes and no
+    allocated state, and a real constructor would need a GPU.
+    """
+    nvfp4_leaf = find_cutlass_grouped_gemm_leaf(QuantAlgo.NVFP4)
+    moved = nvfp4_leaf.__new__(nvfp4_leaf)
+    moved._weights_created = False
+    moved.layer_idx = 3
+    moved.quant_config = QuantConfig(quant_algo=None)
+
+    with pytest.raises(ValueError) as excinfo:
+        moved.create_weights()
+    message = str(excinfo.value)
+    assert "layer 3" in message
+    assert "override_quant_config" in message
+
+    kept = nvfp4_leaf.__new__(nvfp4_leaf)
+    kept.layer_idx = 3
+    kept.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    kept._check_quant_config_is_my_format()
 
 
 # =====================================================================

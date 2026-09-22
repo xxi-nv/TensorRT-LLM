@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE, CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -35,7 +35,11 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
@@ -97,7 +101,11 @@ def get_backend_class(
         raising_lookup = {
             MoeBackendType.TRTLLM: trtllm_gen_leaf,
             MoeBackendType.MARLIN: marlin_leaf,
-        }[backend_type]
+        }.get(backend_type)
+        if raising_lookup is None:
+            raise ValueError(
+                f"{backend_type.value} has no implementation serving quant_algo={quant_algo} here"
+            )
         return raising_lookup(quant_algo)
     return backend_class
 
@@ -107,8 +115,10 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``TRTLLM`` and ``MARLIN`` are not one class each but sets of leaves keyed by
-    quant (and, for TRTLLM-Gen, provider), so both need ``quant_algo``.
+    ``CUTLASS``, ``TRTLLM``, ``MARLIN`` and ``CUTE_DSL_B12X`` are not one class
+    each but sets of leaves keyed by quant (and, for TRTLLM-Gen, provider), so
+    all four need ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice,
+    once per SM family, so for that format the leaf is the one this device runs.
     TRTLLM-Gen prefers the native leaf for that format and falls back to the
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
@@ -121,20 +131,27 @@ def find_backend_class(
     a leaf that got unregistered read as a combination nobody meant to run, and
     the sweep would go green by shrinking.
     """
+    if backend_type is MoeBackendType.CUTLASS:
+        return _cutlass_leaf_for_this_device(quant_algo)
     if backend_type is MoeBackendType.TRTLLM:
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTE_DSL_B12X:
+        # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
+        # W4A16_NVFP4 never leaves the b12x kernel.
+        return {
+            QuantAlgo.NVFP4: CuteDslB12xNvfp4FusedMoE,
+            QuantAlgo.W4A16_NVFP4: CuteDslB12xW4a16Nvfp4FusedMoE,
+        }.get(quant_algo)
 
     backend_class_map = {
-        MoeBackendType.CUTLASS: CutlassFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
-        MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -151,12 +168,32 @@ def find_backend_classes(
     absent. A caller asking whether a case is *supported* has to ask the same
     way, or it skips cases the layer under test goes on to serve.
 
+    CUTLASS is the same shape for ``fp8_block_scales``: one leaf per SM family,
+    and only asking both tells a skip from a case the device serves.
+
     :func:`find_backend_class` stays for callers that want to name one class.
     """
     if backend_type is MoeBackendType.TRTLLM:
         return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    if backend_type is MoeBackendType.CUTLASS:
+        return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
     return () if cls is None else (cls,)
+
+
+def _cutlass_leaf_for_this_device(quant_algo: QuantAlgo | None) -> type[MoE] | None:
+    """The CUTLASS leaf that would serve ``quant_algo`` on the current GPU.
+
+    Only ``fp8_block_scales`` needs the device: its two leaves have disjoint SM
+    sets. Every other format has exactly one leaf, found without probing CUDA.
+    """
+    leaves = cutlass_leaves_in_resolution_order(quant_algo)
+    if len(leaves) <= 1:
+        return leaves[0] if leaves else None
+    from tensorrt_llm._utils import get_sm_version
+
+    sm = get_sm_version()
+    return next((leaf for leaf in leaves if leaf.sm_support.accepts(sm)), None)
 
 
 # ============================================================================
