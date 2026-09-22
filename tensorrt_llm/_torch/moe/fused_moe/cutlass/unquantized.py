@@ -27,10 +27,11 @@ from .eligibility import HP_DTYPES, SmSupport, check_cutlass_leaf
 from .grouped_gemm import DEFAULT_FLAGS, run_grouped_gemm
 from .identity import CUTLASS_LORA_CAPABILITIES, cutlass_descriptor
 from .input_quant import quantize_noop
+from .lora import CutlassMoELoraMixin
 
 
 @register_moe_impl
-class TrtllmCutlassUnquantizedImpl(CutlassFusedMoEBase):
+class TrtllmCutlassUnquantizedImpl(CutlassMoELoraMixin, CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.none``.
 
     The widest-reaching leaf: no quantization, every architecture the

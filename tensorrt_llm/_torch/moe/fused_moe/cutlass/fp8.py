@@ -27,10 +27,11 @@ from .eligibility import HP_DTYPES_WITH_FP32, SmSupport, check_cutlass_leaf
 from .grouped_gemm import DEFAULT_FLAGS, run_grouped_gemm
 from .identity import CUTLASS_LORA_CAPABILITIES, cutlass_descriptor
 from .input_quant import quantize_static_e4m3
+from .lora import CutlassMoELoraMixin
 
 
 @register_moe_impl
-class TrtllmCutlassFp8Impl(CutlassFusedMoEBase):
+class TrtllmCutlassFp8Impl(CutlassMoELoraMixin, CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.fp8``.
 
     Per-tensor FP8, quantized and dequantized around the GEMM rather than

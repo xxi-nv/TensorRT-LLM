@@ -41,7 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ..impl_contract import canonical_quant, normalize_quant
 from ..impl_identity import MOE_IMPL_REGISTRY, MoEImplId
-from .base import CutlassFusedMoEBase, raise_moe_lora_multichunk_unsupported
+from .base import CutlassFusedMoEBase
 from .blockscale_hopper import DeepgemmCudaHopperFp8BlockScalesImpl
 from .blockscale_triton import TrtllmTritonFp8BlockScalesImpl
 from .eligibility import (
@@ -62,6 +62,7 @@ from .identity import (
     TECHNIQUE_CUTLASS,
     cutlass_descriptor,
 )
+from .lora import CutlassMoELoraMixin, raise_moe_lora_multichunk_unsupported
 from .mxfp8 import TrtllmCutlassMxfp8Impl
 from .nvfp4 import TrtllmCutlassNvfp4Impl
 from .unquantized import TrtllmCutlassUnquantizedImpl
@@ -129,6 +130,7 @@ __all__ = [
     # shared layers
     "CutlassFusedMoEBase",
     "CUTLASS_LEAVES",
+    "CutlassMoELoraMixin",
     "raise_moe_lora_multichunk_unsupported",
     # identity
     "PROVIDER_TRTLLM",

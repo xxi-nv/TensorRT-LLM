@@ -28,7 +28,7 @@ actually hands over, so ``type(x) is CutlassFusedMoE`` matches nothing.
 
 ``raise_moe_lora_multichunk_unsupported`` is forwarded because
 :mod:`.moe_scheduler` imports it from this path; the function itself lives with
-the LoRA plumbing in :mod:`.cutlass.base`.
+the LoRA plumbing in :mod:`.cutlass.lora`.
 """
 
 from .cutlass import (CUTLASS_LEAVES, CutlassFusedMoEBase,
