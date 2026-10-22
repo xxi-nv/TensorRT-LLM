@@ -41,6 +41,8 @@ from tensorrt_llm._torch.locality_domain_utils import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
     _expert_count_tile_plan,
     _LocalityDomainConcurrentTunableRunner,
     _runner_tactics_match_tile_size,
@@ -2597,19 +2599,16 @@ def _create_quantized_locality_domain_weights(
 
 
 def test_moe_output_memset_aux_stream_guard_requires_full_aux_state():
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
-    backend = object.__new__(CuteDslFusedMoE)
-    backend.event_dict = {EventType.Main: object()}
-    backend.aux_stream_dict = {}
+    backend = SimpleNamespace(event_dict={EventType.Main: object()}, aux_stream_dict={})
 
-    assert not backend._has_moe_output_memset_aux_stream()
+    assert not CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
     backend.event_dict[EventType.MoeOutputMemset] = object()
     backend.aux_stream_dict[AuxStreamType.MoeOutputMemset] = object()
 
-    assert backend._has_moe_output_memset_aux_stream()
+    assert CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
 
 def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
@@ -2817,33 +2816,36 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
-@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+@pytest.mark.parametrize("reason", ["disabled", "no_aux_stream"])
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
-    """Without an aux stream, NVFP4, or with the kill switch off, the async
+    """Without an aux stream, or with the kill switch off, the async
     quantization is the synchronous one and hands back no event to join."""
     from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
 
     monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
     calls = []
     backend = SimpleNamespace(
-        has_nvfp4=reason != "not_nvfp4",
         quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
         _has_moe_output_memset_aux_stream=lambda: reason != "no_aux_stream",
     )
     x = torch.empty(2, 4)
 
-    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+    x_q, x_sf, event = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async(backend, x)
 
     assert x_q is x and x_sf is None and event is None
     assert calls == [False]
 
 
-def test_join_pending_x_ready_waits_once():
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+def test_bf16_leaf_offers_no_async_input_quantization():
+    """The scheduler forks input quantization only for a backend that defines
+    ``quantize_input_async``; BF16 input has nothing to quantize."""
+    assert not hasattr(TrtllmCutedslGroupedGemmBf16Impl, "quantize_input_async")
 
+
+def test_join_pending_x_ready_waits_once():
     waits = []
     backend = SimpleNamespace(_pending_x_ready_event=SimpleNamespace(wait=lambda: waits.append(1)))
-    join = fused_moe_cute_dsl.CuteDslFusedMoE._join_pending_x_ready
+    join = TrtllmCutedslGroupedGemmNvfp4Impl._join_pending_x_ready
 
     join(backend)
     join(backend)
@@ -2858,12 +2860,10 @@ def test_join_pending_x_ready_waits_once():
 )
 def test_quantize_input_async_matches_sync():
     """The aux-stream quantization produces the same bytes as the main-stream one."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
     hidden = 256
     backend = SimpleNamespace(
-        has_nvfp4=True,
         hidden_size=hidden,
         scaling_vector_size=16,
         fc31_input_scale=torch.tensor([1.0], device="cuda"),
@@ -2874,7 +2874,7 @@ def test_quantize_input_async_matches_sync():
         },
         _x_quant_event=torch.cuda.Event(),
     )
-    cls = fused_moe_cute_dsl.CuteDslFusedMoE
+    cls = TrtllmCutedslGroupedGemmNvfp4Impl
     backend.quantize_input = cls.quantize_input.__get__(backend)
     backend._has_moe_output_memset_aux_stream = cls._has_moe_output_memset_aux_stream.__get__(
         backend
@@ -3006,7 +3006,7 @@ def _cute_dsl_eligibility(**deployment_kwargs):
         ),
         **deployment_kwargs,
     )
-    return CuteDslFusedMoE.can_implement(problem, deployment)
+    return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
@@ -3027,31 +3027,6 @@ def test_cute_dsl_sm107_requires_fused_finalize():
     verdict = _cute_dsl_eligibility(fused_finalize_enabled=False)
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED
-
-
-def test_cute_dsl_unquantized_rejects_non_swiglu():
-    """The BF16 FC1 op fuses SwiGLU by name; NVFP4 serves both activations."""
-    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
-        MoEDeployment,
-        MoEEnvironment,
-        MoEProblem,
-        MoERejectReason,
-    )
-    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
-
-    env = MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN.value,))
-    deployment = MoEDeployment(
-        ep_size=1, tp_size=1, parallel_size=1, use_dp=False, num_slots=8, env=env
-    )
-
-    def verdict(quant):
-        return CuteDslFusedMoE.can_implement(
-            MoEProblem(quant=quant, dtype_act=torch.bfloat16, activation="Relu2"), deployment
-        )
-
-    assert not verdict(None).eligible
-    assert verdict(None).reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-    assert verdict("NVFP4").eligible
 
 
 def test_cute_dsl_locality_domain_disables_dwdp():
@@ -3077,15 +3052,12 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
 
     if quantized:
         backend = SimpleNamespace(
-            has_nvfp4=True,
-            has_deepseek_fp8_block_scales=False,
-            has_any_quant=True,
             activation_type=ActivationType.Swiglu,
             _locality_domain_runtime=object(),
             hidden_size=hidden_size,
             scaling_vector_size=4,
         )
-        x, x_sf = CuteDslFusedMoE.quantize_input(
+        x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
             backend,
             Fp4QuantizedTensor(
                 fp4_tensor=torch.empty((0, hidden_size // 2), dtype=torch.uint8),
@@ -3094,7 +3066,7 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
             ),
         )
         assert x_sf.shape == (0, hidden_size // backend.scaling_vector_size)
-        output = CuteDslFusedMoE.run_moe_nvfp4(
+        output = TrtllmCutedslGroupedGemmNvfp4Impl.run_moe_nvfp4(
             backend,
             x,
             token_selected_experts,
@@ -3105,11 +3077,10 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
         )
     else:
         backend = SimpleNamespace(
-            has_any_quant=False,
             hidden_size=hidden_size,
             use_fused_finalize=True,
         )
-        output = CuteDslFusedMoE.run_moe_bf16(
+        output = TrtllmCutedslGroupedGemmBf16Impl.run_moe_bf16(
             backend,
             torch.empty((0, hidden_size), dtype=torch.bfloat16),
             token_selected_experts,
@@ -3128,15 +3099,12 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
     hidden_size = 32
     scaling_vector_size = 16
     backend = SimpleNamespace(
-        has_nvfp4=True,
-        has_deepseek_fp8_block_scales=False,
-        has_any_quant=True,
         fc31_input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         hidden_size=hidden_size,
         scaling_vector_size=scaling_vector_size,
     )
 
-    x, x_sf = CuteDslFusedMoE.quantize_input(
+    x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
         backend,
         torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda"),
     )

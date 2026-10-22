@@ -93,6 +93,11 @@ only names the code that demonstrates them. Paths are relative to
     `trtllm_<quant>.py` / `flashinfer_<quant>.py` leaves.
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.
+  - `fused_moe_cute_dsl.py`: `CuteDslFusedMoEBase` (construction, the
+    layer-format check in `create_weights`, the locality-domain plan, the
+    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
+    and `_locality_domain_scale_shard` hooks and the leaf-declared
+    `_locality_domain_full_scale_params` carry what only one format needs.
 - Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
   (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
   note says what that inheritance costs.

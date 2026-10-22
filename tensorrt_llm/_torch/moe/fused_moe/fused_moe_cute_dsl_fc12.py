@@ -22,15 +22,17 @@ round-trips through global memory.
 
 A leaf in the ``MoEImplBase`` sense: it declares its ``descriptor``, registers
 itself, and owns the four abstract methods. The NVFP4 weight layout, quant method
-(``NVFP4CuteDslFusedMoEMethod``), weight view and input quantization are the same
-ones ``CuteDslFusedMoE`` uses for its two-op NVFP4 path; they are restated here
-(not inherited) so this class serves exactly one format and carries no bf16 /
-fp8 / locality-domain entry points it cannot execute. The outer autotune runner
-reuses ``CuteDslFusedMoENvfp4Runner`` with the tile set narrowed to what the
-fused kernel supports. Locality domains (uGPU) are not enabled for this backend.
+(``NVFP4CuteDslFusedMoEMethod``) and weight view are the ones
+``TrtllmCutedslGroupedGemmNvfp4Impl`` uses for its two-op path, restated here
+rather than inherited so this class carries no two-op or locality-domain entry
+points it cannot execute; input quantization and the finalize routing scales are
+the shared ``quantize_input_nvfp4`` and ``finalize_routing_scales``. The outer
+autotune runner reuses ``CuteDslFusedMoENvfp4Runner`` with the tile set narrowed
+to what the fused kernel supports. Locality domains (uGPU) are not enabled for
+this backend.
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import torch
 
@@ -38,14 +40,19 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import AutoTuner
 from ...model_config import ModelConfig
-from ...utils import ActivationType, AuxStreamType, EventType, Fp4QuantizedTensor
+from ...utils import ActivationType, AuxStreamType, EventType
 from .activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivation,
     MoEActivationSupport,
 )
-from .fused_moe_cute_dsl import CuteDslFusedMoENvfp4Runner, NvFp4WeightView
+from .fused_moe_cute_dsl import (
+    CuteDslFusedMoENvfp4Runner,
+    NvFp4WeightView,
+    finalize_routing_scales,
+    quantize_input_nvfp4,
+)
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (
     MoEDeployment,
@@ -84,7 +91,7 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
 class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     """``trtllm.cutedsl.fused_fc12.nvfp4``: FC1+FC2-fused CuteDSL NVFP4 MoE (Rubin/SM107).
 
-    Args mirror ``CuteDslFusedMoE``; see the module docstring for what is
+    Args mirror ``TrtllmCutedslGroupedGemmNvfp4Impl``; see the module docstring for what is
     shared with it and why it is restated rather than inherited.
 
     The kernel segment stays in the name because the plain CuteDSL NVFP4
@@ -171,7 +178,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # The fused FC12 kernel scatter-adds FC2 straight into moe_output;
         # there is no unfused FC2 variant, so a deployment that disabled
         # finalize fusion (moe_disable_finalize_fusion, or any LoRA) cannot
-        # be served. Same guard CuteDslFusedMoE applies on SM107.
+        # be served. Same guard the CuteDSL grouped-GEMM leaves apply on SM107.
         if not d.fused_finalize_enabled:
             return _reject(
                 MoERejectReason.FINALIZE_FUSION_REQUIRED,
@@ -189,8 +196,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         return MoEEligibility.ok()
 
     # ------------------------------------------------------------------
-    # Construction and weights. Same shape as CuteDslFusedMoE's NVFP4 path,
-    # minus the bf16 / fp8 / locality-domain machinery this backend never runs.
+    # Construction and weights.
     # ------------------------------------------------------------------
     def __init__(
         self,
@@ -228,7 +234,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         # can_implement already turned down deployments without fused finalize;
         # kept as the runner's enable_finalize_fusion flag for cache-key parity
-        # with CuteDslFusedMoE.
+        # with TrtllmCutedslGroupedGemmNvfp4Impl.
         self.use_fused_finalize = (
             not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
         )
@@ -248,8 +254,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             and self.quant_config.layer_quant_mode.has_any_quant(exclude_kv_cache=True)
             and self.quant_config.layer_quant_mode.has_nvfp4()
         ):
-            # Same weight layout as CuteDslFusedMoE's NVFP4 path; the fused
-            # kernel consumes w3_w1 / w2 and their block scales unchanged.
+            # The fused kernel consumes w3_w1 / w2 and their block scales unchanged.
             return NVFP4CuteDslFusedMoEMethod()
         raise ValueError(f"CuteDslFc12FusedMoE only supports NVFP4, got {self.quant_config}")
 
@@ -269,7 +274,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         super().load_weights(weights, allow_partial_loading=allow_partial_loading)
         # DWDP registers the freshly loaded expert weights with its handle
-        # collector; same hook CuteDslFusedMoE exposes (supports_dwdp=True).
+        # collector; same hook TrtllmCutedslGroupedGemmNvfp4Impl exposes
+        # (supports_dwdp=True).
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
@@ -290,51 +296,15 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch (NVFP4 only)
     # ------------------------------------------------------------------
-    def quantize_input(
-        self, x: Union[torch.Tensor, Fp4QuantizedTensor], post_quant_comm: bool = True
-    ):
-        """NVFP4-quantize the input; returns (x, x_sf) with x_sf reshaped to 2D.
-
-        The 2D shape ``[num_tokens, ceil(hidden / scaling_vector_size)]`` is
-        what alltoall / allgather expect for the scaling factors.
-        """
-        del post_quant_comm  # single path: always quantized ahead of comm
-        assert self.has_nvfp4
-        if isinstance(x, Fp4QuantizedTensor):
-            assert not x.is_sf_swizzled, (
-                "Fp4QuantizedTensor should not be swizzled before communication"
-            )
-            x_row = x.shape[0]
-            x, x_sf = x.fp4_tensor, x.scaling_factor
-        else:
-            x_row = x.shape[0]
-            x, x_sf = torch.ops.trtllm.fp4_quantize(
-                x, self.fc31_input_scale, self.scaling_vector_size, False, False
-            )
-        # ``view(0, -1)`` is ambiguous for an empty micro-batch; spell the
-        # scale width out so empty and non-empty inputs take the same path.
-        scale_cols = (self.hidden_size + self.scaling_vector_size - 1) // self.scaling_vector_size
-        return x, x_sf.view(x_row, scale_cols)
+    quantize_input = quantize_input_nvfp4
 
     def run_moe(self, ctx: MoERunContext, *, workspace: Optional[dict] = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
         plan = require_comm_plan(self, ctx)
-        token_final_scales = ctx.token_final_scales
-        if token_final_scales is None:
-            # With apply_router_weight_on_input the scheduler folds the routing
-            # weights into x and, on the non-DeepEP path, drops the scales
-            # (moe_scheduler: ``token_final_scales = None``). The fused kernel
-            # still sizes moe_output from them and applies them in its finalize,
-            # so feed identity weights: the real weights are already in x
-            # (top-1 only, see _check_configs).
-            assert self.apply_router_weight_on_input, (
-                "token_final_scales is None without apply_router_weight_on_input"
-            )
-            token_final_scales = torch.ones_like(ctx.token_selected_experts, dtype=torch.float32)
         return self.run_moe_nvfp4(
             x=ctx.x,
             token_selected_experts=ctx.token_selected_experts,
-            token_final_scales=token_final_scales,
+            token_final_scales=finalize_routing_scales(self, ctx),
             x_sf=ctx.x_sf,
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
@@ -401,7 +371,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         """``(situ_beta, situ_linear_beta)`` for the fused op; -1 disables them.
 
         ``SiTuActivation.constants()`` lands gate_softcap in ``act_alpha`` and
-        linear_softcap in ``act_beta``, the same mapping CuteDslFusedMoE uses.
+        linear_softcap in ``act_beta``, the same mapping
+        ``TrtllmCutedslGroupedGemmNvfp4Impl`` uses.
         """
         if self.activation_type != ActivationType.SiTu:
             return -1.0, -1.0

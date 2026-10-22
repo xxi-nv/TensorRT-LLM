@@ -30,7 +30,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import MoEActivation, SwigluActivation, activation_constant_names
 from .cutlass import CUTLASS_LEAVES
-from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl import TrtllmCutedslGroupedGemmBf16Impl, TrtllmCutedslGroupedGemmNvfp4Impl
 from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
 from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
@@ -99,7 +99,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
-    CuteDslFusedMoE,
+    # Disjoint ``quant`` segments, so the order between the two does not matter.
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
@@ -138,7 +140,12 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
     "CUTEDSL": frozenset(
-        {CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE, CuteDslFusedMoE}
+        {
+            CuteDslB12xNvfp4FusedMoE,
+            CuteDslB12xW4a16Nvfp4FusedMoE,
+            TrtllmCutedslGroupedGemmNvfp4Impl,
+            TrtllmCutedslGroupedGemmBf16Impl,
+        }
     ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
