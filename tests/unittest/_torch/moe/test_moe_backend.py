@@ -69,6 +69,13 @@ from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
     TrtllmCutlassFp8Impl,
@@ -78,19 +85,11 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmTritonFp8BlockScalesImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoENvfp4Runner,
-    TrtllmCutedslGroupedGemmBf16Impl,
-    TrtllmCutedslGroupedGemmNvfp4Impl,
-)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
-    CuteDslFc12FusedMoE,
-    CuteDslFc12FusedMoENvfp4Runner,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -450,7 +449,7 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts(
     monkeypatch: pytest.MonkeyPatch, use_direct_expert_metadata: bool
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl.get_sm_version", lambda: 100
+        "tensorrt_llm._torch.moe.fused_moe.cutedsl.runners.get_sm_version", lambda: 100
     )
     forward_impl = MagicMock(return_value=torch.empty(1))
     runner = CuteDslFusedMoENvfp4Runner(
@@ -1550,17 +1549,19 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
         leaf_cls.run_moe(backend, ctx)
 
 
-# The CuteDSL grouped-GEMM and fused-FC12 NVFP4 leaves serve NVFP4_AWQ /
-# NVFP4_ARC layers too (``canonical_quant`` folds both into ``nvfp4``), so their
-# ``quantize_input`` applies the checkpoint's pre-quant scale, ``fc31_act_scale``.
+# The CuteDSL NVFP4 leaves serve NVFP4_AWQ / NVFP4_ARC layers too
+# (``canonical_quant`` folds both into ``nvfp4``), so their ``quantize_input``
+# applies the checkpoint's pre-quant scale, ``fc31_act_scale``.
 _CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
     "leaf_cls",
-    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE],
-    ids=["grouped_gemm", "fused_fc12"],
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, TrtllmCutedslDenseGemmNvfp4Impl],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
 )
 
 
-def _nvfp4_input_quantizer_state(act_scale: torch.Tensor, hidden_size: int = 32) -> SimpleNamespace:
+def _nvfp4_input_quantizer_state(
+    act_scale: torch.Tensor | None, hidden_size: int = 32
+) -> SimpleNamespace:
     """The backend attributes ``quantize_input`` reads, and nothing else."""
     return SimpleNamespace(
         hidden_size=hidden_size,
@@ -1597,6 +1598,29 @@ def test_cutedsl_nvfp4_quantizes_the_smoothed_input(leaf_cls, monkeypatch):
 
     assert len(quantized_inputs) == 1
     torch.testing.assert_close(quantized_inputs[0], x * act_scale, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@_CUTEDSL_NVFP4_LEAVES
+def test_cutedsl_nvfp4_scale_width_survives_an_empty_micro_batch(leaf_cls, monkeypatch):
+    """``view(0, -1)`` cannot infer a width from zero rows, so it is spelled out."""
+    hidden_size = 32
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        num_rows, k = x.shape
+        return (
+            torch.zeros(num_rows, k // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * k // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize)
+    _, x_sf = leaf_cls.quantize_input(
+        _nvfp4_input_quantizer_state(None, hidden_size),
+        torch.empty(0, hidden_size, dtype=torch.bfloat16),
+        post_quant_comm=False,
+    )
+
+    assert x_sf.shape == (0, hidden_size // 16)
 
 
 @pytest.mark.cpu_only

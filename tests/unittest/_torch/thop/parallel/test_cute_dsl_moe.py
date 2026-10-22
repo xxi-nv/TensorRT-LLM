@@ -32,6 +32,7 @@ from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
+from tensorrt_llm._torch.locality_domain.autotune import LocalityDomainConcurrentTunableRunner
 from tensorrt_llm._torch.locality_domain_utils import (
     end_for_all_locality_domain,
     get_locality_domain_stream,
@@ -39,15 +40,16 @@ from tensorrt_llm._torch.locality_domain_utils import (
     locality_domain_device,
     start_for_all_locality_domain,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.reference import (
     _expert_count_tile_plan,
-    _LocalityDomainConcurrentTunableRunner,
-    _runner_tactics_match_tile_size,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import _runner_tactics_match_tile_size
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     interleave_gate_and_linear,
     interleave_linear_and_gate,
@@ -2623,7 +2625,7 @@ def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
             return None
 
     op_runner = FakeOpRunner()
-    runner = _LocalityDomainConcurrentTunableRunner(
+    runner = LocalityDomainConcurrentTunableRunner(
         op_runner,
         SimpleNamespace(num_partitions=2),
         2,
@@ -2686,7 +2688,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     def launch(partition_id, launch_inputs, tactic):
         runtime.events.append(("launch", partition_id, id(launch_inputs), tactic))
 
-    runner = _LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
+    runner = LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
     profile = OptimizationProfile()
 
     assert runner.get_valid_tactics(inputs, profile, marker="x") == [-1, ("fast", 128)]
@@ -2695,7 +2697,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     assert runner.op_runner is op_runner
 
     other_runtime = FakeRuntime(((106, 212), (106, 212), (0, 212)))
-    other_runner = _LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
+    other_runner = LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
     assert runner.unique_id() != other_runner.unique_id()
 
     tactic = ("chosen", 256)
@@ -2729,16 +2731,16 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
     output_idx: int,
     tile_sizes: list[int],
 ):
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, **kwargs):
         preparation_calls.append((args, kwargs))
         return args[output_idx]
 
-    runner_cls = getattr(fused_moe_cute_dsl, runner_name)
+    runner_cls = getattr(runners, runner_name)
     runner = runner_cls(
         forward_impl,
         num_experts=1,
@@ -2763,11 +2765,11 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
 @pytest.mark.parametrize(
     "module_name,runner_name,num_inputs,output_idx",
     [
-        ("fused_moe_cute_dsl", "CuteDslFusedMoENvfp4Runner", 5, 4),
-        ("fused_moe_cute_dsl", "CuteDslFusedMoEBF16Runner", 4, 3),
+        ("cutedsl.runners", "CuteDslFusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("fused_moe_cute_dsl_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -2786,9 +2788,9 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     """
     import importlib
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, enable_alltoall=False, tile_size=128):
@@ -2820,9 +2822,9 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
     """Without an aux stream, or with the kill switch off, the async
     quantization is the synchronous one and hands back no event to join."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(nvfp4, "ASYNC_INPUT_QUANT", reason != "disabled")
     calls = []
     backend = SimpleNamespace(
         quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
@@ -2900,7 +2902,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import fused_fc12 as fc12
 
     captured = {}
 
@@ -2937,9 +2939,9 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         act_beta=25.0,
     )
     for name in ("_situ_betas", "_epilogue_identity"):
-        setattr(backend, name, getattr(fc12.CuteDslFc12FusedMoE, name).__get__(backend))
+        setattr(backend, name, getattr(fc12.TrtllmCutedslFusedFc12Nvfp4Impl, name).__get__(backend))
     # Bound, like production's ``self.run_moe_nvfp4_impl``.
-    real_impl = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl.__get__(backend)
+    real_impl = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl.__get__(backend)
 
     def tracking_impl(*args, **kwargs):
         impl_calls.append(kwargs)
@@ -2956,7 +2958,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         moe_output=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
         weight_view=weight_view,
     )
-    out = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4(backend, **inputs)
+    out = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4(backend, **inputs)
     assert out.shape == (num_tokens, hidden)
 
     # Positive control: the activation-keyed identity is non-None.
@@ -2980,7 +2982,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     # And the reason it must not: the impl cannot take that kwarg.
     assert (
         "overlap_moe_output_memset"
-        not in inspect.signature(fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl).parameters
+        not in inspect.signature(fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl).parameters
     )
 
 

@@ -29,12 +29,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import MoEActivation, SwigluActivation, activation_constant_names
+from .cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
 from .cutlass import CUTLASS_LEAVES
-from .fused_moe_cute_dsl import TrtllmCutedslGroupedGemmBf16Impl, TrtllmCutedslGroupedGemmNvfp4Impl
 from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
-from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
-from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase

@@ -68,14 +68,14 @@ def resolve_deepseek_group_config(model_config: MoeModelConfig) -> tuple[int, in
 
 
 def ensure_cute_dsl_importable_for_benchmark() -> None:
-    """Install a local sentinel module when optional CUTEDSL imports are absent.
+    """Install a local sentinel package when optional CUTEDSL imports are absent.
 
-    Production MoE modules import ``fused_moe_cute_dsl`` at module load time.
+    Production MoE modules import the ``cutedsl`` package at module load time.
     ``bench_moe`` can still benchmark non-CUTEDSL backends in environments that
     do not package CUTLASS DSL; keep that fallback local to the benchmark rather
-    than weakening the production module.
+    than weakening the production package.
     """
-    module_name = "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl"
+    module_name = "tensorrt_llm._torch.moe.fused_moe.cutedsl"
     if module_name in sys.modules:
         return
     try:
@@ -84,7 +84,7 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
     except ImportError as exc:
         import_error = exc
 
-    class CuteDslFusedMoE:
+    class CuteDslFusedMoEBase:
         @classmethod
         def can_implement(cls, p, d):
             from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -99,22 +99,21 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError(f"CUTLASS DSL is unavailable: {import_error}")
 
-    # Stubs for the per-format leaves the MoE package imports by name; they
-    # inherit the root stub's DEP_MISSING verdict.
-    class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoE):
-        pass
-
-    class TrtllmCutedslGroupedGemmBf16Impl(CuteDslFusedMoE):
-        pass
-
     def find_cutedsl_grouped_gemm_leaf(quant_algo: object) -> type:
         del quant_algo
-        return CuteDslFusedMoE
+        return CuteDslFusedMoEBase
 
     module = types.ModuleType(module_name)
-    module.CuteDslFusedMoE = CuteDslFusedMoE
-    module.TrtllmCutedslGroupedGemmNvfp4Impl = TrtllmCutedslGroupedGemmNvfp4Impl
-    module.TrtllmCutedslGroupedGemmBf16Impl = TrtllmCutedslGroupedGemmBf16Impl
+    module.CuteDslFusedMoEBase = CuteDslFusedMoEBase
+    # Stubs for the leaves the MoE package imports by name; they inherit the
+    # root stub's DEP_MISSING verdict.
+    for leaf_name in (
+        "TrtllmCutedslGroupedGemmNvfp4Impl",
+        "TrtllmCutedslGroupedGemmBf16Impl",
+        "TrtllmCutedslFusedFc12Nvfp4Impl",
+        "TrtllmCutedslDenseGemmNvfp4Impl",
+    ):
+        setattr(module, leaf_name, type(leaf_name, (CuteDslFusedMoEBase,), {}))
     module.find_cutedsl_grouped_gemm_leaf = find_cutedsl_grouped_gemm_leaf
     module.cutedsl_grouped_gemm_leaf = find_cutedsl_grouped_gemm_leaf
     sys.modules[module_name] = module

@@ -40,6 +40,12 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
     CutlassMoELoraMixin,
@@ -63,26 +69,16 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass.base import (
     quantize_input_mxfp8,
     quantize_input_static_e4m3,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
-    TrtllmCutedslGroupedGemmBf16Impl,
-    TrtllmCutedslGroupedGemmNvfp4Impl,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
-)
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
-    TrtllmCutedslFusedFc12Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import (
-    DenseGEMMFusedMoE,
-    TrtllmCutedslDenseGemmNvfp4Impl,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
