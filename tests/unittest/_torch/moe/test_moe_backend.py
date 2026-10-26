@@ -5333,19 +5333,11 @@ def test_cutedsl_trtllm_gen_weight_rows_hold_the_trtllm_gen_bytes(monkeypatch, a
         assert torch.equal(ours, theirs), f"{name} differs from the TRTLLM-Gen layout"
 
 
-# The FC1 and FC2 accumulators sum over K in the same order in both layouts;
-# only the column holding each output channel moves. With top-1 routing the
-# finalize adds one expert per row, so even the fused, atomically reducing FC2
-# is order-independent and the outputs must match bit for bit.
-@pytest.mark.parametrize("use_fused_finalize", [True, False], ids=["fused_fc2", "unfused_fc2"])
-@pytest.mark.parametrize(
-    "activation_type", [ActivationType.Swiglu, ActivationType.Relu2], ids=["swiglu", "relu2"]
-)
-@pytest.mark.parametrize("seq_len", [1, 77, 300])
-def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
-    monkeypatch, seq_len, activation_type, use_fused_finalize
-):
-    _skip_unless_sm100_family()
+def _cutedsl_outputs_in_both_row_orders(monkeypatch, seq_len, activation_type, use_fused_finalize):
+    """Run one CuteDSL MoE on the same weights and input with native and TRTLLM-Gen rows.
+
+    Returns the two outputs, plus the reference module and its output.
+    """
     model_config = MoeModelConfig(16, 1, 2048, 256)
     torch.manual_seed(0)
     routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
@@ -5383,14 +5375,71 @@ def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
                     router_logits,
                 )
             )
-    native, trtllm_gen_rows = outputs
-    assert torch.equal(native, trtllm_gen_rows)
 
     ref_fused_moe = quantize_util.create_ref_module(routing_method)
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
     with torch.inference_mode():
-        ref_fused_moe.check_accuracy(trtllm_gen_rows, ref_fused_moe.forward(x, router_logits))
+        reference = ref_fused_moe.forward(x, router_logits)
+    return outputs[0], outputs[1], ref_fused_moe, reference
+
+
+# The FC1 and FC2 accumulators sum over K in the same order in both layouts;
+# only the column holding each output channel moves. With top-1 routing the
+# finalize adds one expert per row, so even the fused, atomically reducing FC2
+# is order-independent and the outputs must match bit for bit.
+@pytest.mark.parametrize("use_fused_finalize", [True, False], ids=["fused_fc2", "unfused_fc2"])
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.Relu2], ids=["swiglu", "relu2"]
+)
+@pytest.mark.parametrize("seq_len", [1, 77, 300])
+def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
+    monkeypatch, seq_len, activation_type, use_fused_finalize
+):
+    _skip_unless_sm100_family()
+    native, trtllm_gen_rows, ref_fused_moe, reference = _cutedsl_outputs_in_both_row_orders(
+        monkeypatch, seq_len, activation_type, use_fused_finalize
+    )
+    assert torch.equal(native, trtllm_gen_rows)
+    with torch.inference_mode():
+        ref_fused_moe.check_accuracy(trtllm_gen_rows, reference)
+
+
+# The untuned FC1 tactic is ``(tile_size, 128)``, which keeps two accumulator
+# stages. An N=256 tile has one, so its epilogue loads a subtile pair and then
+# releases the accumulator early for the next tile's MMA; force that tactic so
+# the TRTLLM-Gen-row epilogue is compared on that path too.
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.Relu2], ids=["swiglu", "relu2"]
+)
+@pytest.mark.parametrize("seq_len", [77, 300])
+def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout_on_n256_fc1_tiles(
+    monkeypatch, seq_len, activation_type
+):
+    _skip_unless_sm100_family()
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner as fc1_runner_cls,
+    )
+
+    forward = fc1_runner_cls.forward
+    used_tactics = []
+
+    def forward_on_n256_tiles(self, inputs, tactic):
+        if not isinstance(tactic, tuple):
+            tactic = ((self.tile_size, 256), (self.tile_size // 128, 1), False)
+        used_tactics.append(tactic)
+        return forward(self, inputs, tactic)
+
+    monkeypatch.setattr(fc1_runner_cls, "forward", forward_on_n256_tiles)
+    native, trtllm_gen_rows, ref_fused_moe, reference = _cutedsl_outputs_in_both_row_orders(
+        monkeypatch, seq_len, activation_type, use_fused_finalize=True
+    )
+    # Both row orders ran FC1 on N=256 tiles.
+    assert len(used_tactics) >= 2
+    assert all(mma_tiler_mn[1] == 256 for mma_tiler_mn, _, _ in used_tactics)
+    assert torch.equal(native, trtllm_gen_rows)
+    with torch.inference_mode():
+        ref_fused_moe.check_accuracy(trtllm_gen_rows, reference)
 
 
 # =====================================================================
