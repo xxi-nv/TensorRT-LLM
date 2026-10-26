@@ -3911,6 +3911,123 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 module, module.w3_w1_weight_scale.data[expert_idx])
 
 
+class NVFP4CuteDslTrtllmGenRowsFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+    """NVFP4 CuteDSL grouped-GEMM weights in TRTLLM-Gen's row order (SM100/SM103).
+
+    Loading is the CUTLASS pipeline ``NVFP4CuteDslFusedMoEMethod`` also uses;
+    only the final row permutation differs. Instead of interleaving FC1 into
+    ``[up64, gate64]`` groups, every FC1 and FC2 weight row, and the matching
+    block-scale row, gets the permutation ``NVFP4TRTLLMGenFusedMoEBaseMethod``
+    applies: the gated up/gate row reorder (FC1 only), then
+    ``shuffle_matrix_a`` with a 128-row epilogue tile. When neither method pads
+    the shape (intermediate size a multiple of 128, hidden size a multiple of
+    256 or at most 1024) the four expert tensors are byte-identical to
+    TRTLLM-Gen's. The grouped-GEMM kernels read them with
+    ``trtllm_gen_weight_rows=True``.
+    """
+
+    _EPILOGUE_TILE_M = 128
+
+    # The indices depend only on the row count and the activation, and are
+    # costly to compute. The helpers key their cache by shape alone, so a gated
+    # and a non-gated FC1 of the same height get separate caches.
+    _cache_permute_indices: Dict[bool, Dict[Tuple, torch.Tensor]] = {
+        True: {},
+        False: {},
+    }
+
+    def create_weights(self, module: torch.nn.Module):
+        if module.bias:
+            raise NotImplementedError(
+                "TRTLLM-Gen row order for the CuteDSL MoE weights does not "
+                "permute expert biases.")
+        super().create_weights(module)
+
+    def _row_permutation(self, rows: torch.Tensor, is_fc1: bool,
+                         is_gated: bool) -> torch.Tensor:
+        cache = self._cache_permute_indices[is_gated]
+        if is_fc1:
+            permutation = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                rows, cache, self._EPILOGUE_TILE_M, is_gated_act_gemm=is_gated)
+        else:
+            permutation = trtllmgen_maybe_get_cached_w2_permute_indices(
+                rows, cache, self._EPILOGUE_TILE_M)
+        return permutation.to(rows.device)
+
+    def _permute_expert_rows(self, module: torch.nn.Module,
+                             weight: Optional[torch.Tensor],
+                             weight_scale: Optional[torch.Tensor],
+                             is_fc1: bool) -> None:
+        """Permute one expert's weight rows and block-scale rows in place.
+
+        Either tensor may be a host EPLB mirror; the permutation runs on the
+        GPU. ``weight_scale`` holds the 128x4-swizzled scales.
+        """
+        is_gated = module.is_gated_activation
+        if is_fc1:
+            rows = module.expand_intermediate_size_per_partition
+            cols = module.hidden_size
+        else:
+            rows = module.hidden_size
+            cols = module.intermediate_size_per_partition
+        if weight is not None:
+            weight_gpu = weight.cuda()
+            weight.copy_(
+                weight_gpu.index_select(
+                    0, self._row_permutation(weight_gpu, is_fc1, is_gated)))
+        if weight_scale is not None:
+            sf_cols = cols // module.scaling_vector_size
+            linear = unswizzle_sf(weight_scale.cuda().view(float4_sf_dtype),
+                                  rows, cols).view(rows, sf_cols)
+            linear = linear.index_select(
+                0, self._row_permutation(linear, is_fc1, is_gated))
+            swizzled = swizzle_sf(linear, rows, cols).view(rows, sf_cols)
+            weight_scale.copy_(swizzled.view(weight_scale.dtype))
+
+    def _prepare_shared_weights_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # Online EPLB copies experts into slots from these host mirrors, so
+        # they need the permutation process_weights_after_loading() applies
+        # to the device weights.
+        super()._prepare_shared_weights_for_finalization(module)
+        for name, is_fc1 in (("local_shared_w3_w1_tensors", True),
+                             ("local_shared_w2_tensors", False)):
+            shared = getattr(module, name, None)
+            if shared is None:
+                continue
+            for expert_idx in range(shared.shape[0]):
+                self._permute_expert_rows(module, shared[expert_idx], None,
+                                          is_fc1)
+
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        super()._prepare_shared_weight_scales_for_finalization(module)
+        for name, is_fc1 in (("local_shared_w3_w1_scale_tensors", True),
+                             ("local_shared_w2_scale_tensors", False)):
+            shared = getattr(module, name, None)
+            if shared is None:
+                continue
+            for expert_idx in range(shared.shape[0]):
+                self._permute_expert_rows(module, None, shared[expert_idx],
+                                          is_fc1)
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # Cat + pad + swizzle the scales first; the permutation works on the
+        # finished buffers.
+        super().process_weights_after_loading(module)
+        num_experts = module.w3_w1_weight.data.shape[0]
+        for expert_idx in range(num_experts):
+            self._permute_expert_rows(
+                module,
+                module.w3_w1_weight.data[expert_idx],
+                module.w3_w1_weight_scale.data[expert_idx],
+                is_fc1=True)
+            self._permute_expert_rows(module,
+                                      module.w2_weight.data[expert_idx],
+                                      module.w2_weight_scale.data[expert_idx],
+                                      is_fc1=False)
+
+
 class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     """NVFP4 quant method for the FlashInfer B12x MoE backend (SM120 / SM121).
 

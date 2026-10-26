@@ -2951,7 +2951,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     trtllm_gen_weight_rows: bool = False):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -2962,6 +2963,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
+            self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2982,6 +2984,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.trtllm_gen_weight_rows,
             )
 
         def get_valid_tactics(
@@ -3125,12 +3128,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+                         cluster_shape_mn, self.trtllm_gen_weight_rows)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    trtllm_gen_weight_rows=self.trtllm_gen_weight_rows,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -3195,12 +3199,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        trtllm_gen_weight_rows: bool = False,
     ) -> torch.Tensor:
         tuner = AutoTuner.get()
 
         runner = Sm100BlockScaledContiguousGroupedGemmRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
+            tile_size, output_dtype, scaling_vector_size,
+            trtllm_gen_weight_rows)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, num_non_exiting_tiles
@@ -3232,6 +3238,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        trtllm_gen_weight_rows: bool = False,
     ) -> torch.Tensor:
         m = input.size(0)
         n = weight.size(1)
@@ -3251,7 +3258,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     trtllm_gen_weight_rows: bool = False):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -3263,6 +3271,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
             self.use_expert_counts = use_expert_counts
+            self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
@@ -3289,6 +3298,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.scaling_vector_size,
                 self.use_expert_counts,
+                self.trtllm_gen_weight_rows,
             )
             if self.fc2_n_tile_size_override is not None:
                 runner_id += (
@@ -3508,7 +3518,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m,
-                         self.use_expert_counts, self.num_local_experts)
+                         self.use_expert_counts, self.num_local_experts,
+                         self.trtllm_gen_weight_rows)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -3517,6 +3528,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     use_expert_counts=self.use_expert_counts,
                     num_local_experts=self.num_local_experts,
+                    trtllm_gen_weight_rows=self.trtllm_gen_weight_rows,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -3604,6 +3616,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        trtllm_gen_weight_rows: bool = False,
     ) -> None:
         tuner = AutoTuner.get()
         if expert_counts is None and expert_capacity != 0:
@@ -3626,7 +3639,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             output_dtype,
             scaling_vector_size,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            trtllm_gen_weight_rows=trtllm_gen_weight_rows)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3666,6 +3680,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        trtllm_gen_weight_rows: bool = False,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -3707,6 +3722,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        trtllm_gen_weight_rows: bool = False,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -3733,6 +3749,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size=tile_size,
             output_dtype=output_dtype,
             scaling_vector_size=scaling_vector_size,
+            trtllm_gen_weight_rows=trtllm_gen_weight_rows,
         )
         return output
 
@@ -3756,6 +3773,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        trtllm_gen_weight_rows: bool = False,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -4105,7 +4123,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      swiglu_limit_scalar: float = float("inf"),
                      use_expert_counts: bool = False,
                      situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     situ_linear_beta: Optional[float] = None,
+                     trtllm_gen_weight_rows: bool = False):
             """Initialize the runner.
 
             Args:
@@ -4116,12 +4135,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_beta: Gate-side SiTU soft-cap. Required for -- and only
                     valid with -- ``ActivationType.SiTu``.
                 situ_linear_beta: Linear-side SiTU soft-cap, same rule.
+                trtllm_gen_weight_rows: The weight rows and their scale
+                    factors are in TRTLLM-Gen's row order instead of the
+                    ``[up64, gate64]`` interleave.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
             self.is_gated = is_gated_activation(self.activation_type)
             self.situ_beta = situ_beta
             self.situ_linear_beta = situ_linear_beta
+            self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -4169,6 +4192,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_expert_counts,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.trtllm_gen_weight_rows,
             )
 
         def get_valid_tactics(
@@ -4434,7 +4458,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
                          self.use_expert_counts, self.num_local_experts,
-                         self.situ_beta, self.situ_linear_beta)
+                         self.situ_beta, self.situ_linear_beta,
+                         self.trtllm_gen_weight_rows)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -4450,6 +4475,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_local_experts=self.num_local_experts,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    trtllm_gen_weight_rows=self.trtllm_gen_weight_rows,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4541,6 +4567,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        trtllm_gen_weight_rows: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4578,7 +4605,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
             situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta)
+            situ_linear_beta=situ_linear_beta,
+            trtllm_gen_weight_rows=trtllm_gen_weight_rows)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4619,6 +4647,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        trtllm_gen_weight_rows: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 

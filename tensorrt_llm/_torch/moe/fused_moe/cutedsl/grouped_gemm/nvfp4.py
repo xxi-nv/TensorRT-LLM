@@ -38,7 +38,7 @@ from ...impl_contract import (
 )
 from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
-from ...quantization import NVFP4CuteDslFusedMoEMethod
+from ...quantization import NVFP4CuteDslFusedMoEMethod, NVFP4CuteDslTrtllmGenRowsFusedMoEMethod
 from ..identity import grouped_gemm_identity
 from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
 from ..runners import CuteDslFusedMoENvfp4Runner
@@ -54,6 +54,11 @@ ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
 ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 
 _DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
+
+# Stores the expert weights in TRTLLM-Gen's row order on SM100/SM103, the
+# layout the TRTLLM-Gen implementation reads (see
+# NVFP4CuteDslTrtllmGenRowsFusedMoEMethod).
+_TRTLLM_GEN_WEIGHT_ROWS_ENV = "TRTLLM_CUTEDSL_MOE_TRTLLM_GEN_WEIGHT_ROWS"
 
 
 @register_moe_impl
@@ -112,8 +117,15 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # _join_pending_x_ready).
         self._x_quant_event = torch.cuda.Event()
         self._pending_x_ready_event: torch.cuda.Event | None = None
+        # SM107 keeps its own [gate16, up16] FC1 order: only the Blackwell
+        # kernels can read TRTLLM-Gen rows.
+        self.trtllm_gen_weight_rows = os.environ.get(
+            _TRTLLM_GEN_WEIGHT_ROWS_ENV, "0"
+        ) == "1" and get_sm_version() in (100, 103)
 
     def _get_quant_method(self) -> object:
+        if self.trtllm_gen_weight_rows:
+            return NVFP4CuteDslTrtllmGenRowsFusedMoEMethod()
         return NVFP4CuteDslFusedMoEMethod()
 
     def can_use_deep_ep_direct_metadata(self, supports_post_quant_dispatch: bool) -> bool:
@@ -295,7 +307,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ]
         else:
             forward_impl = self.run_moe_nvfp4_impl
-            workload_identity = None
+            workload_identity = ("trtllm_gen_weight_rows",) if self.trtllm_gen_weight_rows else None
             tuner_key = "CuteDslFusedMoE::run_moe_nvfp4"
             inputs = [
                 x,
@@ -464,6 +476,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
+        else:
+            gather_act_kwargs["trtllm_gen_weight_rows"] = self.trtllm_gen_weight_rows
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -553,6 +567,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 finalize_inplace_kwargs["expert_capacity"] = (
                     deep_ep_expert_capacity if use_count_native_expert_metadata else 0
                 )
+                finalize_inplace_kwargs["trtllm_gen_weight_rows"] = self.trtllm_gen_weight_rows
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:
@@ -578,6 +593,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
+                trtllm_gen_weight_rows=self.trtllm_gen_weight_rows,
             )
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,

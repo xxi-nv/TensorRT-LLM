@@ -59,6 +59,8 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     is_power_of_2,
 )
 
+from .trtllm_gen_row_order import TRTLLM_GEN_ROW_GROUP, trtllm_gen_row_source
+
 
 class Sm100BlockScaledContiguousGroupedGemmKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
@@ -107,6 +109,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        trtllm_gen_weight_rows: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -125,10 +128,16 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: If True, raster along M dimension for tile scheduler.
         :type raster_along_m: bool
+        :param trtllm_gen_weight_rows: The B rows (weights and their scale
+            factors) are in TRTLLM-Gen's shuffled row order rather than natural
+            order; see ``trtllm_gen_row_order``. The epilogue reads each output
+            channel from the column the shuffle moved it to.
+        :type trtllm_gen_weight_rows: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.raster_along_m = raster_along_m
+        self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -282,6 +291,12 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        if self.trtllm_gen_weight_rows and self.epi_tile_n % TRTLLM_GEN_ROW_GROUP != 0:
+            raise ValueError(
+                f"TRTLLM-Gen weight rows need an epilogue tile N that covers whole "
+                f"{TRTLLM_GEN_ROW_GROUP}-row groups, got {self.epi_tile_n} for "
+                f"output dtype {self.c_dtype}."
+            )
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -1649,7 +1664,11 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     #
                     # Apply alpha and convert to C type
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows):
+                        tTR_rAcc_out = self._gather_trtllm_gen_output_channels(tTR_rAcc)
+                    else:
+                        tTR_rAcc_out = tTR_rAcc
+                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc_out).load()
                     acc_vec = epilogue_op((alpha_val * acc_vec).to(self.c_dtype))
                     tRS_rC.store(acc_vec)
                     #
@@ -1715,6 +1734,26 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             c_pipeline.producer_tail()
 
         griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _gather_trtllm_gen_output_channels(self, acc: cute.Tensor) -> cute.Tensor:
+        """Reorder one thread's accumulator subtile out of TRTLLM-Gen row order.
+
+        The thread holds consecutive output columns of one row, a whole number
+        of aligned 32-column groups (checked in ``_setup_attributes``), so the
+        natural channel order is a trace-time register rename.
+        """
+        num_regs = cute.size(acc)
+        if cutlass.const_expr(num_regs % TRTLLM_GEN_ROW_GROUP != 0):
+            raise ValueError(
+                f"TRTLLM-Gen weight rows need whole {TRTLLM_GEN_ROW_GROUP}-column "
+                f"groups per TMEM load, got {num_regs} columns."
+            )
+        natural = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+        for out_idx in cutlass.range_constexpr(num_regs):
+            group, channel = divmod(out_idx, TRTLLM_GEN_ROW_GROUP)
+            natural[out_idx] = acc[TRTLLM_GEN_ROW_GROUP * group + trtllm_gen_row_source(channel)]
+        return natural
 
     def epilog_tmem_copy_and_partition(
         self,

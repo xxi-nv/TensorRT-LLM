@@ -51,6 +51,12 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
 )
 
 from ....utils import ActivationType, is_gated_activation
+from .trtllm_gen_row_order import (
+    TRTLLM_GEN_GATED_CHANNELS_PER_GROUP,
+    TRTLLM_GEN_ROW_GROUP,
+    trtllm_gen_gated_sources,
+    trtllm_gen_row_source,
+)
 
 SUPPORTED_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
@@ -291,6 +297,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        trtllm_gen_weight_rows: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -341,6 +348,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Linear-side (up) SiTU constant. Required for --
             and only valid with -- ``ActivationType.SiTu``.
         :type situ_linear_beta: Optional[float]
+        :param trtllm_gen_weight_rows: The B rows (weights and their scale
+            factors) are in TRTLLM-Gen's row order instead of the
+            ``[up64, gate64]`` interleave (gated) or natural order (non-gated);
+            see ``trtllm_gen_row_order``. Only the epilogue changes: it reads
+            each output channel from the column the permutation moved it to.
+        :type trtllm_gen_weight_rows: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -424,6 +437,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+        self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
 
         if swiglu_limit < 0:
             swiglu_limit = float("inf")
@@ -2534,14 +2548,21 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
-                    acc_vec_up = tTR_rAcc_up.load()
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows):
+                        tTR_rAcc_up_out, tTR_rAcc_gate_out = (
+                            self._gather_trtllm_gen_output_channels(tTR_rAcc_up, tTR_rAcc_gate)
+                        )
+                    else:
+                        tTR_rAcc_up_out, tTR_rAcc_gate_out = tTR_rAcc_up, tTR_rAcc_gate
+
+                    acc_vec_up = tTR_rAcc_up_out.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
                     if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
-                        acc_vec_gate = tTR_rAcc_gate.load()
+                        acc_vec_gate = tTR_rAcc_gate_out.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
-                        acc_vec_gate = tTR_rAcc_gate.load()
+                        acc_vec_gate = tTR_rAcc_gate_out.load()
                         self._apply_situ_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
@@ -2758,6 +2779,49 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     #   4. If the new activation is gated, also handle the two-subtile TMEM
     #      load path in ``__call__`` (mirror the existing Swiglu branch).
     # ------------------------------------------------------------------
+
+    @cute.jit
+    def _gather_trtllm_gen_output_channels(
+        self,
+        acc_first: cute.Tensor,
+        acc_second: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """Reorder one output subtile's accumulators out of TRTLLM-Gen row order.
+
+        Each thread holds one token row. For a gated activation ``acc_first``
+        and ``acc_second`` are the two TMEM loads of a subtile pair, together
+        the 128 accumulator columns behind 64 output channels; for a
+        non-gated one ``acc_first`` alone covers the subtile. Every aligned
+        32-column group holds whole output channels (``trtllm_gen_row_order``),
+        and one load spans whole groups, so the natural order is a trace-time
+        register rename.
+
+        Returns:
+            ``(up, gate)`` in natural output-channel order. For a non-gated
+            activation ``gate`` is ``acc_second`` unchanged.
+        """
+        num_regs = cute.size(acc_first)
+        if cutlass.const_expr(num_regs % TRTLLM_GEN_ROW_GROUP != 0):
+            raise ValueError(
+                f"TRTLLM-Gen weight rows need whole {TRTLLM_GEN_ROW_GROUP}-column "
+                f"groups per TMEM load, got {num_regs} columns."
+            )
+        up = cute.make_rmem_tensor(acc_first.shape, self.acc_dtype)
+        if cutlass.const_expr(self.is_gated):
+            gate = cute.make_rmem_tensor(acc_first.shape, self.acc_dtype)
+            groups_per_load = num_regs // TRTLLM_GEN_ROW_GROUP
+            for out_idx in cutlass.range_constexpr(num_regs):
+                group, channel = divmod(out_idx, TRTLLM_GEN_GATED_CHANNELS_PER_GROUP)
+                up_column, gate_column = trtllm_gen_gated_sources(channel)
+                base = TRTLLM_GEN_ROW_GROUP * (group % groups_per_load)
+                source = acc_first if group < groups_per_load else acc_second
+                up[out_idx] = source[base + up_column]
+                gate[out_idx] = source[base + gate_column]
+            return up, gate
+        for out_idx in cutlass.range_constexpr(num_regs):
+            group, channel = divmod(out_idx, TRTLLM_GEN_ROW_GROUP)
+            up[out_idx] = acc_first[TRTLLM_GEN_ROW_GROUP * group + trtllm_gen_row_source(channel)]
+        return up, acc_second
 
     @cute.jit
     def _apply_swiglu_epilogue(

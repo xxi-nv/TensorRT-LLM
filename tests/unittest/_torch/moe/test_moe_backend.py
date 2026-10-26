@@ -5241,6 +5241,152 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             ref_fused_moe.check_accuracy(output, ref_output)
 
 
+# =====================================================================
+# CuteDSL grouped GEMM reading TRTLLM-Gen's weight rows (SM100/SM103)
+# =====================================================================
+_TRTLLM_GEN_WEIGHT_ROWS_ENV = "TRTLLM_CUTEDSL_MOE_TRTLLM_GEN_WEIGHT_ROWS"
+
+
+def _skip_unless_sm100_family() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    sm_version = get_sm_version()
+    if sm_version not in (100, 103):
+        pytest.skip(f"only the SM100/SM103 kernels read TRTLLM-Gen rows, got SM{sm_version}")
+
+
+def _nvfp4_test_weights(model_config: MoeModelConfig, activation_type: ActivationType):
+    x = torch.randn((8, model_config.hidden_size), dtype=torch.bfloat16, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, MoeBackendType.CUTEDSL
+    )
+    quantize_util = quantize_util_cls(
+        num_experts=model_config.num_experts,
+        dtype=torch.bfloat16,
+        intermediate_size=model_config.intermediate_size,
+        hidden_size=model_config.hidden_size,
+        quant_config=quant_config,
+        activation_type=activation_type,
+    )
+    quant_kwargs.pop("ref_cls", None)
+    return quantize_util, quant_config, quantize_util.create_weights(**quant_kwargs)
+
+
+def _loaded_nvfp4_backend(
+    backend_type: MoeBackendType,
+    model_config: MoeModelConfig,
+    activation_type: ActivationType,
+    quant_config,
+    weights,
+    routing_method,
+) -> MoE:
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    backend = create_test_backend(
+        backend_type=backend_type,
+        routing_method=routing_method,
+        num_experts=model_config.num_experts,
+        hidden_size=model_config.hidden_size,
+        intermediate_size=model_config.intermediate_size,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+        mapping=mapping,
+        activation_type=activation_type,
+    )
+    backend.load_weights([weights])
+    backend.post_load_weights()
+    backend.cuda()
+    return backend
+
+
+# Neither weight method pads these shapes (intermediate a multiple of 128,
+# hidden a multiple of 256), so the two layouts can be byte-identical.
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.Relu2], ids=["swiglu", "relu2"]
+)
+def test_cutedsl_trtllm_gen_weight_rows_hold_the_trtllm_gen_bytes(monkeypatch, activation_type):
+    _skip_unless_sm100_family()
+    model_config = MoeModelConfig(16, 4, 2048, 256)
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+    _, quant_config, weights = _nvfp4_test_weights(model_config, activation_type)
+
+    NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
+    trtllm_gen = _loaded_nvfp4_backend(
+        MoeBackendType.TRTLLM, model_config, activation_type, quant_config, weights, routing_method
+    )
+    monkeypatch.setenv(_TRTLLM_GEN_WEIGHT_ROWS_ENV, "1")
+    cutedsl = _loaded_nvfp4_backend(
+        MoeBackendType.CUTEDSL, model_config, activation_type, quant_config, weights, routing_method
+    )
+    assert cutedsl.trtllm_gen_weight_rows
+
+    for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
+        ours = getattr(cutedsl, name).detach().contiguous().view(torch.uint8).flatten()
+        theirs = getattr(trtllm_gen, name).detach().contiguous().view(torch.uint8).flatten()
+        assert torch.equal(ours, theirs), f"{name} differs from the TRTLLM-Gen layout"
+
+
+# The FC1 and FC2 accumulators sum over K in the same order in both layouts;
+# only the column holding each output channel moves. With top-1 routing the
+# finalize adds one expert per row, so even the fused, atomically reducing FC2
+# is order-independent and the outputs must match bit for bit.
+@pytest.mark.parametrize("use_fused_finalize", [True, False], ids=["fused_fc2", "unfused_fc2"])
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.Relu2], ids=["swiglu", "relu2"]
+)
+@pytest.mark.parametrize("seq_len", [1, 77, 300])
+def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
+    monkeypatch, seq_len, activation_type, use_fused_finalize
+):
+    _skip_unless_sm100_family()
+    model_config = MoeModelConfig(16, 1, 2048, 256)
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+    quantize_util, quant_config, weights = _nvfp4_test_weights(model_config, activation_type)
+    x = torch.randn((seq_len, model_config.hidden_size), dtype=torch.bfloat16, device="cuda")
+    router_logits = torch.randn(
+        (seq_len, model_config.num_experts), dtype=torch.bfloat16, device="cuda"
+    )
+
+    outputs = []
+    for rows_env in ("0", "1"):
+        monkeypatch.setenv(_TRTLLM_GEN_WEIGHT_ROWS_ENV, rows_env)
+        backend = _loaded_nvfp4_backend(
+            MoeBackendType.CUTEDSL,
+            model_config,
+            activation_type,
+            quant_config,
+            weights,
+            routing_method,
+        )
+        assert backend.trtllm_gen_weight_rows == (rows_env == "1")
+        backend.use_fused_finalize = use_fused_finalize
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            outputs.append(
+                run_backend_moe(
+                    backend,
+                    MoeBackendType.CUTEDSL,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    torch.bfloat16,
+                    router_logits,
+                )
+            )
+    native, trtllm_gen_rows = outputs
+    assert torch.equal(native, trtllm_gen_rows)
+
+    ref_fused_moe = quantize_util.create_ref_module(routing_method)
+    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.cuda()
+    with torch.inference_mode():
+        ref_fused_moe.check_accuracy(trtllm_gen_rows, ref_fused_moe.forward(x, router_logits))
+
+
 def test_build_moe_deployment_carries_finalize_and_locality_domain():
     """The two fields SM107 eligibility reads must survive ``ModelConfig``."""
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy

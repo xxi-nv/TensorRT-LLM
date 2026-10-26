@@ -19,10 +19,21 @@ import torch
 from tensorrt_llm._torch.moe.fused_moe import quantization as quant_mod
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslFusedMoEMethod,
+    NVFP4CuteDslTrtllmGenRowsFusedMoEMethod,
     interleave_gate_and_linear,
     interleave_linear_and_gate,
 )
+from tensorrt_llm._torch.moe.kernels.blackwell.trtllm_gen_row_order import (
+    TRTLLM_GEN_GATED_CHANNELS_PER_GROUP,
+    TRTLLM_GEN_ROW_GROUP,
+    trtllm_gen_gated_sources,
+    trtllm_gen_row_source,
+)
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    get_reorder_rows_for_gated_act_gemm_row_indices,
+    get_shuffle_matrix_a_row_indices,
+)
 
 # FC1 rows are [up (intermediate) | gate (intermediate)]; K is packed FP4 bytes.
 INTERMEDIATE = 256
@@ -197,3 +208,75 @@ def test_eplb_hooks_skip_non_gated_modules(monkeypatch):
     module = _module_namespace(is_gated_activation=False, local_shared_w3_w1_tensors=raw.clone())
     method._prepare_shared_weights_for_finalization(module)
     assert torch.equal(module.local_shared_w3_w1_tensors, raw)
+
+
+# --- TRTLLM-Gen row order --------------------------------------------------
+# The Blackwell grouped-GEMM kernels can also read the expert weights in the
+# row order the TRTLLM-Gen implementation keeps them in, so both read one copy.
+# The epilogue finds each output channel through trtllm_gen_row_order; these
+# tests pin those maps, and the weight method that produces the order, against
+# the host-side permutation helpers TRTLLM-Gen's own weight method uses.
+
+
+def _trtllm_gen_stored_rows(num_rows: int, is_gated: bool) -> torch.Tensor:
+    """Original row held by every stored row, as NVFP4TRTLLMGenFusedMoEBaseMethod lays it out."""
+    rows = torch.arange(num_rows).view(num_rows, 1)
+    order = (
+        get_reorder_rows_for_gated_act_gemm_row_indices(rows)
+        if is_gated
+        else torch.arange(num_rows)
+    )
+    return order[get_shuffle_matrix_a_row_indices(rows, epilogue_tile_m=128)]
+
+
+@pytest.mark.parametrize("num_groups", [1, 4])
+def test_trtllm_gen_gated_sources_match_the_trtllm_gen_fc1_order(num_groups):
+    # FC1 rows are [up (intermediate) | gate (intermediate)].
+    intermediate = num_groups * TRTLLM_GEN_GATED_CHANNELS_PER_GROUP
+    stored = _trtllm_gen_stored_rows(2 * intermediate, is_gated=True)
+    for group in range(num_groups):
+        for channel in range(TRTLLM_GEN_GATED_CHANNELS_PER_GROUP):
+            up_column, gate_column = trtllm_gen_gated_sources(channel)
+            output_channel = TRTLLM_GEN_GATED_CHANNELS_PER_GROUP * group + channel
+            base = TRTLLM_GEN_ROW_GROUP * group
+            assert stored[base + up_column] == output_channel
+            assert stored[base + gate_column] == intermediate + output_channel
+
+
+@pytest.mark.parametrize("num_groups", [1, 4])
+def test_trtllm_gen_row_source_matches_the_trtllm_gen_shuffle(num_groups):
+    stored = _trtllm_gen_stored_rows(num_groups * TRTLLM_GEN_ROW_GROUP, is_gated=False)
+    for group in range(num_groups):
+        base = TRTLLM_GEN_ROW_GROUP * group
+        for channel in range(TRTLLM_GEN_ROW_GROUP):
+            assert stored[base + trtllm_gen_row_source(channel)] == base + channel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the weight method permutes on the GPU")
+@pytest.mark.parametrize("is_fc1", [True, False], ids=["fc1", "fc2"])
+@pytest.mark.parametrize("is_gated", [True, False], ids=["gated", "non_gated"])
+def test_trtllm_gen_rows_method_permutes_weights_and_scales(is_gated, is_fc1):
+    method = NVFP4CuteDslTrtllmGenRowsFusedMoEMethod()
+    expand_rows = FC1_ROWS if is_gated else INTERMEDIATE
+    module = _module_namespace(
+        is_gated_activation=is_gated, expand_intermediate_size_per_partition=expand_rows
+    )
+    rows, cols = (expand_rows, HIDDEN) if is_fc1 else (HIDDEN, INTERMEDIATE)
+    # FC2 rows only go through the shuffle, whatever the activation.
+    expected = _trtllm_gen_stored_rows(rows, is_gated=is_gated and is_fc1)
+
+    g = torch.Generator().manual_seed(5)
+    raw = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, generator=g)
+    weight = raw.clone()
+    method._permute_expert_rows(module, weight, None, is_fc1=is_fc1)
+    assert torch.equal(weight, raw[expected])
+
+    linear = torch.randint(0, 256, (rows, cols // SF_VEC), dtype=torch.uint8, generator=g)
+    swizzled = (
+        swizzle_sf(linear.view(quant_mod.float4_sf_dtype).cuda(), rows, cols)
+        .view(rows, cols // SF_VEC)
+        .cpu()
+    )
+    method._permute_expert_rows(module, None, swizzled, is_fc1=is_fc1)
+    permuted = unswizzle_sf(swizzled.cuda(), rows, cols).view(rows, cols // SF_VEC).cpu()
+    assert torch.equal(permuted.view(torch.uint8), linear[expected])

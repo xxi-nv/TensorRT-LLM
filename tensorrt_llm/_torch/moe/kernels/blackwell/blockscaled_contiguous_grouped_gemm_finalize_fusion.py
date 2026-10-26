@@ -47,6 +47,8 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     is_power_of_2,
 )
 
+from .trtllm_gen_row_order import TRTLLM_GEN_ROW_GROUP, trtllm_gen_row_source
+
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
 the NVIDIA Blackwell architecture using CUTE DSL.
@@ -206,6 +208,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         use_expert_counts: bool = False,
         num_local_experts: int = 0,
+        trtllm_gen_weight_rows: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -223,6 +226,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
+        :param trtllm_gen_weight_rows: The B rows (weights and their scale
+            factors) are in TRTLLM-Gen's shuffled row order rather than natural
+            order; see ``trtllm_gen_row_order``. The epilogue reads each output
+            channel from the column the shuffle moved it to.
+        :type trtllm_gen_weight_rows: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -230,6 +238,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
+        self.trtllm_gen_weight_rows = trtllm_gen_weight_rows
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
@@ -384,6 +393,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        if self.trtllm_gen_weight_rows and self.epi_tile_n % TRTLLM_GEN_ROW_GROUP != 0:
+            raise ValueError(
+                f"TRTLLM-Gen weight rows need an epilogue tile N that covers whole "
+                f"{TRTLLM_GEN_ROW_GROUP}-row groups, got {self.epi_tile_n} for "
+                f"output dtype {self.out_dtype}."
+            )
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -1928,7 +1943,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             acc_consumer_state.advance()
 
                     # Get vectorized accumulator and apply the combined finalize scale
-                    acc_vec = tTR_rAcc.load()
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows):
+                        acc_vec = self._gather_trtllm_gen_output_channels(tTR_rAcc).load()
+                    else:
+                        acc_vec = tTR_rAcc.load()
                     acc_vec_final = meta_scale * acc_vec
 
                     tRS_rC.store(acc_vec_final.to(self.out_dtype))
@@ -2005,6 +2023,26 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tmem.free(tmem_ptr)
 
         griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _gather_trtllm_gen_output_channels(self, acc: cute.Tensor) -> cute.Tensor:
+        """Reorder one thread's accumulator subtile out of TRTLLM-Gen row order.
+
+        The thread holds consecutive output columns of one row, a whole number
+        of aligned 32-column groups (checked in ``_setup_attributes``), so the
+        natural channel order is a trace-time register rename.
+        """
+        num_regs = cute.size(acc)
+        if cutlass.const_expr(num_regs % TRTLLM_GEN_ROW_GROUP != 0):
+            raise ValueError(
+                f"TRTLLM-Gen weight rows need whole {TRTLLM_GEN_ROW_GROUP}-column "
+                f"groups per TMEM load, got {num_regs} columns."
+            )
+        natural = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+        for out_idx in cutlass.range_constexpr(num_regs):
+            group, channel = divmod(out_idx, TRTLLM_GEN_ROW_GROUP)
+            natural[out_idx] = acc[TRTLLM_GEN_ROW_GROUP * group + trtllm_gen_row_source(channel)]
+        return natural
 
     def epilog_tmem_copy_and_partition(
         self,
