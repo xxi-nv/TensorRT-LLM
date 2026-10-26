@@ -5327,6 +5327,92 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                 delattr(module, attr)
 
 
+class NVFP4MegaMoECuteDslTrtllmGenRowsMethod(NVFP4MegaMoECuteDslMethod):
+    """MegaMoE CuteDSL weights in TRTLLM-Gen's row order (SM100/SM103).
+
+    The weight lifecycle is ``NVFP4MegaMoECuteDslMethod``'s; only the rows of
+    the derived ``mega_fc*`` buffers differ. Instead of the 16-atom
+    ``[gate16, up16]`` FC1 interleave and natural FC2 rows, they carry the
+    permutation ``NVFP4TRTLLMGenFusedMoEBaseMethod`` applies: the gated
+    up/gate row reorder (FC1), then ``shuffle_matrix_a`` with a 128-row
+    epilogue tile (FC1 and FC2). The block scales get the same row
+    permutation before their 128x4 swizzle. The kernel reads these buffers
+    with ``weight_row_order="trtllm_gen"``.
+    """
+
+    weight_row_order = "trtllm_gen"
+
+    _EPILOGUE_TILE_M = 128
+
+    # The indices depend only on the row count and are costly to compute.
+    _cache_permute_indices: Dict[Tuple, torch.Tensor] = {}
+
+    def _row_permutation(self, num_rows: int, is_fc1: bool,
+                         device: torch.device) -> torch.Tensor:
+        # The helpers only read the row count off the tensor they are given.
+        rows = torch.empty((num_rows, 1), dtype=torch.uint8, device=device)
+        if is_fc1:
+            permutation = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                rows, self._cache_permute_indices, self._EPILOGUE_TILE_M)
+        else:
+            permutation = trtllmgen_maybe_get_cached_w2_permute_indices(
+                rows, self._cache_permute_indices, self._EPILOGUE_TILE_M)
+        return permutation.to(device)
+
+    def _build_mega_format_buffers(
+        self,
+        raw_w3_w1: torch.Tensor,
+        raw_w3_w1_sf: torch.Tensor,
+        raw_w2: torch.Tensor,
+        raw_w2_sf: torch.Tensor,
+        *,
+        num_slots: int,
+        intermediate: int,
+        hidden: int,
+        expand_intermediate: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same contract as the parent, with TRTLLM-Gen row order.
+
+        Every MegaMoE activation is gated, so FC1 always takes the gated
+        reorder. Slot-blockwise like the parent: each slot's rows get the same
+        permutation.
+        """
+        # The TRTLLM-Gen shuffle moves rows within 32-row groups, and the
+        # gated reorder pairs one up row with one gate row in each of them.
+        if hidden % 32 != 0 or intermediate % 16 != 0:
+            raise ValueError(
+                "MegaMoE NVFP4 weights in TRTLLM-Gen row order require"
+                f" hidden % 32 == 0 and intermediate % 16 == 0; got"
+                f" hidden={hidden}, intermediate={intermediate}.")
+        if raw_w3_w1.dtype != torch.uint8:
+            raw_w3_w1 = raw_w3_w1.view(torch.uint8).contiguous()
+        if raw_w2.dtype != torch.uint8:
+            raw_w2 = raw_w2.view(torch.uint8).contiguous()
+        fc1_rows = self._row_permutation(expand_intermediate, True,
+                                         raw_w3_w1.device)
+        fc2_rows = self._row_permutation(hidden, False, raw_w2.device)
+
+        mega_fc1 = raw_w3_w1.index_select(1, fc1_rows).contiguous()
+        mega_fc2 = raw_w2.index_select(1, fc2_rows).contiguous()
+        mega_fc1_sf = self._build_mega_sf(
+            raw_w3_w1_sf.index_select(1, fc1_rows.to(raw_w3_w1_sf.device)),
+            num_slots=num_slots,
+            gate_up_interleave_intermediate=None,
+            n_pairs=None,
+            expand_intermediate=expand_intermediate,
+            flat_size=self.fc1_sf_flat_size(intermediate, hidden),
+        )
+        mega_fc2_sf = self._build_mega_sf(
+            raw_w2_sf.index_select(1, fc2_rows.to(raw_w2_sf.device)),
+            num_slots=num_slots,
+            gate_up_interleave_intermediate=None,
+            n_pairs=None,
+            expand_intermediate=expand_intermediate,
+            flat_size=self.fc2_sf_flat_size(hidden, intermediate),
+        )
+        return mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf
+
+
 def _fc31_scale_c_omits_dequant(module: torch.nn.Module) -> bool:
     """Whether the FC1 kernel's scaleC must be quantScaleC alone.
 

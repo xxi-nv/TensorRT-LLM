@@ -39,6 +39,7 @@ from _torch.moe.moe_test_utils import (
     get_backend_class,
     iter_base_test_configs,
     replay_tactics_and_check,
+    should_skip_megamoe_cutedsl,
     should_skip_to_accelerate_ci,
     skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
@@ -5255,10 +5256,15 @@ def _skip_unless_sm100_family() -> None:
         pytest.skip(f"only the SM100/SM103 kernels read TRTLLM-Gen rows, got SM{sm_version}")
 
 
-def _nvfp4_test_weights(model_config: MoeModelConfig, activation_type: ActivationType):
+def _nvfp4_test_weights(
+    model_config: MoeModelConfig,
+    activation_type: ActivationType,
+    backend_type: MoeBackendType = MoeBackendType.CUTEDSL,
+):
+    """Random NVFP4 expert weights, plus what building a reference for ``backend_type`` needs."""
     x = torch.randn((8, model_config.hidden_size), dtype=torch.bfloat16, device="cuda")
     quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-        QuantAlgo.NVFP4, x, MoeBackendType.CUTEDSL
+        QuantAlgo.NVFP4, x, backend_type
     )
     quantize_util = quantize_util_cls(
         num_experts=model_config.num_experts,
@@ -5268,8 +5274,8 @@ def _nvfp4_test_weights(model_config: MoeModelConfig, activation_type: Activatio
         quant_config=quant_config,
         activation_type=activation_type,
     )
-    quant_kwargs.pop("ref_cls", None)
-    return quantize_util, quant_config, quantize_util.create_weights(**quant_kwargs)
+    ref_cls = quant_kwargs.pop("ref_cls", None)
+    return quantize_util, quant_config, quantize_util.create_weights(**quant_kwargs), ref_cls
 
 
 def _loaded_nvfp4_backend(
@@ -5309,7 +5315,7 @@ def test_cutedsl_trtllm_gen_weight_rows_hold_the_trtllm_gen_bytes(monkeypatch, a
     model_config = MoeModelConfig(16, 4, 2048, 256)
     torch.manual_seed(0)
     routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
-    _, quant_config, weights = _nvfp4_test_weights(model_config, activation_type)
+    _, quant_config, weights, _ = _nvfp4_test_weights(model_config, activation_type)
 
     NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
     trtllm_gen = _loaded_nvfp4_backend(
@@ -5343,7 +5349,7 @@ def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
     model_config = MoeModelConfig(16, 1, 2048, 256)
     torch.manual_seed(0)
     routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
-    quantize_util, quant_config, weights = _nvfp4_test_weights(model_config, activation_type)
+    quantize_util, quant_config, weights, _ = _nvfp4_test_weights(model_config, activation_type)
     x = torch.randn((seq_len, model_config.hidden_size), dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(
         (seq_len, model_config.num_experts), dtype=torch.bfloat16, device="cuda"
@@ -5381,6 +5387,115 @@ def test_cutedsl_trtllm_gen_weight_rows_reproduce_the_native_layout(
     assert torch.equal(native, trtllm_gen_rows)
 
     ref_fused_moe = quantize_util.create_ref_module(routing_method)
+    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.cuda()
+    with torch.inference_mode():
+        ref_fused_moe.check_accuracy(trtllm_gen_rows, ref_fused_moe.forward(x, router_logits))
+
+
+# =====================================================================
+# MegaMoE CuteDSL reading TRTLLM-Gen's weight rows (SM100/SM103)
+# =====================================================================
+_MEGAMOE_TRTLLM_GEN_WEIGHT_ROWS_ENV = "TRTLLM_MEGAMOE_CUTEDSL_TRTLLM_GEN_WEIGHT_ROWS"
+
+
+def _skip_unless_megamoe_reads_trtllm_gen_rows() -> None:
+    _skip_unless_sm100_family()
+    reason = should_skip_megamoe_cutedsl(
+        MoeBackendType.MEGAMOE_CUTEDSL, QuantAlgo.NVFP4, torch.bfloat16
+    )
+    if reason:
+        pytest.skip(reason)
+    _ensure_single_proc_dist_for_megamoe(MoeBackendType.MEGAMOE_CUTEDSL, mpi_rank())
+
+
+# MegaMoE keeps only its derived mega_fc* buffers after packing; in TRTLLM-Gen
+# row order they must hold exactly the TRTLLM-Gen leaf's bytes.
+def test_megamoe_trtllm_gen_weight_rows_hold_the_trtllm_gen_bytes(monkeypatch):
+    _skip_unless_megamoe_reads_trtllm_gen_rows()
+    model_config = MoeModelConfig(16, 4, 2048, 256)
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+    _, quant_config, weights, _ = _nvfp4_test_weights(model_config, ActivationType.Swiglu)
+
+    NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
+    trtllm_gen = _loaded_nvfp4_backend(
+        MoeBackendType.TRTLLM,
+        model_config,
+        ActivationType.Swiglu,
+        quant_config,
+        weights,
+        routing_method,
+    )
+    monkeypatch.setenv(_MEGAMOE_TRTLLM_GEN_WEIGHT_ROWS_ENV, "1")
+    megamoe = _loaded_nvfp4_backend(
+        MoeBackendType.MEGAMOE_CUTEDSL,
+        model_config,
+        ActivationType.Swiglu,
+        quant_config,
+        weights,
+        routing_method,
+    )
+    assert megamoe.weight_row_order == "trtllm_gen"
+
+    for ours_name, theirs_name in (
+        ("mega_fc1_weight", "w3_w1_weight"),
+        ("mega_fc2_weight", "w2_weight"),
+        ("mega_fc1_weight_sf", "w3_w1_weight_scale"),
+        ("mega_fc2_weight_sf", "w2_weight_scale"),
+    ):
+        ours = getattr(megamoe, ours_name).detach().contiguous().view(torch.uint8).flatten()
+        theirs = getattr(trtllm_gen, theirs_name).detach().contiguous().view(torch.uint8).flatten()
+        assert torch.equal(ours, theirs), f"{ours_name} differs from TRTLLM-Gen's {theirs_name}"
+
+
+# Same argument as the CuteDSL test above: only the TMEM row holding each
+# channel moves, and the default top-k reduction is deterministic.
+@pytest.mark.parametrize("seq_len", [1, 77, 300])
+def test_megamoe_trtllm_gen_weight_rows_reproduce_the_native_layout(monkeypatch, seq_len):
+    _skip_unless_megamoe_reads_trtllm_gen_rows()
+    model_config = MoeModelConfig(16, 4, 2048, 256)
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+    quantize_util, quant_config, weights, ref_cls = _nvfp4_test_weights(
+        model_config, ActivationType.Swiglu, MoeBackendType.MEGAMOE_CUTEDSL
+    )
+    x = torch.randn((seq_len, model_config.hidden_size), dtype=torch.bfloat16, device="cuda")
+    router_logits = torch.randn(
+        (seq_len, model_config.num_experts), dtype=torch.bfloat16, device="cuda"
+    )
+
+    outputs = []
+    for rows_env in ("0", "1"):
+        monkeypatch.setenv(_MEGAMOE_TRTLLM_GEN_WEIGHT_ROWS_ENV, rows_env)
+        backend = _loaded_nvfp4_backend(
+            MoeBackendType.MEGAMOE_CUTEDSL,
+            model_config,
+            ActivationType.Swiglu,
+            quant_config,
+            weights,
+            routing_method,
+        )
+        assert backend.weight_row_order == ("trtllm_gen" if rows_env == "1" else "megamoe")
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            outputs.append(
+                run_backend_moe(
+                    backend,
+                    MoeBackendType.MEGAMOE_CUTEDSL,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    torch.bfloat16,
+                    router_logits,
+                )
+            )
+    native, trtllm_gen_rows = outputs
+    assert torch.equal(native, trtllm_gen_rows)
+
+    ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
     with torch.inference_mode():

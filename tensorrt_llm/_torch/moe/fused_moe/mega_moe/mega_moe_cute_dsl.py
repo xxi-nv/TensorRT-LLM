@@ -113,7 +113,7 @@ from ..impl_contract import (
 from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
-from ..quantization import NVFP4MegaMoECuteDslMethod
+from ..quantization import NVFP4MegaMoECuteDslMethod, NVFP4MegaMoECuteDslTrtllmGenRowsMethod
 from ..routing import BaseMoeRoutingMethod
 
 __all__ = [
@@ -610,6 +610,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         self.combine_format = combine_format
 
+        # TRTLLM_MEGAMOE_CUTEDSL_TRTLLM_GEN_WEIGHT_ROWS=1 stores the expert
+        # weights in TRTLLM-Gen's row order (SM100/SM103), the layout the
+        # TRTLLM-Gen implementation reads. Like the combine format it picks the
+        # compiled kernel, so it MUST be rank-identical.
+        self.weight_row_order = (
+            "trtllm_gen"
+            if os.environ.get("TRTLLM_MEGAMOE_CUTEDSL_TRTLLM_GEN_WEIGHT_ROWS", "0") == "1"
+            and get_sm_version() in (100, 103)
+            else "megamoe"
+        )
+
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
         # (bench-only knob; default OFF so serving warmup never pays the
         # MERGE lockstep sweep). Must be set identically on ALL ranks (it
@@ -938,6 +949,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     def _get_quant_method(self):
         if self.quant_config is None or not self.quant_config.layer_quant_mode.has_nvfp4():
             raise NotImplementedError("MegaMoECuteDsl supports NVFP4 quantization only.")
+        if self.weight_row_order == "trtllm_gen":
+            return NVFP4MegaMoECuteDslTrtllmGenRowsMethod()
         return NVFP4MegaMoECuteDslMethod()
 
     def create_weights(self):
@@ -1615,6 +1628,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
+                weight_row_order=self.weight_row_order,
             )
         finally:
             # Always clear: a raising op call must not leave the factory

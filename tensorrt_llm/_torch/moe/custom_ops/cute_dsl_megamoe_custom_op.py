@@ -2567,6 +2567,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        weight_row_order: str = "megamoe",
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -2593,6 +2594,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ``act_alpha`` / ``act_beta`` select the activation: both None
         runs SwiGLU, both set runs SiTU with the gate-side and linear-side
         soft-caps, respectively. They are codegen-time constants.
+
+        ``weight_row_order`` names the row order of the FC1 / FC2 weights and
+        their block scales: ``"megamoe"`` (FC1 ``[gate16, up16]``) or
+        ``"trtllm_gen"`` (the TRTLLM-Gen NVFP4 order, SM100/SM103 only).
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103, 107):
@@ -2627,6 +2632,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_format=combine_format,
             tactic_autotune=tactic_autotune,
+            weight_row_order=weight_row_order,
         )
         inputs = [
             activation,
@@ -2744,5 +2750,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        weight_row_order: str = "megamoe",
     ) -> None:
         return None
