@@ -620,6 +620,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and get_sm_version() in (100, 103)
             else "megamoe"
         )
+        if self.weight_row_order == "trtllm_gen":
+            logger.info_once(
+                "MegaMoE CuteDSL stores expert weights in TRTLLM-Gen row order.",
+                key="megamoe_cutedsl_trtllm_gen_weight_rows",
+            )
 
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
         # (bench-only knob; default OFF so serving warmup never pays the
