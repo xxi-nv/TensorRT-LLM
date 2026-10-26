@@ -50,6 +50,50 @@ from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 
+# Weight row orders the epilogue can consume, picked at codegen time by the ProblemDesc key
+# ``weight_row_order``. Epilogue warp w owns TMEM lanes 32w..32w+31 of the 128-row CTA tile, which
+# is 16 FC1 output channels (gate and up rows) or 32 FC2 hidden channels:
+#   * "megamoe":    FC1 rows are [gate16, up16] per 32-row window; FC2 rows are natural hidden rows.
+#   * "trtllm_gen": TRTLLM-Gen's NVFP4 order (gated-activation row interleave, then the 32-row
+#                   shuffle of epilogue_tile_m=128). Within a window, FC1 rows 0-7 / 8-15 / 16-23 /
+#                   24-31 are up(2b) / gate(2b) / up(2b+1) / gate(2b+1) with b = row % 8, and FC2
+#                   row r is hidden channel 4 * (r % 8) + r // 8.
+# Weight block-scale rows follow their weight rows; the mainloop and the 128x4 scale swizzle are
+# the same for both orders, only the epilogue's register mapping differs.
+WEIGHT_ROW_ORDERS: Tuple[str, ...] = ("megamoe", "trtllm_gen")
+
+
+def _trtllm_gen_fc1_channel_of_slot(slot):
+    """trtllm_gen: channel (of the warp's 16) held by FC1 transpose slot ``slot``.
+
+    Valid after ``SwapABFc1Epilogue._exchange_trtllm_gen_gate_up``; a slot is the TMEM row index
+    within a 16-lane half of the warp window.
+    """
+    return 2 * (slot % 8) + slot // 8
+
+
+def _trtllm_gen_fc2_hidden_of_row(row):
+    """trtllm_gen: hidden channel (of the warp's 32) held by warp-local FC2 TMEM row ``row``.
+
+    Plain arithmetic, so it accepts a Python int or a DSL integer (the UBLK store uses a lane id).
+    """
+    return 4 * (row % 8) + row // 8
+
+
+def _inverse_table(forward: Callable[[int], int], size: int) -> Tuple[int, ...]:
+    inverse = [None] * size
+    for index in range(size):
+        inverse[forward(index)] = index
+    if None in inverse:
+        raise ValueError(f"{forward.__name__} is not a permutation of range({size}).")
+    return tuple(inverse)
+
+
+# Entry c is the FC1 transpose slot that holds channel c.
+_TRTLLM_GEN_FC1_SLOT_OF_CHANNEL = _inverse_table(_trtllm_gen_fc1_channel_of_slot, 16)
+# Entry h is the warp-local FC2 TMEM row that holds hidden channel h.
+_TRTLLM_GEN_FC2_ROW_OF_HIDDEN = _inverse_table(_trtllm_gen_fc2_hidden_of_row, 32)
+
 
 @dataclasses.dataclass(frozen=True)
 class QuantImpl:
@@ -1073,6 +1117,9 @@ class SwapABGatedActEpilogue(KernelComponent):
             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # One of WEIGHT_ROW_ORDERS; absent means "megamoe". A codegen-time choice, so the
+            # enclosing KernelClass must fold it into its ``name()`` cache key.
+            "weight_row_order": OptionalRequirement(str),
         }
 
     @classmethod
@@ -1119,6 +1166,26 @@ class SwapABGatedActEpilogue(KernelComponent):
             raise ValueError("SiTU does not support SwiGLUBias constants.")
         return float(beta), float(linear_beta)
 
+    @staticmethod
+    def _resolve_weight_row_order(problem_desc: ProblemDesc) -> str:
+        """Resolve the weight row order (see ``WEIGHT_ROW_ORDERS``); absent means "megamoe"."""
+        weight_row_order = problem_desc.get("weight_row_order", "megamoe")
+        if weight_row_order not in WEIGHT_ROW_ORDERS:
+            raise ValueError(
+                f"weight_row_order must be one of {WEIGHT_ROW_ORDERS}, got {weight_row_order!r}."
+            )
+        if weight_row_order == "trtllm_gen":
+            # TRTLLM-Gen permutes rows inside 32-row blocks, so a block must never straddle the
+            # end of a weight: FC1 has 2 * intermediate_downproj rows and FC2 has hidden_size rows.
+            for name in ("intermediate_gateup_size", "hidden_size"):
+                extent = problem_desc[name]
+                if isinstance(extent, int) and extent % 32 != 0:
+                    raise ValueError(
+                        f"weight_row_order='trtllm_gen' needs {name} to be a multiple of 32, "
+                        f"got {extent}."
+                    )
+        return weight_row_order
+
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
@@ -1136,6 +1203,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             self.swiglu_alpha = float(self.swiglu_alpha)
             self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+        self.weight_row_order = self._resolve_weight_row_order(problem_desc)
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1859,6 +1927,17 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
 
+        if cutlass.const_expr(self.weight_row_order == "trtllm_gen"):
+            # The loads above hold TRTLLM-Gen rows: gate and up of a channel sit in an xor-1 lane
+            # pair instead of the top / bottom 16-lane halves. One exchange per register restores
+            # the (gate, up) pairing everything below consumes, for both token halves.
+            gate_token_0_32, up_token_0_32 = self._exchange_trtllm_gen_gate_up(
+                gate_token_0_32, up_token_0_32
+            )
+            gate_token_32_64, up_token_32_64 = self._exchange_trtllm_gen_gate_up(
+                gate_token_32_64, up_token_32_64
+            )
+
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
             gate_token_0_32, up_token_0_32, alpha_val
@@ -1886,6 +1965,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
         )
         token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+
+        if cutlass.const_expr(self.weight_row_order == "trtllm_gen"):
+            # A transpose slot is a TMEM row, so under TRTLLM-Gen it is not the channel index yet.
+            # Quantization, scale grouping and the store all expect natural channel order.
+            token_0_32_pre_quant = self._trtllm_gen_slots_to_channels(token_0_32_pre_quant)
+            token_32_64_pre_quant = self._trtllm_gen_slots_to_channels(token_32_64_pre_quant)
 
         # Step 2: Quant
         self.fc1_quant(
@@ -1931,6 +2016,59 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 cute.arch.cp_async_bulk_commit_group()
         else:
             tma_ready_to_read_smem_named_barrier.arrive()
+
+    @cute.jit
+    def _exchange_trtllm_gen_gate_up(
+        self,
+        top: cute.Tensor,  # raw acc of window lanes 0..15, (16,) fp32
+        bottom: cute.Tensor,  # raw acc of window lanes 16..31, (16,) fp32
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """Pair TRTLLM-Gen FC1 rows into (gate, up) for one 32-token half of a subtile.
+
+        Both inputs are in the ``TmemTranspose16x32`` input distribution: lane t, register e holds
+        row L = 8 * (t % 2) + t // 4 of its 16-lane half at token column 2 * e + (t // 2) % 2.
+        Under TRTLLM-Gen rows, with b = t // 4, ``top`` holds up(2b) on even lanes and gate(2b) on
+        odd lanes, and ``bottom`` holds up(2b + 1) / gate(2b + 1). Lanes t and t ^ 1 share b and the
+        token column, so a single xor-1 shuffle per register completes every pair:
+
+            even t: gate = partner top = gate(2b),          up = own top = up(2b)
+            odd t:  gate = own bottom = gate(2b + 1),       up = partner bottom = up(2b + 1)
+
+        The returned ``(gate, up)`` keep the input distribution, so slot L of lane t now carries
+        channel 2 * (L % 8) + L // 8 of the warp's 16-channel block; see
+        ``_trtllm_gen_slots_to_channels`` for the matching rename after the transposes.
+        """
+        if cutlass.const_expr(cute.size(top) != cute.size(bottom)):
+            raise ValueError("The TRTLLM-Gen gate/up exchange needs equally sized halves.")
+        num_regs = cute.size(top)
+        is_even_lane = (self.lane_idx % cutlass.Int32(2)) == cutlass.Int32(0)
+        gate = cute.make_rmem_tensor((num_regs,), cutlass.Float32)
+        up = cute.make_rmem_tensor((num_regs,), cutlass.Float32)
+        for reg_idx in cutlass.range_constexpr(num_regs):
+            # Even lanes give away their bottom (the odd partner's up), odd lanes their top (the
+            # even partner's gate).
+            send = cutlass.Float32(cutlass.select_(is_even_lane, bottom[reg_idx], top[reg_idx]))
+            recv = cute.arch.shuffle_sync_bfly(send, offset=1)
+            gate[reg_idx] = cutlass.Float32(cutlass.select_(is_even_lane, recv, bottom[reg_idx]))
+            up[reg_idx] = cutlass.Float32(cutlass.select_(is_even_lane, top[reg_idx], recv))
+        return gate, up
+
+    @cute.jit
+    def _trtllm_gen_slots_to_channels(self, slots: cute.Tensor) -> cute.Tensor:
+        """Rename one token's 16 transpose slots into natural channel order (registers only).
+
+        After ``_exchange_trtllm_gen_gate_up`` slot L carries channel 2 * (L % 8) + L // 8, so
+        channel c is read from slot 8 * (c % 2) + c // 2.
+        """
+        num_channels = len(_TRTLLM_GEN_FC1_SLOT_OF_CHANNEL)
+        if cutlass.const_expr(cute.size(slots) != num_channels):
+            raise ValueError(
+                f"The TRTLLM-Gen FC1 rename expects {num_channels} slots, got {cute.size(slots)}."
+            )
+        channels = cute.make_rmem_tensor((num_channels,), slots.element_type)
+        for channel in cutlass.range_constexpr(num_channels):
+            channels[channel] = slots[_TRTLLM_GEN_FC1_SLOT_OF_CHANNEL[channel]]
+        return channels
 
     @cute.jit
     def alpha_swiglu_clamp(
@@ -2556,7 +2694,9 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         # reorder returns a bare RMEM fragment in the store's expected pre-store
         # distribution; reorder + store are paired 1:1 inside the pipeline.
         pre_store = process_pipeline.post_f2fp_reorder(
-            casted=casted, tmem_subtile_view=tmem_subtile_tensor
+            casted=casted,
+            tmem_subtile_view=tmem_subtile_tensor,
+            weight_row_order=self.weight_row_order,
         )
         process_pipeline.store_function(
             epi=self,
@@ -2996,21 +3136,58 @@ def fc2_ublk_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
 
 
 @cute.jit
+def fc2_tmem_rows_to_hidden_order(movm_out: cute.Tensor, weight_row_order: str) -> cute.Tensor:
+    """Rename the MOVM transpose output so that slot ``elem_idx % 32`` is the hidden channel.
+
+    ``TmemTranspose32x64B16Movm`` hands lane t the token ``t + 32 * (elem_idx // 32)`` and, in
+    slot ``elem_idx % 32``, warp-local TMEM row ``elem_idx % 32``. A TMEM row is a weight row, so
+    under "megamoe" it already is the hidden channel. Under "trtllm_gen" row r carries hidden
+    ``4 * (r % 8) + r // 8``, and hidden h is read from row ``8 * (h % 4) + h // 4``. This is a
+    compile-time register rename; every store, quantizer and re-transpose downstream sees natural
+    hidden order.
+    """
+    if cutlass.const_expr(weight_row_order == "megamoe"):
+        return movm_out
+    if cutlass.const_expr(weight_row_order != "trtllm_gen"):
+        raise ValueError(f"Unsupported weight_row_order {weight_row_order!r}.")
+    rows_per_window = len(_TRTLLM_GEN_FC2_ROW_OF_HIDDEN)
+    num_elems = cute.size(movm_out)
+    if cutlass.const_expr(num_elems % rows_per_window != 0):
+        raise ValueError(
+            f"The TRTLLM-Gen FC2 rename expects whole {rows_per_window}-row windows, got {num_elems}."
+        )
+    hidden_ordered = cute.make_rmem_tensor((num_elems,), movm_out.element_type)
+    for token_group in cutlass.range_constexpr(num_elems // rows_per_window):
+        base = token_group * rows_per_window
+        for hidden in cutlass.range_constexpr(rows_per_window):
+            hidden_ordered[base + hidden] = movm_out[base + _TRTLLM_GEN_FC2_ROW_OF_HIDDEN[hidden]]
+    return hidden_ordered
+
+
+@cute.jit
 def fc2_stg_post_f2fp_reorder(
     *,
     casted: cute.Tensor,  # (subtile_cnt,)
     tmem_subtile_view: cute.Tensor,  # (epi_tile_m, epi_tile_n)
+    weight_row_order: str,
     **_,
 ):
     if cutlass.const_expr(cute.size(casted) != 64):
         raise NotImplementedError("fc2 stg pass expects 64 BF16 registers before store reorder.")
-    return TmemTranspose32x64B16Movm(tmem_subtile_view.iterator, casted)()
+    return fc2_tmem_rows_to_hidden_order(
+        TmemTranspose32x64B16Movm(tmem_subtile_view.iterator, casted)(), weight_row_order
+    )
 
 
 @cute.jit
-def fc2_redg_post_f2fp_reorder(*, casted: cute.Tensor, tmem_subtile_view: cute.Tensor, **_):
+def fc2_redg_post_f2fp_reorder(
+    *, casted: cute.Tensor, tmem_subtile_view: cute.Tensor, weight_row_order: str, **_
+):
     # (epi_tid, elem_idx) -> (token_64, hidden_128), each thread hold token_2 x hidden_32
-    natural = fc2_stg_post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile_view)
+    # The hidden rename happens inside fc2_stg_post_f2fp_reorder, before the re-transpose below.
+    natural = fc2_stg_post_f2fp_reorder(
+        casted=casted, tmem_subtile_view=tmem_subtile_view, weight_row_order=weight_row_order
+    )
     core_matrix_reorder_sttm_atom = cute.make_copy_atom(
         tcgen05.St32x32bOp(tcgen05.Repetition.x16), cutlass.Float32
     )
@@ -3260,8 +3437,14 @@ def fc2_ublk_store_function_impl(
                 "BF16 UBLK staging requires one register per token in the 64-token subtile."
             )
         warp_hidden_base = cutlass.Int32(warp_idx * 32)
+        # This lane loaded warp-local TMEM row lane_idx (fc2_ublk_tmem_acc_load), i.e. one weight
+        # row; place it in the hidden column that row carries.
+        if cutlass.const_expr(epi.weight_row_order == "megamoe"):
+            hidden_in_warp = lane_idx
+        else:
+            hidden_in_warp = _trtllm_gen_fc2_hidden_of_row(lane_idx)
         for token_idx in cutlass.range_constexpr(epi._EpilogueTokenTileSize):
-            smem_stage[token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
+            smem_stage[token_idx, warp_hidden_base + hidden_in_warp] = data_subtile[token_idx]
 
     cute.arch.fence_proxy("async.shared", space="cta")
     smem_read_write_bar.arrive_and_wait()

@@ -84,6 +84,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "swiglu_beta": OptionalRequirement(Optional[float]),
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # Validated and consumed by SwapABGatedActEpilogue; absent means "megamoe".
+            "weight_row_order": OptionalRequirement(str),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -132,6 +134,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+        self.weight_row_order = problem_desc.get("weight_row_order", "megamoe")
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
@@ -457,6 +460,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
         )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        # The weight row order changes the epilogue's codegen. The native order keeps the
+        # historical name so existing cache entries stay valid.
+        row_order = "" if self.weight_row_order == "megamoe" else f"_rows{self.weight_row_order}"
         return (
             f"sm100_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -479,6 +485,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            f"{row_order}"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):

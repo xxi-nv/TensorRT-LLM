@@ -524,8 +524,9 @@ def _megamoe_problem_key(
     combine_format: str,
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
+    weight_row_order: str = "megamoe",
 ) -> Tuple:
-    return (
+    key = (
         int(sm_version),
         int(world_size),
         int(num_topk),
@@ -544,6 +545,11 @@ def _megamoe_problem_key(
         None if swiglu_alpha is None else float(swiglu_alpha),
         None if swiglu_beta is None else float(swiglu_beta),
     )
+    # Appended only when it differs from the native order, so default keys (and the
+    # positional fields read by _default_megamoe_tactic_for_key) are unchanged.
+    if weight_row_order != "megamoe":
+        key += (("weight_row_order", str(weight_row_order)),)
+    return key
 
 
 def _default_megamoe_tactic_for_problem(
@@ -722,6 +728,14 @@ def _construct_megamoe_kernel(
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
 
     local_experts, intermediate_gateup_size, hidden_size = common["static_expert_shape"]
+    weight_row_order = common.get("weight_row_order", "megamoe")
+    if sm_version == 107 and weight_row_order != "megamoe":
+        # The Rubin kernels do not read this key, so passing it on would silently run the
+        # native layout against differently ordered weights.
+        raise NotImplementedError(
+            f"MegaMoE weight_row_order={weight_row_order!r} is only implemented by the "
+            "Blackwell (SM100/SM103) kernel."
+        )
     problem_desc = ProblemDesc(
         {
             "expert_count": int(local_experts) * int(common["world_size"]),
@@ -736,6 +750,7 @@ def _construct_megamoe_kernel(
             "swiglu_beta": common["swiglu_beta"],
             "situ_beta": common["situ_beta"],
             "situ_linear_beta": common["situ_linear_beta"],
+            "weight_row_order": weight_row_order,
             "world_size": int(common["world_size"]),
             "topk": int(common["num_topk"]),
             "topk_index_dtype": cutlass.Int32 if sm_version == 107 else cutlass.Int64,
@@ -1877,6 +1892,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             in_kernel_fc2_reduce: bool = False,
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
+            weight_row_order: str = "megamoe",
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -1929,6 +1945,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # generated kernel, so deliberately EXCLUDED from unique_id /
             # _tactic_cache_key: opted-in and opted-out runs share caches.
             self.tactic_autotune = bool(tactic_autotune)
+            # Row order of the FC1 / FC2 weights and their block scales
+            # ("megamoe" or "trtllm_gen"); it selects the epilogue's register
+            # mapping at codegen time, so it is part of unique_id().
+            self.weight_row_order = str(weight_row_order)
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -1955,6 +1975,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=self.situ_linear_beta,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
+                weight_row_order=self.weight_row_order,
             )
 
         def get_valid_tactics(
@@ -2195,6 +2216,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
+                weight_row_order=self.weight_row_order,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel, rejection = _construct_megamoe_kernel(
