@@ -19,6 +19,7 @@ import os
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from .....autotuner import AutoTuner
 from .....cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -122,6 +123,11 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         self.trtllm_gen_weight_rows = os.environ.get(
             _TRTLLM_GEN_WEIGHT_ROWS_ENV, "0"
         ) == "1" and get_sm_version() in (100, 103)
+        if self.trtllm_gen_weight_rows:
+            logger.info_once(
+                "CuteDSL NVFP4 MoE stores expert weights in TRTLLM-Gen row order.",
+                key="cutedsl_moe_trtllm_gen_weight_rows",
+            )
 
     def _get_quant_method(self) -> object:
         if self.trtllm_gen_weight_rows:

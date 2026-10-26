@@ -280,3 +280,57 @@ def test_trtllm_gen_rows_method_permutes_weights_and_scales(is_gated, is_fc1):
     method._permute_expert_rows(module, None, swizzled, is_fc1=is_fc1)
     permuted = unswizzle_sf(swizzled.cuda(), rows, cols).view(rows, cols // SF_VEC).cpu()
     assert torch.equal(permuted.view(torch.uint8), linear[expected])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the weight method permutes on the GPU")
+@pytest.mark.parametrize("is_gated", [True, False], ids=["gated", "non_gated"])
+def test_trtllm_gen_rows_eplb_host_mirrors_match_device_weights(is_gated):
+    # Online EPLB copies experts into slots from the host mirrors, bypassing
+    # process_weights_after_loading, so both mirror hooks must apply the exact
+    # permutation the device path applies -- FC2 included, which the native
+    # CuTe DSL layout leaves untouched.
+    method = NVFP4CuteDslTrtllmGenRowsFusedMoEMethod()
+    num_experts = 2
+    fc1_rows = FC1_ROWS if is_gated else INTERMEDIATE
+    g = torch.Generator().manual_seed(6)
+
+    def rand(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
+
+    w3_w1 = rand(num_experts, fc1_rows, HIDDEN // 2)
+    w2 = rand(num_experts, HIDDEN, INTERMEDIATE // 2)
+    w3_w1_sf = rand(num_experts, fc1_rows, HIDDEN // SF_VEC)
+    w2_sf = rand(num_experts, HIDDEN, INTERMEDIATE // SF_VEC)
+    module = _module_namespace(
+        is_gated_activation=is_gated,
+        expand_intermediate_size_per_partition=fc1_rows,
+        local_shared_w3_w1_tensors=w3_w1.clone(),
+        local_shared_w2_tensors=w2.clone(),
+        local_shared_w3_w1_scale_tensors=w3_w1_sf.clone(),
+        local_shared_w2_scale_tensors=w2_sf.clone(),
+    )
+    method._prepare_shared_weights_for_finalization(module)
+    method._prepare_shared_weight_scales_for_finalization(module)
+
+    for e in range(num_experts):
+        for mirror, device, scale_mirror, scale_device, is_fc1 in (
+            (
+                module.local_shared_w3_w1_tensors,
+                w3_w1,
+                module.local_shared_w3_w1_scale_tensors,
+                w3_w1_sf,
+                True,
+            ),
+            (
+                module.local_shared_w2_tensors,
+                w2,
+                module.local_shared_w2_scale_tensors,
+                w2_sf,
+                False,
+            ),
+        ):
+            weight = device[e].clone()
+            scale = scale_device[e].clone()
+            method._permute_expert_rows(module, weight, scale, is_fc1=is_fc1)
+            assert torch.equal(mirror[e], weight)
+            assert torch.equal(scale_mirror[e], scale)
