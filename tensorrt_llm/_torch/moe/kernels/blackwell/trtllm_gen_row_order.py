@@ -70,3 +70,26 @@ def trtllm_gen_gated_sources(channel: int) -> tuple[int, int]:
     pair, parity = divmod(channel, 2)
     up_column = 16 * parity + pair
     return up_column, up_column + 8
+
+
+def trtllm_gen_gated_slot(channel: int) -> int:
+    """Rank of gated-FC1 ``channel``'s up row among the 16 up rows of a 32-row block.
+
+    The up rows are rows 0-7 (even channels) and 16-23 (odd channels), and each
+    gate row sits 8 rows below its up row. Numbering the channels in that row
+    order gives two adjacent slots two adjacent, pair-aligned up rows and two
+    such gate rows, so an epilogue that runs its packed f32x2 activation in slot
+    order reads its operand pairs as the TMEM load left them.
+
+    Args:
+        channel: Output channel inside the group, in ``[0, 16)``.
+
+    Returns:
+        The slot, in ``[0, 16)``.
+    """
+    if not 0 <= channel < TRTLLM_GEN_GATED_CHANNELS_PER_GROUP:
+        raise ValueError(
+            f"channel must be in [0, {TRTLLM_GEN_GATED_CHANNELS_PER_GROUP}), got {channel}"
+        )
+    pair, parity = divmod(channel, 2)
+    return 8 * parity + pair

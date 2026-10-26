@@ -54,6 +54,7 @@ from ....utils import ActivationType, is_gated_activation
 from .trtllm_gen_row_order import (
     TRTLLM_GEN_GATED_CHANNELS_PER_GROUP,
     TRTLLM_GEN_ROW_GROUP,
+    trtllm_gen_gated_slot,
     trtllm_gen_gated_sources,
     trtllm_gen_row_source,
 )
@@ -2365,6 +2366,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
+            if cutlass.const_expr(self.trtllm_gen_weight_rows and self.is_gated):
+                (
+                    tiled_copy_t2r_pair,
+                    tTR_tAcc_pair_base,
+                    tTR_rAcc_pair,
+                ) = self.epilog_tmem_pair_copy_and_partition(epi_tidx, tCtAcc_base, use_2cta_instrs)
 
             tTR_rC = None
             tiled_copy_r2s = None
@@ -2502,6 +2509,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                if cutlass.const_expr(self.trtllm_gen_weight_rows and self.is_gated):
+                    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N / 2))
+                    tTR_tAcc_pair = tTR_tAcc_pair_base[
+                        (None, None, None, None, None, acc_stage_index)
+                    ]
+                    tTR_tAcc_pair = cute.group_modes(tTR_tAcc_pair, 3, cute.rank(tTR_tAcc_pair))
 
                 #
                 # Process accumulator subtiles with activation fusion and store to global memory.
@@ -2523,7 +2536,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 - real_subtile_idx
                             )
 
-                    if cutlass.const_expr(self.is_gated):
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows and self.is_gated):
+                        #
+                        # Gated, TRTLLM-Gen rows: each 32-column group holds the up and the
+                        # gate rows of its own channels, so with two loads half of the
+                        # activation is ready after the first one and ptxas schedules it
+                        # ahead of the second load and of the accumulator release below.
+                        # Load the subtile pair with one instruction instead.
+                        #
+                        cute.copy(
+                            tiled_copy_t2r_pair,
+                            tTR_tAcc_pair[(None, None, None, real_subtile_idx)],
+                            tTR_rAcc_pair,
+                        )
+                    elif cutlass.const_expr(self.is_gated):
                         #
                         # Gated: Load pair of accumulator subtiles (up, gate)
                         #
@@ -2547,25 +2573,34 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             cute.arch.fence_view_async_tmem_load()
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
+                            if cutlass.const_expr(self.trtllm_gen_weight_rows):
+                                # The MMA warp waits for this release before it starts
+                                # the next tile. The warp barrier keeps ptxas from
+                                # sinking the predicated arrive below the activation
+                                # math that follows.
+                                cute.arch.sync_warp()
 
-                    if cutlass.const_expr(self.trtllm_gen_weight_rows):
-                        tTR_rAcc_up_out, tTR_rAcc_gate_out = (
-                            self._gather_trtllm_gen_output_channels(tTR_rAcc_up, tTR_rAcc_gate)
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows and self.is_gated):
+                        tTR_rAcc_up_in, tTR_rAcc_gate_in = self._split_trtllm_gen_gated_rows(
+                            tTR_rAcc_pair, tTR_rAcc_up
                         )
                     else:
-                        tTR_rAcc_up_out, tTR_rAcc_gate_out = tTR_rAcc_up, tTR_rAcc_gate
+                        tTR_rAcc_up_in, tTR_rAcc_gate_in = tTR_rAcc_up, tTR_rAcc_gate
 
-                    acc_vec_up = tTR_rAcc_up_out.load()
+                    acc_vec_up = tTR_rAcc_up_in.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
                     if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
-                        acc_vec_gate = tTR_rAcc_gate_out.load()
+                        acc_vec_gate = tTR_rAcc_gate_in.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
-                        acc_vec_gate = tTR_rAcc_gate_out.load()
+                        acc_vec_gate = tTR_rAcc_gate_in.load()
                         self._apply_situ_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
+
+                    if cutlass.const_expr(self.trtllm_gen_weight_rows):
+                        tCompute = self._restore_trtllm_gen_channel_order(tCompute)
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -2781,47 +2816,73 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     # ------------------------------------------------------------------
 
     @cute.jit
-    def _gather_trtllm_gen_output_channels(
+    def _split_trtllm_gen_gated_rows(
         self,
-        acc_first: cute.Tensor,
-        acc_second: cute.Tensor,
+        acc_pair: cute.Tensor,
+        acc_like: cute.Tensor,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
-        """Reorder one output subtile's accumulators out of TRTLLM-Gen row order.
+        """Gated activation inputs of one output subtile when B is in TRTLLM-Gen row order.
 
-        Each thread holds one token row. For a gated activation ``acc_first``
-        and ``acc_second`` are the two TMEM loads of a subtile pair, together
-        the 128 accumulator columns behind 64 output channels; for a
-        non-gated one ``acc_first`` alone covers the subtile. Every aligned
-        32-column group holds whole output channels (``trtllm_gen_row_order``),
-        and one load spans whole groups, so the natural order is a trace-time
-        register rename.
+        Each thread holds one token row. ``acc_pair`` is the TMEM load of a
+        subtile pair, the 128 accumulator columns behind 64 output channels,
+        and every aligned 32-column group holds the up and the gate column of
+        16 whole channels (``trtllm_gen_row_order``). Element
+        ``16 * group + slot`` of the result is the channel at
+        ``trtllm_gen_gated_slot`` ``slot`` of that group, an order in which two
+        adjacent elements are two adjacent, pair-aligned registers of the
+        load: the packed f32x2 activation reads its operand pairs where the
+        load left them instead of having them copied into new register pairs.
+        The activation result stays in this order until
+        ``_restore_trtllm_gen_channel_order``.
+
+        Args:
+            acc_pair: The loaded subtile pair.
+            acc_like: An accumulator fragment of one subtile, giving the
+                result shape.
 
         Returns:
-            ``(up, gate)`` in natural output-channel order. For a non-gated
-            activation ``gate`` is ``acc_second`` unchanged.
+            ``(up, gate)`` in slot order.
         """
-        num_regs = cute.size(acc_first)
+        num_regs = cute.size(acc_like)
         if cutlass.const_expr(num_regs % TRTLLM_GEN_ROW_GROUP != 0):
             raise ValueError(
                 f"TRTLLM-Gen weight rows need whole {TRTLLM_GEN_ROW_GROUP}-column "
                 f"groups per TMEM load, got {num_regs} columns."
             )
-        up = cute.make_rmem_tensor(acc_first.shape, self.acc_dtype)
+        up = cute.make_rmem_tensor(acc_like.shape, self.acc_dtype)
+        gate = cute.make_rmem_tensor(acc_like.shape, self.acc_dtype)
+        for out_idx in cutlass.range_constexpr(num_regs):
+            group, channel = divmod(out_idx, TRTLLM_GEN_GATED_CHANNELS_PER_GROUP)
+            up_column, gate_column = trtllm_gen_gated_sources(channel)
+            base = TRTLLM_GEN_ROW_GROUP * group
+            slot = TRTLLM_GEN_GATED_CHANNELS_PER_GROUP * group + trtllm_gen_gated_slot(channel)
+            up[slot] = acc_pair[base + up_column]
+            gate[slot] = acc_pair[base + gate_column]
+        return up, gate
+
+    @cute.jit
+    def _restore_trtllm_gen_channel_order(self, act: cute.Tensor) -> cute.Tensor:
+        """Put one output subtile's activation into output-channel order.
+
+        A gated activation ran in the slot order of
+        ``_split_trtllm_gen_gated_rows``, a non-gated one in the order of the
+        loaded columns, so that its packed f32x2 math read aligned register
+        pairs; the scale-factor reduction and the store expect consecutive
+        output channels. A trace-time register rename.
+        """
+        num_regs = cute.size(act)
+        natural = cute.make_rmem_tensor(act.shape, self.acc_dtype)
         if cutlass.const_expr(self.is_gated):
-            gate = cute.make_rmem_tensor(acc_first.shape, self.acc_dtype)
-            groups_per_load = num_regs // TRTLLM_GEN_ROW_GROUP
             for out_idx in cutlass.range_constexpr(num_regs):
                 group, channel = divmod(out_idx, TRTLLM_GEN_GATED_CHANNELS_PER_GROUP)
-                up_column, gate_column = trtllm_gen_gated_sources(channel)
-                base = TRTLLM_GEN_ROW_GROUP * (group % groups_per_load)
-                source = acc_first if group < groups_per_load else acc_second
-                up[out_idx] = source[base + up_column]
-                gate[out_idx] = source[base + gate_column]
-            return up, gate
+                natural[out_idx] = act[
+                    TRTLLM_GEN_GATED_CHANNELS_PER_GROUP * group + trtllm_gen_gated_slot(channel)
+                ]
+            return natural
         for out_idx in cutlass.range_constexpr(num_regs):
             group, channel = divmod(out_idx, TRTLLM_GEN_ROW_GROUP)
-            up[out_idx] = acc_first[TRTLLM_GEN_ROW_GROUP * group + trtllm_gen_row_source(channel)]
-        return up, acc_second
+            natural[out_idx] = act[TRTLLM_GEN_ROW_GROUP * group + trtllm_gen_row_source(channel)]
+        return natural
 
     @cute.jit
     def _apply_swiglu_epilogue(
@@ -3084,6 +3145,53 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
+
+    def epilog_tmem_pair_copy_and_partition(
+        self,
+        tidx: cutlass.Int32,
+        tAcc: cute.Tensor,
+        use_2cta_instrs: Union[cutlass.Boolean, bool],
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        """Make the tensor memory load of a gated subtile pair as one instruction.
+
+        The tile is the epilogue tile widened to both subtiles of a pair, so
+        register ``i`` of the destination is column ``i`` of the pair: the
+        first subtile's columns, then the second's.
+
+        :param tidx: The thread index in epilogue warp groups
+        :type tidx: cutlass.Int32
+        :param tAcc: The accumulator tensor to be copied and partitioned
+        :type tAcc: cute.Tensor
+        :param use_2cta_instrs: Whether use_2cta_instrs is enabled
+        :type use_2cta_instrs: bool
+
+        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
+            - tiled_copy_t2r: The tiled copy for the pair
+            - tTR_tAcc: The partitioned accumulator tensor, one pair per EPI_N
+            - tTR_rAcc: The register fragment of one pair
+        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        """
+        epi_tile_pair = (self.epi_tile[0], 2 * self.epi_tile[1])
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            self.cta_tile_shape_mnk,
+            self.c_layout,
+            self.c_dtype,
+            self.acc_dtype,
+            epi_tile_pair,
+            use_2cta_instrs,
+        )
+        # (EPI_TILE_M, 2 * EPI_TILE_N, EPI_M, EPI_N / 2, STAGE)
+        tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile_pair)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N / 2, STAGE)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        # (T2R, T2R_M, T2R_N)
+        tTR_rAcc = cute.make_rmem_tensor(
+            thr_copy_t2r.partition_D(cute.make_identity_tensor(epi_tile_pair)).shape,
+            self.acc_dtype,
+        )
+        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_copy_and_partition(
         self,

@@ -26,6 +26,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
 from tensorrt_llm._torch.moe.kernels.blackwell.trtllm_gen_row_order import (
     TRTLLM_GEN_GATED_CHANNELS_PER_GROUP,
     TRTLLM_GEN_ROW_GROUP,
+    trtllm_gen_gated_slot,
     trtllm_gen_gated_sources,
     trtllm_gen_row_source,
 )
@@ -250,6 +251,21 @@ def test_trtllm_gen_row_source_matches_the_trtllm_gen_shuffle(num_groups):
         base = TRTLLM_GEN_ROW_GROUP * group
         for channel in range(TRTLLM_GEN_ROW_GROUP):
             assert stored[base + trtllm_gen_row_source(channel)] == base + channel
+
+
+def test_trtllm_gen_gated_slots_read_adjacent_register_pairs():
+    # The FC1 epilogue runs its packed f32x2 activation in slot order, which
+    # needs the two channels of every even/odd slot pair to sit in two
+    # adjacent, pair-aligned up rows and two such gate rows of the group.
+    channels = TRTLLM_GEN_GATED_CHANNELS_PER_GROUP
+    channel_at_slot = {trtllm_gen_gated_slot(channel): channel for channel in range(channels)}
+    assert sorted(channel_at_slot) == list(range(channels))
+    for slot in range(0, channels, 2):
+        first = trtllm_gen_gated_sources(channel_at_slot[slot])
+        second = trtllm_gen_gated_sources(channel_at_slot[slot + 1])
+        for column, next_column in zip(first, second):
+            assert column % 2 == 0
+            assert next_column == column + 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the weight method permutes on the GPU")
